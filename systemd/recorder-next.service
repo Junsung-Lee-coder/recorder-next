@@ -1,0 +1,20 @@
+[Unit]
+Description=Recorder Next standalone v1 server
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/recorder-next
+ExecStart=/usr/bin/python3 -m recorder_next --db /var/lib/recorder-next/recorder-next.sqlite3 --storage-root /var/lib/recorder-next/data --host 127.0.0.1 --port 8643
+Restart=on-failure
+RestartSec=3
+User=recorder-next
+Group=recorder-next
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/recorder-next
+
+[Install]
+WantedBy=multi-user.target

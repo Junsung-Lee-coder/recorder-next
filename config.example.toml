@@ -1,0 +1,34 @@
+# Recorder Next v1 example configuration.
+# This standalone candidate defaults to loopback and never uses legacy port 5000.
+
+[server]
+host = "127.0.0.1"
+port = 8643
+
+[storage]
+database = "./state/recorder-next.sqlite3"
+root = "./state/data"
+min_free_bytes = 104857600
+
+[limits]
+max_audio_minutes = 120
+max_audio_bytes = 1073741824
+max_chunk_bytes = 1048576
+max_text_bytes = 10485760
+max_attachment_bytes = 262144000
+max_turn_bytes = 1073741824
+max_parts = 20
+
+[retries]
+hermes_max_attempts = 2
+hermes_late_result_grace_seconds = 30
+asr_provider_timeout_seconds = 10
+tts_retry_seconds = 10
+
+[providers]
+# Inject real adapters only in a separately reviewed deployment configuration.
+realtime_asr = "disabled"
+batch_asr = "disabled"
+local_asr = "disabled"
+# hermes_base_url is intentionally omitted; set it only in deployment configuration.
+tts = "fixture"

@@ -1,0 +1,103 @@
+{
+  "files": {
+    "data_csv": {
+      "bytes": 24,
+      "caption_hash": "79b9a2f052e924b41e633feb92eb337092ddf688b313d1305c931d4f6cbfba11",
+      "kind": "attachment",
+      "mime": "text/csv; charset=utf-8",
+      "part_id": "csv-1",
+      "path": "data.csv",
+      "relationship": "standalone_attachment",
+      "sha256": "2714a951f0bcfbf0180f0c63b4879fa9500fe7330d21dd7e32bb5531d58cf340"
+    },
+    "document_pdf": {
+      "bytes": 612,
+      "caption_hash": "e2639d66c3a747f39489b5842b889a33484ac08b25ed74b71655c569efd93ab7",
+      "kind": "attachment",
+      "mime": "application/pdf",
+      "part_id": "document-1",
+      "path": "document.pdf",
+      "relationship": "standalone_attachment",
+      "sha256": "d9b70d90a446261b0a16476cdf7789e2627d51cc5a705788e7658d3d78166e00"
+    },
+    "generic_binary": {
+      "bytes": 29,
+      "caption_hash": "0184705e7acfe20d60703250ce4f1e52bed97c52150f0345b85b9249966bb38d",
+      "kind": "attachment",
+      "mime": "application/octet-stream",
+      "part_id": "binary-1",
+      "path": "generic.bin",
+      "relationship": "standalone_attachment",
+      "sha256": "0d41e776e8535fb2eb604bb99b57917b8096958511e93c48399c67c72561422e"
+    },
+    "image_png": {
+      "bytes": 10662,
+      "caption_hash": "bbb9a30ac377725931b09171c74994e4428edd32294adb6bf49285e786715299",
+      "kind": "attachment",
+      "mime": "image/png",
+      "part_id": "image-1",
+      "path": "image.png",
+      "relationship": "standalone_attachment",
+      "sha256": "a30c5a0129e719554703f9eba9753d6c13e48ccc25ae2e409293948b54c3c9b2"
+    },
+    "text_utf8": {
+      "bytes": 59,
+      "caption_hash": null,
+      "kind": "text",
+      "mime": "text/plain; charset=utf-8",
+      "part_id": "text-1",
+      "path": "text.txt",
+      "relationship": "standalone_text",
+      "sha256": "d50b71e1f9aa6d98d485ec1426c412fd325dc634047b97097431f4433a11b5c9"
+    },
+    "voice_en": {
+      "bytes": 110388,
+      "caption_hash": null,
+      "kind": "audio",
+      "mime": "audio/wav",
+      "part_id": "voice-en-1",
+      "path": "voice_en.wav",
+      "prompt_sha256": "eae13e2c361569d736d03da8f9d851b7a4e45a591fb88c440737d8499edd8b5f",
+      "relationship": "primary_input",
+      "sha256": "ebfcd54140b6b20a0f38dc592b5d4e51eb55a6e7d697c905585fe99024e87987"
+    },
+    "voice_ko": {
+      "bytes": 117928,
+      "caption_hash": null,
+      "kind": "audio",
+      "mime": "audio/wav",
+      "part_id": "voice-ko-1",
+      "path": "voice_ko.wav",
+      "prompt_sha256": "abb6f2096ac6390296b9e7c33a26479db699f164685c54ce5c9fb3af863512df",
+      "relationship": "primary_input",
+      "sha256": "ce54f2d8cdd9251b1add48176b247c2c9ab4386a956970f8fb1d8fee0cbe4a9f"
+    }
+  },
+  "fixture_id": "recorder-next-v1-generated-multimodal-r1",
+  "generator": {
+    "canonical_audio": {
+      "channels": 1,
+      "container": "WAV",
+      "sample_rate": 16000,
+      "sample_width_bytes": 2
+    },
+    "determinism": "fixed prompts, fixed voice parameters, -D deterministic mode, metadata stripped on resample",
+    "espeak_ng_version": "eSpeak NG text-to-speech: 1.52.0",
+    "espeak_voice_en": "en-us",
+    "espeak_voice_ko": "Korean",
+    "ffmpeg_version": "ffmpeg version 7.1.3-0+deb13u1+rpt1 Copyright (c) 2000-2025 the FFmpeg developers",
+    "name": "fixtures/generate_multimodal_fixtures.py",
+    "tts_provider": "espeak-ng"
+  },
+  "privacy": "synthetic-only",
+  "prompts": {
+    "en": "Synthetic English voice acceptance fixture.",
+    "ko": "합성 음성 입력 수용 시험입니다.",
+    "sha256": {
+      "en": "eae13e2c361569d736d03da8f9d851b7a4e45a591fb88c440737d8499edd8b5f",
+      "ko": "abb6f2096ac6390296b9e7c33a26479db699f164685c54ce5c9fb3af863512df"
+    }
+  },
+  "schema_version": 1,
+  "scope": "separate single-input turns; mixed turns intentionally excluded"
+}

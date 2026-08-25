@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "recorder-next"
+version = "1.0.0"
+description = "Standalone reliable Recorder v1 server"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+recorder-next = "recorder_next.__main__:main"
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+include = ["recorder_next*"]
+
+[tool.setuptools.package-data]
+recorder_next = ["schema.sql"]
