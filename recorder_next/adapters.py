@@ -41,6 +41,25 @@ class TTSProvider(Protocol):
     def synthesize(self, text: str, *, artifact_id: str) -> TTSResult: ...
 
 
+class ScheduleCreateAdapter(Protocol):
+    def schedule_create(self, command: Mapping[str, Any]) -> dict[str, Any]: ...
+
+
+class TrustedScheduleCreateAdapter:
+    """Structured Recorder-side seam; apps never call the store directly."""
+
+    def __init__(self, store: Any):
+        self.store = store
+
+    def schedule_create(self, command: Mapping[str, Any]) -> dict[str, Any]:
+        if not isinstance(command, Mapping):
+            raise TypeError("schedule_create command must be an object")
+        return self.store.create_schedule(command)
+
+
+TrustedScheduleAdapter = TrustedScheduleCreateAdapter
+
+
 class DeterministicRouter:
     """Small fixture-safe router; production deployments inject the agent seam."""
 

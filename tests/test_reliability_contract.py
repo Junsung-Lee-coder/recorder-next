@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 
 from recorder_next.canonical import hermes_content_hash
-from recorder_next.errors import ConflictError
+from recorder_next.errors import ConflictError, NotReadyError
 from recorder_next.models import HermesResult, RouterDecision, TTSResult
 from recorder_next.service import RecorderService
 from recorder_next.store import RecorderStore
@@ -227,7 +227,13 @@ class GraceAndCASRegressionTests(unittest.TestCase):
             ready = store.set_tts_result(artifact["artifact_id"], TTSResult(b"audio"))
             store.revoke_device("u", "device-1")
             with self.assertRaises(Exception):
-                store.ack_playback(artifact["artifact_id"], device_id="device-1", payload_sha256=ready["payload_sha256"])
+                store.ack_playback(
+                    artifact["artifact_id"],
+                    device_id="device-1",
+                    payload_sha256=ready["payload_sha256"],
+                    turn_id=turn_id,
+                    artifact_version=artifact["artifact_version"],
+                )
             self.assertTrue(Path(ready["storage_path"]).exists())
 
     def test_expired_tts_retains_spool_until_origin_playback_ack(self):
@@ -237,9 +243,15 @@ class GraceAndCASRegressionTests(unittest.TestCase):
             ready = store.set_tts_result(artifact["artifact_id"], TTSResult(b"audio"))
             store.mark_tts_expired(artifact["artifact_id"])
             self.assertTrue(Path(ready["storage_path"]).exists())
-            played = store.ack_playback(artifact["artifact_id"], device_id="device-1", payload_sha256=ready["payload_sha256"])
-            self.assertEqual(played["status"], "PLAYED")
-            self.assertFalse(Path(ready["storage_path"]).exists())
+            with self.assertRaises(NotReadyError):
+                store.ack_playback(
+                    artifact["artifact_id"],
+                    device_id="device-1",
+                    payload_sha256=ready["payload_sha256"],
+                    turn_id=turn_id,
+                    artifact_version=artifact["artifact_version"],
+                )
+            self.assertTrue(Path(ready["storage_path"]).exists())
 
 
 if __name__ == "__main__":

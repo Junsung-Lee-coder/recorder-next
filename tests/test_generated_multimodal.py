@@ -245,6 +245,7 @@ def _route_hermes_and_ack(test: unittest.TestCase, server, *, user: str, device:
                 {
                     "device_id": device,
                     "turn_id": turn_id,
+                    "artifact_version": artifact["artifact_version"],
                     "payload_sha256": ready["payload_sha256"],
                 },
             ),

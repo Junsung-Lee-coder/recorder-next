@@ -15,10 +15,11 @@ from .adapters import (
     RouterAdapter,
     StaticASRProvider,
     StaticTTSProvider,
+    TrustedScheduleCreateAdapter,
     TTSProvider,
 )
 from .canonical import hermes_content_hash, normalize_hermes_text
-from .errors import NotFoundError, RecorderError, ValidationError
+from .errors import NotFoundError, RecorderError, UnauthorizedError, ValidationError
 from .models import AsrResult, HermesResult, RouterDecision, TTSResult
 from .store import DEFAULT_MISSING_PAGE_SIZE, MAX_MISSING_PAGE_SIZE, FINAL_ERROR_MESSAGES, RecorderStore
 
@@ -42,6 +43,7 @@ class RecorderService:
         self.hermes = hermes
         self.asr_providers = dict(asr_providers or {})
         self.tts = tts or StaticTTSProvider()
+        self.schedule_adapter = TrustedScheduleCreateAdapter(store)
         self.hermes_max_attempts = max(1, hermes_max_attempts)
         self.hermes_grace_seconds = max(0, hermes_grace_seconds)
         self._lock = threading.RLock()
@@ -181,6 +183,22 @@ class RecorderService:
             results.append(self.generate_tts(artifact["artifact_id"]))
         return results
 
+    def schedule_create(self, command: Mapping[str, Any]) -> dict[str, Any]:
+        return self.schedule_adapter.schedule_create(command)
+
+    def run_scheduler(
+        self,
+        *,
+        owner: str = "scheduler-1",
+        lease_seconds: int = 30,
+        limit: int = 50,
+        now: str | None = None,
+    ) -> list[dict[str, Any]]:
+        return self.store.fire_due_schedules(owner=owner, lease_seconds=lease_seconds, limit=limit, now=now)
+
+    def recover_scheduler(self, *, now: str | None = None) -> dict[str, Any]:
+        return self.store.recover(now=now)
+
     def accept_text_turn(self, manifest: Mapping[str, Any], text: str) -> dict[str, Any]:
         manifest = dict(manifest)
         if manifest.get("parts"):
@@ -232,6 +250,13 @@ class RecorderService:
         return value
 
     @staticmethod
+    def _json_string(payload: Mapping[str, Any], key: str) -> str:
+        value = payload.get(key)
+        if not isinstance(value, str) or not value:
+            raise ValidationError(f"{key} is required and must be a non-empty string")
+        return value
+
+    @staticmethod
     def _json_integer(payload: Mapping[str, Any], key: str, *, allow_none: bool = False) -> int | None:
         if key not in payload:
             raise ValidationError(f"{key} is required")
@@ -274,6 +299,24 @@ class RecorderService:
 
             return 200, {}, OPENAPI
         segments = [unquote(item) for item in path.split("/") if item]
+        if segments[:3] == ["v1", "internal", "schedule_create"] and method == "POST":
+            if headers.get("X-Recorder-Internal-Trusted") != "1":
+                raise UnauthorizedError("schedule_create requires the trusted Recorder adapter")
+            return 201, {}, self.schedule_create(self._json_body(body))
+        if segments[:3] == ["v1", "internal", "scheduler"] and len(segments) == 4 and segments[3] == "fire" and method == "POST":
+            payload = self._json_body(body)
+            items = self.run_scheduler(
+                owner=str(payload.get("owner", "scheduler-1")),
+                lease_seconds=int(payload.get("lease_seconds", 30)),
+                limit=int(payload.get("limit", 50)),
+                now=payload.get("now"),
+            )
+            return 200, {}, {"items": items}
+        if segments[:3] == ["v1", "internal", "scheduler"] and len(segments) == 4 and segments[3] == "recover" and method == "POST":
+            payload = self._json_body(body)
+            return 200, {}, self.recover_scheduler(now=payload.get("now"))
+        if segments[:2] == ["v1", "schedules"] and len(segments) == 3 and method == "GET":
+            return 200, {}, self.store.get_schedule(segments[2])
         if segments[:2] == ["v1", "devices"] and len(segments) == 2 and method == "POST":
             payload = self._json_body(body)
             return 201, {}, self.store.register_device(payload["user_id"], payload["device_id"], payload["kind"])
@@ -329,13 +372,29 @@ class RecorderService:
             return 200, {}, self.store.ack_event(segments[2], segments[4], device_id=str(payload["device_id"]), event_version=int(payload["event_version"]), payload_sha256=str(payload["payload_sha256"]))
         if segments[:2] == ["v1", "outbox"] and method == "GET":
             return 200, {}, {"items": self.store.pending_outbox(query["device_id"], limit=int(query.get("limit", "50")))}
+        if len(segments) == 4 and segments[:2] == ["v1", "tts"] and segments[3] == "bridge-read" and method == "GET":
+            bridge_device_id = query.get("device_id")
+            if not bridge_device_id:
+                raise ValidationError("device_id is required for TTS bridge reads")
+            metadata, audio = self.store.read_tts_for_bridge(segments[2], bridge_device_id=bridge_device_id)
+            metadata["audio_base64"] = base64.b64encode(audio).decode("ascii")
+            return 200, {}, metadata
         if segments[:2] == ["v1", "tts"] and len(segments) == 3 and method == "GET":
-            metadata, audio = self.store.read_tts(segments[2], device_id=query["device_id"])
+            device_id = query.get("device_id") or headers.get("X-Recorder-Device-ID")
+            if not device_id:
+                raise ValidationError("device_id is required for TTS reads")
+            metadata, audio = self.store.read_tts(segments[2], device_id=device_id)
             metadata["audio_base64"] = base64.b64encode(audio).decode("ascii")
             return 200, {}, metadata
         if len(segments) == 4 and segments[:2] == ["v1", "tts"] and segments[3] == "playback-ack" and method == "POST":
             payload = self._json_body(body)
-            return 200, {}, self.store.ack_playback(segments[2], device_id=str(payload["device_id"]), payload_sha256=str(payload["payload_sha256"]), turn_id=payload.get("turn_id"))
+            return 200, {}, self.store.ack_playback(
+                segments[2],
+                device_id=self._json_string(payload, "device_id"),
+                payload_sha256=self._json_string(payload, "payload_sha256"),
+                turn_id=self._json_string(payload, "turn_id"),
+                artifact_version=self._json_integer(payload, "artifact_version"),
+            )
         if len(segments) == 4 and segments[:2] == ["v1", "tts"] and segments[3] == "relay-received" and method == "POST":
             payload = self._json_body(body)
             return 200, {}, self.store.relay_tts_received(segments[2], device_id=str(payload["device_id"]), payload_sha256=str(payload["payload_sha256"]))
@@ -372,8 +431,8 @@ class RecorderService:
         raise NotFoundError("API route not found")
 
 
-def create_service(db_path: str, storage_root: str, **kwargs: Any) -> RecorderService:
-    return RecorderService(RecorderStore(db_path, storage_root=storage_root), **kwargs)
+def create_service(db_path: str, storage_root: str, *, clock: Any | None = None, **kwargs: Any) -> RecorderService:
+    return RecorderService(RecorderStore(db_path, storage_root=storage_root, clock=clock), **kwargs)
 
 
 def create_configured_service(config: "RecorderConfig") -> RecorderService:

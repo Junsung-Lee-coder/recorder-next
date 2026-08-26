@@ -65,9 +65,10 @@ The machine-readable contract is `api/openapi.json` and is also served at `GET /
 6. An Hermes worker uses `POST /v1/internal/hermes`; the server stores only delivery references and bounded delivery payloads.
 7. Origin-device outbox polling uses `GET /v1/outbox?device_id=...`.
 8. Exact event ACK uses `POST /v1/turns/{turn_id}/events/{event_id}/ack`.
-9. TTS playback completion uses `POST /v1/tts/{artifact_id}/playback-ack`; relay receipt cannot complete playback.
+9. Target TTS playback completion uses `POST /v1/tts/{artifact_id}/playback-ack`; its JSON body must include the target `device_id`, non-empty exact `payload_sha256`, exact `turn_id`, and positive `artifact_version`. A relay receipt cannot complete playback.
+10. An active registered Phone can bridge-read Watch-targeted audio with `GET /v1/tts/{artifact_id}/bridge-read?device_id=...`; bridge reads never authorize playback completion or spool deletion.
 
-Authentication/key management is intentionally a deployment seam in this standalone candidate. The event and artifact handlers still enforce registered, active, origin-device binding and exact payload hashes.
+Authentication/key management is intentionally a deployment seam in this standalone candidate. The event, bridge-read, and artifact handlers still enforce registered active device identity; playback completion remains bound to the frozen delivery target and exact artifact receipt.
 
 ## Layout
 

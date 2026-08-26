@@ -26,8 +26,28 @@ OPENAPI = {
         "/v1/turns/{turn_id}/parts/{part_id}/finish": {"post": {"responses": {"200": {"description": "Verified part"}}}},
         "/v1/turns/{turn_id}/events/{event_id}/ack": {"post": {"responses": {"200": {"description": "Event ACK"}}}},
         "/v1/outbox": {"get": {"responses": {"200": {"description": "Origin-device ordered outbox"}}}},
-        "/v1/tts/{artifact_id}": {"get": {"responses": {"200": {"description": "Origin-device TTS payload"}}}},
-        "/v1/tts/{artifact_id}/playback-ack": {"post": {"responses": {"200": {"description": "Origin playback completion"}}}},
+        "/v1/tts/{artifact_id}": {
+            "get": {
+                "summary": "Read target TTS or bridge it through an authenticated registered Phone",
+                "parameters": [{"$ref": "#/components/parameters/ArtifactId"}, {"$ref": "#/components/parameters/DeviceId"}],
+                "responses": {"200": {"description": "TTS payload"}, "401": {"description": "Device is not the target or an active Phone bridge"}, "409": {"description": "TTS payload is unavailable"}},
+            }
+        },
+        "/v1/tts/{artifact_id}/bridge-read": {
+            "get": {
+                "summary": "Read Watch-targeted TTS through an authenticated registered Phone bridge",
+                "parameters": [{"$ref": "#/components/parameters/ArtifactId"}, {"$ref": "#/components/parameters/DeviceId"}],
+                "responses": {"200": {"description": "TTS payload"}, "401": {"description": "Active registered Phone bridge required"}, "409": {"description": "TTS payload is unavailable"}},
+            }
+        },
+        "/v1/tts/{artifact_id}/playback-ack": {
+            "post": {
+                "summary": "Complete playback on the actual TTS delivery target",
+                "parameters": [{"$ref": "#/components/parameters/ArtifactId"}],
+                "requestBody": {"required": True, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/PlaybackAck"}}}},
+                "responses": {"200": {"description": "Target playback completion"}, "400": {"description": "Required receipt field missing or invalid"}, "401": {"description": "Only the delivery target may complete playback"}, "409": {"description": "Receipt does not match the stored artifact"}},
+            }
+        },
         "/v1/tts/{artifact_id}/relay-received": {"post": {"responses": {"200": {"description": "Non-origin relay receipt"}}}},
         "/v1/projects": {"get": {"responses": {"200": {"description": "Project registry"}}}, "post": {"responses": {"201": {"description": "Project"}}}},
         "/v1/projects/search": {"get": {"responses": {"200": {"description": "Project search"}}}},
@@ -37,13 +57,34 @@ OPENAPI = {
         "/v1/internal/router": {"post": {"responses": {"200": {"description": "Internal router worker step"}}}},
         "/v1/internal/hermes": {"post": {"responses": {"200": {"description": "Internal Hermes worker step"}}}},
         "/v1/internal/tts": {"post": {"responses": {"200": {"description": "Internal TTS worker step"}}}},
+        "/v1/internal/schedule_create": {"post": {"summary": "Trusted Recorder adapter schedule creation", "responses": {"201": {"description": "Durably scheduled with atomic confirmation FINAL"}, "401": {"description": "Trusted adapter header required"}, "409": {"description": "Immutable schedule conflict"}}}},
+        "/v1/internal/scheduler/fire": {"post": {"summary": "Claim and fire due server schedules", "responses": {"200": {"description": "Scheduled FINAL readback"}}}},
+        "/v1/internal/scheduler/recover": {"post": {"summary": "Requeue expired scheduler leases", "responses": {"200": {"description": "Recovery counts"}}}},
+        "/v1/schedules/{schedule_id}": {"get": {"parameters": [{"name": "schedule_id", "in": "path", "required": True, "schema": {"type": "string"}}], "responses": {"200": {"description": "Schedule and occurrence readback"}}}},
     },
     "components": {
-        "parameters": {"TurnId": {"name": "turn_id", "in": "path", "required": True, "schema": {"type": "string", "format": "uuid"}}},
+        "parameters": {
+            "TurnId": {"name": "turn_id", "in": "path", "required": True, "schema": {"type": "string", "format": "uuid"}},
+            "ArtifactId": {"name": "artifact_id", "in": "path", "required": True, "schema": {"type": "string"}},
+            "DeviceId": {"name": "device_id", "in": "query", "required": True, "description": "Registered active device identity; a Phone may bridge-read a Watch-targeted artifact.", "schema": {"type": "string", "minLength": 1}},
+        },
         "schemas": {
             "TurnState": {"type": "string", "enum": ["RECEIVING", "ACCEPTED", "PREPROCESSING", "ROUTING", "ROUTED", "HERMES_PENDING", "FINAL_READY", "DELIVERY_PENDING", "RETRY_WAIT", "LATE_RESULT_GRACE", "DELIVERED", "FAILED_PERMANENT", "EXPIRED"]},
             "EventKind": {"type": "string", "enum": ["ACCEPTED", "ROUTED", "FINAL"]},
             "ArtifactState": {"type": "string", "enum": ["PENDING", "READY", "DELIVERY_PENDING", "PLAYED", "FAILED_GENERATION", "EXPIRED"]},
+            "ScheduleState": {"type": "string", "enum": ["SCHEDULED", "CLAIMED", "FIRED", "FAILED", "CANCELLED"]},
+            "ServerTurnSource": {"type": "string", "enum": ["server_schedule"]},
+            "PlaybackAck": {
+                "type": "object",
+                "required": ["device_id", "payload_sha256", "turn_id", "artifact_version"],
+                "additionalProperties": False,
+                "properties": {
+                    "device_id": {"type": "string", "minLength": 1},
+                    "payload_sha256": {"type": "string", "minLength": 1},
+                    "turn_id": {"type": "string", "format": "uuid", "minLength": 1},
+                    "artifact_version": {"type": "integer", "minimum": 1},
+                },
+            },
             "Error": {"type": "object", "required": ["error"], "properties": {"error": {"type": "object", "properties": {"code": {"type": "string"}, "message": {"type": "string"}}}}},
         },
     },

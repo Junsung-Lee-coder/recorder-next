@@ -11,7 +11,7 @@ import sqlite3
 import threading
 import uuid
 from pathlib import Path
-from typing import Any, Iterator, Mapping
+from typing import Any, Callable, Iterator, Mapping
 
 from .canonical import canonical_json, hermes_content_hash, normalize_hermes_text, sha256_bytes, sha256_json
 from .errors import (
@@ -30,6 +30,7 @@ from .models import AsrResult, HermesResult, RouterDecision, TTSResult
 
 SCHEMA_PATH = Path(__file__).with_name("schema.sql")
 UUIDISH = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+SCHEDULE_ID = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
 MAX_CHUNK_BYTES = 1024 * 1024
 DEFAULT_MISSING_PAGE_SIZE = 1024
 MAX_MISSING_PAGE_SIZE = 1024
@@ -39,6 +40,7 @@ FINAL_ERROR_MESSAGES = {
     "routing": "요청을 처리할 프로젝트를 결정하지 못했습니다.",
     "asr": "음성을 인식하지 못했습니다. 원본은 보존되어 다시 시도할 수 있습니다.",
     "hermes": "요청 처리가 지연되고 있습니다. 잠시 후 프로젝트 세션에서 다시 확인해 주세요.",
+    "schedule": "예약을 저장하지 못했습니다. 성공으로 처리하지 않고 다시 시도할 수 있도록 보존했습니다.",
 }
 
 
@@ -68,6 +70,7 @@ class RecorderStore:
         db_path: str | os.PathLike[str],
         *,
         storage_root: str | os.PathLike[str],
+        clock: Callable[[], str] | Any | None = None,
         max_chunk_bytes: int = MAX_CHUNK_BYTES,
         max_turn_bytes: int = 1024 * 1024 * 1024,
         max_audio_bytes: int = 1024 * 1024 * 1024,
@@ -89,6 +92,7 @@ class RecorderStore:
         self.max_parts = max_parts
         self.max_user_storage_bytes = max_user_storage_bytes
         self.min_free_bytes = max(0, min_free_bytes)
+        self._clock = clock
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.storage_root.mkdir(parents=True, exist_ok=True)
         self._write_lock = threading.RLock()
@@ -108,9 +112,100 @@ class RecorderStore:
         conn = self._connect()
         try:
             conn.executescript(schema)
-            conn.execute("INSERT OR IGNORE INTO schema_meta(key, value) VALUES ('schema_version', '1')")
+            version_row = conn.execute("SELECT value FROM schema_meta WHERE key='schema_version'").fetchone()
+            version = int(version_row["value"]) if version_row is not None else 1
+            if version > 2:
+                raise RuntimeError(f"unsupported Recorder schema version {version}")
+            if version < 2:
+                self._apply_scheduled_migration(conn)
+                conn.execute("UPDATE schema_meta SET value='2' WHERE key='schema_version'")
+            conn.execute("INSERT OR IGNORE INTO schema_meta(key, value) VALUES ('schema_version', '2')")
         finally:
             conn.close()
+
+    @staticmethod
+    def _apply_scheduled_migration(conn: sqlite3.Connection) -> None:
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(turns)").fetchall()}
+        for name, definition in (
+            ("turn_source", "TEXT NOT NULL DEFAULT 'client'"),
+            ("schedule_id", "TEXT"),
+            ("trigger_instance_id", "TEXT"),
+            ("parent_turn_id", "TEXT"),
+            ("previous_turn_id", "TEXT"),
+            ("previous_turn_origin_device_id", "TEXT"),
+            ("scheduled_for", "TEXT"),
+            ("fired_at", "TEXT"),
+            ("delivery_target_device_id", "TEXT"),
+        ):
+            if name not in columns:
+                conn.execute(f"ALTER TABLE turns ADD COLUMN {name} {definition}")
+        artifact_columns = {row["name"] for row in conn.execute("PRAGMA table_info(tts_artifacts)").fetchall()}
+        if "delivery_target_device_id" not in artifact_columns:
+            conn.execute("ALTER TABLE tts_artifacts ADD COLUMN delivery_target_device_id TEXT")
+        conn.execute("UPDATE tts_artifacts SET delivery_target_device_id=origin_device_id WHERE delivery_target_device_id IS NULL")
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS schedules (
+                schedule_id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                parent_turn_id TEXT NOT NULL,
+                project_id TEXT NOT NULL,
+                session_key TEXT NOT NULL,
+                origin_device_id TEXT NOT NULL,
+                delivery_target_device_id TEXT NOT NULL,
+                fire_at_utc TEXT NOT NULL,
+                timezone_offset TEXT NOT NULL,
+                reminder_text TEXT NOT NULL,
+                generation_instruction TEXT,
+                confirmation_text TEXT NOT NULL,
+                request_sha256 TEXT NOT NULL UNIQUE,
+                state TEXT NOT NULL DEFAULT 'SCHEDULED' CHECK(state IN ('SCHEDULED','CLAIMED','FIRED','FAILED','CANCELLED')),
+                version INTEGER NOT NULL DEFAULT 1,
+                lease_owner TEXT,
+                lease_expires_at TEXT,
+                attempt_count INTEGER NOT NULL DEFAULT 0,
+                trigger_instance_id TEXT NOT NULL,
+                confirmation_event_id TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                fired_at TEXT,
+                FOREIGN KEY(parent_turn_id) REFERENCES turns(turn_id) ON DELETE RESTRICT
+            );
+            CREATE INDEX IF NOT EXISTS idx_schedules_due ON schedules(state, fire_at_utc);
+            CREATE TABLE IF NOT EXISTS schedule_occurrences (
+                schedule_id TEXT NOT NULL,
+                trigger_instance_id TEXT NOT NULL,
+                scheduled_for TEXT NOT NULL,
+                previous_turn_id TEXT,
+                previous_turn_origin_device_id TEXT,
+                delivery_target_device_id TEXT,
+                state TEXT NOT NULL DEFAULT 'PENDING' CHECK(state IN ('PENDING','CLAIMED','FIRED','FAILED')),
+                version INTEGER NOT NULL DEFAULT 1,
+                lease_owner TEXT,
+                lease_expires_at TEXT,
+                attempt_count INTEGER NOT NULL DEFAULT 0,
+                turn_id TEXT,
+                event_id TEXT,
+                artifact_id TEXT,
+                fired_at TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY(schedule_id, trigger_instance_id),
+                UNIQUE(turn_id),
+                FOREIGN KEY(schedule_id) REFERENCES schedules(schedule_id) ON DELETE CASCADE,
+                FOREIGN KEY(turn_id) REFERENCES turns(turn_id) ON DELETE RESTRICT
+            );
+            CREATE INDEX IF NOT EXISTS idx_schedule_occurrences_due ON schedule_occurrences(state, scheduled_for);
+            """
+        )
+
+    def _now(self) -> str:
+        if self._clock is None:
+            return utc_now()
+        value = self._clock.now() if hasattr(self._clock, "now") else self._clock()
+        if not isinstance(value, str):
+            raise TypeError("clock must return an RFC3339 string")
+        return value
 
     @contextlib.contextmanager
     def _tx(self, *, immediate: bool = True) -> Iterator[sqlite3.Connection]:
@@ -245,7 +340,7 @@ class RecorderStore:
         turn["tts_artifacts"] = [
             _row(artifact)
             for artifact in conn.execute(
-                "SELECT artifact_id, event_id, event_kind, artifact_version, output_kind, origin_device_id, payload_sha256, status, mode, delivery_seq, created_at, updated_at, played_at FROM tts_artifacts WHERE turn_id = ? ORDER BY delivery_seq",
+                "SELECT artifact_id, event_id, event_kind, artifact_version, output_kind, origin_device_id, delivery_target_device_id, payload_sha256, status, mode, delivery_seq, created_at, updated_at, played_at FROM tts_artifacts WHERE turn_id = ? ORDER BY delivery_seq",
                 (turn_id,),
             ).fetchall()
         ]
@@ -329,7 +424,7 @@ class RecorderStore:
                 if int(existing) + known_total > self.max_user_storage_bytes:
                     raise QuotaExceeded("user storage quota would be exceeded")
             conn.execute(
-                "INSERT INTO turns(turn_id, user_id, origin_device_id, client_created_at, current_project_number, prefer_current_project, initial_fingerprint, manifest_json, state, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'RECEIVING', ?, ?)",
+                "INSERT INTO turns(turn_id, user_id, origin_device_id, client_created_at, current_project_number, prefer_current_project, initial_fingerprint, manifest_json, state, turn_source, delivery_target_device_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'RECEIVING', 'client', ?, ?, ?)",
                 (
                     turn_id,
                     manifest["user_id"],
@@ -339,6 +434,7 @@ class RecorderStore:
                     int(bool(manifest.get("prefer_current_project", False))),
                     fingerprint,
                     _json(manifest),
+                    manifest["origin_device_id"],
                     now,
                     now,
                 ),
@@ -746,6 +842,7 @@ class RecorderStore:
         outcome: str | None,
         error_kind: str | None,
         create_outbox: bool,
+        created_at: str | None = None,
     ) -> dict[str, Any]:
         existing = conn.execute(
             "SELECT * FROM events WHERE turn_id=? AND event_kind=? AND event_version=?",
@@ -762,7 +859,7 @@ class RecorderStore:
         event_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"recorder-next:event:{turn_id}:{event_kind}:{event_version}"))
         payload_json = _json(dict(payload))
         payload_sha = sha256_bytes(canonical_json(dict(payload)))
-        now = utc_now()
+        now = created_at or utc_now()
         conn.execute(
             "INSERT INTO events(event_id, turn_id, event_kind, event_version, turn_event_seq, payload_sha256, required_device_id, outcome, error_kind, payload_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (event_id, turn_id, event_kind, event_version, turn_event_seq, payload_sha, required_device_id, outcome, error_kind, payload_json, now),
@@ -797,6 +894,8 @@ class RecorderStore:
         artifact_version: int,
         source_text: str,
         output_kind: str,
+        delivery_target_device_id: str | None = None,
+        created_at: str | None = None,
     ) -> dict[str, Any]:
         existing = conn.execute(
             "SELECT * FROM tts_artifacts WHERE turn_id=? AND event_kind=? AND artifact_version=?",
@@ -806,11 +905,12 @@ class RecorderStore:
             return _row(existing) or {}
         turn = self._turn_row(conn, turn_id)
         artifact_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"recorder-next:tts:{turn_id}:{event_kind}:{artifact_version}"))
-        now = utc_now()
-        seq = self._next_delivery_seq_tx(conn, turn["origin_device_id"])
+        now = created_at or utc_now()
+        target = delivery_target_device_id or turn["delivery_target_device_id"] or turn["origin_device_id"]
+        seq = self._next_delivery_seq_tx(conn, target)
         conn.execute(
-            "INSERT INTO tts_artifacts(artifact_id, turn_id, event_id, event_kind, artifact_version, output_kind, origin_device_id, source_text, status, delivery_seq, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', ?, ?, ?)",
-            (artifact_id, turn_id, event_id, event_kind, artifact_version, output_kind, turn["origin_device_id"], source_text, seq, now, now),
+            "INSERT INTO tts_artifacts(artifact_id, turn_id, event_id, event_kind, artifact_version, output_kind, origin_device_id, delivery_target_device_id, source_text, status, delivery_seq, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', ?, ?, ?)",
+            (artifact_id, turn_id, event_id, event_kind, artifact_version, output_kind, turn["origin_device_id"], target, source_text, seq, now, now),
         )
         return _row(conn.execute("SELECT * FROM tts_artifacts WHERE artifact_id=?", (artifact_id,)).fetchone()) or {}
 
@@ -1341,7 +1441,14 @@ class RecorderStore:
                 raise NotFoundError("TTS artifact not found")
             return _row(row) or {}
 
-    def read_tts(self, artifact_id: str, *, device_id: str) -> tuple[dict[str, Any], bytes]:
+    def _read_tts(
+        self,
+        artifact_id: str,
+        *,
+        device_id: str,
+        allow_phone_bridge: bool,
+        require_phone_bridge: bool = False,
+    ) -> tuple[dict[str, Any], bytes]:
         with self._read() as conn:
             row = conn.execute(
                 "SELECT a.*, t.user_id FROM tts_artifacts a JOIN turns t ON t.turn_id=a.turn_id WHERE a.artifact_id=?",
@@ -1350,8 +1457,18 @@ class RecorderStore:
             if row is None:
                 raise NotFoundError("TTS artifact not found")
             self._assert_device(conn, row["user_id"], device_id)
-            if row["origin_device_id"] != device_id:
-                raise UnauthorizedError("TTS payload is bound to its origin device")
+            bridge = None
+            if allow_phone_bridge:
+                bridge = conn.execute(
+                    "SELECT kind FROM devices WHERE user_id=? AND device_id=? AND status='active'",
+                    (row["user_id"], device_id),
+                ).fetchone()
+                if require_phone_bridge and (bridge is None or bridge["kind"] != "phone"):
+                    raise UnauthorizedError("an active registered Phone is required for TTS bridge reads")
+            target = row["delivery_target_device_id"] or row["origin_device_id"]
+            if target != device_id:
+                if not allow_phone_bridge or bridge is None or bridge["kind"] != "phone":
+                    raise UnauthorizedError("TTS payload is bound to its delivery target or an authenticated Phone bridge")
             if row["status"] not in {"READY", "DELIVERY_PENDING", "EXPIRED"} or not row["storage_path"]:
                 raise NotReadyError("TTS artifact is not ready")
             path = Path(row["storage_path"])
@@ -1361,6 +1478,14 @@ class RecorderStore:
             metadata.pop("source_text", None)
             metadata.pop("user_id", None)
             return metadata, path.read_bytes()
+
+    def read_tts(self, artifact_id: str, *, device_id: str) -> tuple[dict[str, Any], bytes]:
+        """Read target audio or allow an active registered Phone to bridge it."""
+        return self._read_tts(artifact_id, device_id=device_id, allow_phone_bridge=True)
+
+    def read_tts_for_bridge(self, artifact_id: str, *, bridge_device_id: str) -> tuple[dict[str, Any], bytes]:
+        """Read target audio through the authenticated registered Phone bridge."""
+        return self._read_tts(artifact_id, device_id=bridge_device_id, allow_phone_bridge=True, require_phone_bridge=True)
 
     def set_tts_result(self, artifact_id: str, result: TTSResult | Mapping[str, Any] | None, *, error: str | None = None) -> dict[str, Any]:
         if result is not None and not isinstance(result, TTSResult):
@@ -1400,8 +1525,9 @@ class RecorderStore:
             if artifact is None:
                 raise NotFoundError("TTS artifact not found")
             self._assert_device(conn, artifact["user_id"], device_id)
-            if artifact["origin_device_id"] == device_id:
-                raise ConflictError("origin playback requires playback-complete ACK, not relay receipt")
+            target = artifact["delivery_target_device_id"] or artifact["origin_device_id"]
+            if target == device_id:
+                raise ConflictError("target playback requires playback-complete ACK, not relay receipt")
             if artifact["payload_sha256"] and artifact["payload_sha256"] != payload_sha256:
                 raise ConflictError("relay payload hash does not match")
             journal = conn.execute(
@@ -1422,7 +1548,14 @@ class RecorderStore:
         device_id: str,
         payload_sha256: str,
         turn_id: str | None = None,
+        artifact_version: int | None = None,
     ) -> dict[str, Any]:
+        if not isinstance(turn_id, str) or not turn_id:
+            raise ValidationError("turn_id is required for playback completion")
+        if not isinstance(artifact_version, int) or isinstance(artifact_version, bool) or artifact_version < 1:
+            raise ValidationError("artifact_version must be a positive native JSON integer")
+        if not isinstance(payload_sha256, str) or not payload_sha256:
+            raise ValidationError("payload_sha256 is required for playback completion")
         path: Path | None = None
         with self._tx() as conn:
             artifact = conn.execute(
@@ -1432,18 +1565,30 @@ class RecorderStore:
             if artifact is None:
                 raise NotFoundError("TTS artifact not found")
             self._assert_device(conn, artifact["user_id"], device_id)
-            if turn_id is not None and artifact["turn_id"] != turn_id:
+            if artifact["turn_id"] != turn_id:
                 raise UnauthorizedError("artifact does not belong to turn")
-            if artifact["origin_device_id"] != device_id:
-                raise UnauthorizedError("only the origin device may complete playback")
-            if artifact["payload_sha256"] and artifact["payload_sha256"] != payload_sha256:
+            if artifact["artifact_version"] != artifact_version:
+                raise UnauthorizedError("artifact version does not match playback receipt")
+            target = artifact["delivery_target_device_id"] or artifact["origin_device_id"]
+            if target != device_id:
+                raise UnauthorizedError("only the delivery target device may complete playback")
+            if artifact["status"] == "PLAYED":
+                if not artifact["payload_sha256"]:
+                    raise NotReadyError("played TTS artifact has no generated payload hash")
+                if artifact["payload_sha256"] != payload_sha256:
+                    raise ConflictError("playback payload hash does not match")
+                return _row(conn.execute("SELECT * FROM tts_artifacts WHERE artifact_id=?", (artifact_id,)).fetchone()) or {}
+            if artifact["status"] not in {"READY", "DELIVERY_PENDING"}:
+                raise NotReadyError("TTS artifact is not ready for playback completion")
+            if not artifact["payload_sha256"]:
+                raise NotReadyError("TTS artifact has no generated payload hash")
+            if artifact["payload_sha256"] != payload_sha256:
                 raise ConflictError("playback payload hash does not match")
-            if artifact["status"] != "PLAYED":
-                conn.execute(
-                    "INSERT OR REPLACE INTO playback_journal(artifact_id, device_id, payload_sha256, state, recorded_at) VALUES (?, ?, ?, 'PLAYED', ?)",
-                    (artifact_id, device_id, payload_sha256, utc_now()),
-                )
-                conn.execute("UPDATE tts_artifacts SET status='PLAYED', played_at=?, updated_at=? WHERE artifact_id=?", (utc_now(), utc_now(), artifact_id))
+            conn.execute(
+                "INSERT OR REPLACE INTO playback_journal(artifact_id, device_id, payload_sha256, state, recorded_at) VALUES (?, ?, ?, 'PLAYED', ?)",
+                (artifact_id, device_id, payload_sha256, utc_now()),
+            )
+            conn.execute("UPDATE tts_artifacts SET status='PLAYED', played_at=?, updated_at=? WHERE artifact_id=?", (utc_now(), utc_now(), artifact_id))
             path = Path(artifact["storage_path"]) if artifact["storage_path"] else None
             result = _row(conn.execute("SELECT * FROM tts_artifacts WHERE artifact_id=?", (artifact_id,)).fetchone()) or {}
         if path:
@@ -1451,9 +1596,484 @@ class RecorderStore:
                 path.unlink()
         return result
 
+    @staticmethod
+    def _schedule_identifier(value: Any, field: str) -> str:
+        if not isinstance(value, str) or not SCHEDULE_ID.fullmatch(value):
+            raise ValidationError(f"{field} must be a non-empty bounded identifier")
+        return value
+
+    @staticmethod
+    def _schedule_timestamp(value: Any, field: str) -> str:
+        if not isinstance(value, str) or not value:
+            raise ValidationError(f"{field} must be an RFC3339 timestamp")
+        try:
+            parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise ValidationError(f"{field} must be an RFC3339 timestamp") from exc
+        if parsed.tzinfo is None:
+            raise ValidationError(f"{field} must include a timezone")
+        return parsed.astimezone(dt.timezone.utc).isoformat(timespec="milliseconds")
+
+    def _schedule_payload(self, conn: sqlite3.Connection, schedule_id: str) -> dict[str, Any]:
+        row = conn.execute("SELECT * FROM schedules WHERE schedule_id=?", (schedule_id,)).fetchone()
+        if row is None:
+            raise NotFoundError("schedule not found")
+        result = _row(row) or {}
+        result["occurrences"] = [
+            _row(item) or {}
+            for item in conn.execute(
+                "SELECT * FROM schedule_occurrences WHERE schedule_id=? ORDER BY scheduled_for, trigger_instance_id",
+                (schedule_id,),
+            ).fetchall()
+        ]
+        if result.get("parent_turn_id"):
+            result["parent_turn"] = self._turn_payload(conn, result["parent_turn_id"])
+        return result
+
+    def get_schedule(self, schedule_id: str) -> dict[str, Any]:
+        schedule_id = self._schedule_identifier(schedule_id, "schedule_id")
+        with self._read() as conn:
+            return self._schedule_payload(conn, schedule_id)
+
+    def _commit_schedule_confirmation_tx(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        parent: sqlite3.Row,
+        schedule_id: str,
+        trigger_instance_id: str,
+        project_id: str,
+        session_key: str,
+        origin_device_id: str,
+        delivery_target_device_id: str,
+        confirmation_text: str,
+        now: str,
+    ) -> dict[str, Any]:
+        normalized = normalize_hermes_text(confirmation_text)
+        content_hash = hermes_content_hash(normalized)
+        combined_hash = hermes_content_hash(normalized)
+        conn.execute(
+            "INSERT INTO final_versions(turn_id, event_version, source, outcome, error_kind, source_ref, content_hash, combined_content_hash, combined_content, committed_at) VALUES (?, 1, 'schedule_confirmation', 'success', NULL, ?, ?, ?, NULL, ?)",
+            (parent["turn_id"], schedule_id, content_hash, combined_hash, now),
+        )
+        payload = {
+            "type": "FINAL",
+            "turn_id": parent["turn_id"],
+            "event_version": 1,
+            "text": normalized,
+            "outcome": "success",
+            "error_kind": None,
+            "source": "schedule_confirmation",
+            "schedule_id": schedule_id,
+            "trigger_instance_id": trigger_instance_id,
+        }
+        event = self._insert_event_tx(
+            conn,
+            turn_id=parent["turn_id"],
+            event_kind="FINAL",
+            event_version=1,
+            required_device_id=delivery_target_device_id,
+            payload=payload,
+            outcome="success",
+            error_kind=None,
+            create_outbox=True,
+            created_at=now,
+        )
+        self._create_tts_tx(
+            conn,
+            turn_id=parent["turn_id"],
+            event_id=event["event_id"],
+            event_kind="FINAL",
+            artifact_version=1,
+            source_text=normalized,
+            output_kind="FINAL_TTS",
+            delivery_target_device_id=delivery_target_device_id,
+            created_at=now,
+        )
+        conn.execute(
+            "UPDATE turns SET final_event_version=1, final_combined_hash=?, final_content=?, final_outcome='success', final_error_kind=NULL, state='FINAL_READY', project_id=COALESCE(project_id, ?), session_key=COALESCE(session_key, ?), delivery_target_device_id=?, updated_at=? WHERE turn_id=? AND final_event_version=0",
+            (combined_hash, normalized, project_id, session_key, delivery_target_device_id, now, parent["turn_id"]),
+        )
+        if conn.execute("SELECT changes()").fetchone()[0] != 1:
+            raise ConflictError("parent turn already has a FINAL")
+        return event
+
+    def _record_schedule_failure(self, parent_turn_id: str) -> dict[str, Any] | None:
+        try:
+            with self._tx() as conn:
+                turn = self._turn_row(conn, parent_turn_id)
+                if turn["final_event_version"]:
+                    return self._turn_payload(conn, parent_turn_id)
+                return self._commit_protocol_final_tx(
+                    conn,
+                    turn_id=parent_turn_id,
+                    error_kind="schedule",
+                    message=FINAL_ERROR_MESSAGES["schedule"],
+                    grace_seconds=0,
+                    source_ref=f"recorder_protocol:schedule:{parent_turn_id}",
+                )
+        except Exception:
+            return None
+
+    def create_schedule(self, command: Mapping[str, Any]) -> dict[str, Any]:
+        parent_value = command.get("parent_turn_id") if isinstance(command, Mapping) else None
+        try:
+            parent_turn_id = self._validate_turn_id(parent_value)
+        except Exception:
+            return self._create_schedule_tx(command)
+        try:
+            return self._create_schedule_tx(command)
+        except Exception:
+            self._record_schedule_failure(parent_turn_id)
+            raise
+
+    def _create_schedule_tx(self, command: Mapping[str, Any]) -> dict[str, Any]:
+        command = dict(command)
+        parent_turn_id = self._validate_turn_id(command.get("parent_turn_id"))
+        schedule_id = self._schedule_identifier(
+            command.get("schedule_id")
+            or str(uuid.uuid5(uuid.NAMESPACE_URL, f"recorder-next:schedule:{parent_turn_id}:{command.get('fire_at_utc')}:{command.get('reminder_text', command.get('text', ''))}")),
+            "schedule_id",
+        )
+        fire_at = self._schedule_timestamp(command.get("fire_at_utc"), "fire_at_utc")
+        reminder_text = command.get("reminder_text", command.get("text"))
+        confirmation_text = command.get("confirmation_text", "타이머를 설정했습니다.")
+        if not isinstance(reminder_text, str) or not reminder_text:
+            raise ValidationError("reminder_text must be a non-empty string")
+        if not isinstance(confirmation_text, str) or not confirmation_text:
+            raise ValidationError("confirmation_text must be a non-empty string")
+        timezone_offset = command.get("timezone_offset", command.get("timezone", "UTC"))
+        if not isinstance(timezone_offset, str) or not timezone_offset:
+            raise ValidationError("timezone_offset must be a non-empty string")
+        trigger_instance_id = self._schedule_identifier(
+            command.get("trigger_instance_id")
+            or str(uuid.uuid5(uuid.NAMESPACE_URL, f"recorder-next:trigger:{schedule_id}:{fire_at}")),
+            "trigger_instance_id",
+        )
+        now = self._now()
+        request = {
+            "schedule_id": schedule_id,
+            "parent_turn_id": parent_turn_id,
+            "project_id": command.get("project_id"),
+            "session_key": command.get("session_key"),
+            "origin_device_id": command.get("origin_device_id"),
+            "delivery_target_device_id": command.get("delivery_target_device_id"),
+            "fire_at_utc": fire_at,
+            "timezone_offset": timezone_offset,
+            "reminder_text": reminder_text,
+            "generation_instruction": command.get("generation_instruction"),
+            "confirmation_text": confirmation_text,
+            "trigger_instance_id": trigger_instance_id,
+        }
+        request_sha = sha256_json(request)
+        with self._tx() as conn:
+            existing = conn.execute("SELECT request_sha256 FROM schedules WHERE schedule_id=?", (schedule_id,)).fetchone()
+            if existing is not None:
+                if existing["request_sha256"] != request_sha:
+                    raise ConflictError("schedule_id already has a different immutable definition")
+                return self._schedule_payload(conn, schedule_id)
+            by_request = conn.execute("SELECT schedule_id FROM schedules WHERE request_sha256=?", (request_sha,)).fetchone()
+            if by_request is not None:
+                return self._schedule_payload(conn, by_request["schedule_id"])
+            parent = self._turn_row(conn, parent_turn_id)
+            if parent["state"] in TERMINAL_TURN_STATES or parent["final_event_version"]:
+                raise ConflictError("schedule confirmation requires a parent turn without a FINAL")
+            origin_device_id = command.get("origin_device_id") or parent["origin_device_id"]
+            if origin_device_id != parent["origin_device_id"]:
+                raise UnauthorizedError("schedule origin device must match the parent turn")
+            delivery_target = command.get("delivery_target_device_id") or origin_device_id
+            if not isinstance(delivery_target, str) or not delivery_target:
+                raise ValidationError("delivery_target_device_id must be non-empty")
+            self._assert_device(conn, parent["user_id"], origin_device_id)
+            self._assert_device(conn, parent["user_id"], delivery_target)
+            project_id = command.get("project_id") or parent["project_id"]
+            session_key = command.get("session_key") or parent["session_key"]
+            if not project_id or not session_key:
+                raise ValidationError("project_id and session_key are required for a schedule")
+            project = conn.execute(
+                "SELECT * FROM projects WHERE stable_project_id=? AND user_id=? AND status='active'",
+                (project_id, parent["user_id"]),
+            ).fetchone()
+            if project is None or project["default_session_key"] != session_key:
+                raise ConflictError("schedule project/session reference is not active")
+            conn.execute(
+                "INSERT INTO schedules(schedule_id, user_id, parent_turn_id, project_id, session_key, origin_device_id, delivery_target_device_id, fire_at_utc, timezone_offset, reminder_text, generation_instruction, confirmation_text, request_sha256, trigger_instance_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    schedule_id,
+                    parent["user_id"],
+                    parent_turn_id,
+                    project_id,
+                    session_key,
+                    origin_device_id,
+                    delivery_target,
+                    fire_at,
+                    timezone_offset,
+                    reminder_text,
+                    command.get("generation_instruction"),
+                    normalize_hermes_text(confirmation_text),
+                    request_sha,
+                    trigger_instance_id,
+                    now,
+                    now,
+                ),
+            )
+            conn.execute(
+                "INSERT INTO schedule_occurrences(schedule_id, trigger_instance_id, scheduled_for, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+                (schedule_id, trigger_instance_id, fire_at, now, now),
+            )
+            confirmation = self._commit_schedule_confirmation_tx(
+                conn,
+                parent=parent,
+                schedule_id=schedule_id,
+                trigger_instance_id=trigger_instance_id,
+                project_id=project_id,
+                session_key=session_key,
+                origin_device_id=origin_device_id,
+                delivery_target_device_id=delivery_target,
+                confirmation_text=confirmation_text,
+                now=now,
+            )
+            conn.execute(
+                "UPDATE schedules SET confirmation_event_id=?, updated_at=? WHERE schedule_id=?",
+                (confirmation["event_id"], now, schedule_id),
+            )
+            return self._schedule_payload(conn, schedule_id)
+
+    def _scheduled_delivery_payload(self, conn: sqlite3.Connection, occurrence: sqlite3.Row) -> dict[str, Any]:
+        turn_id = occurrence["turn_id"]
+        result = {
+            "schedule_id": occurrence["schedule_id"],
+            "trigger_instance_id": occurrence["trigger_instance_id"],
+            "turn_id": turn_id,
+            "event_id": occurrence["event_id"],
+            "artifact_id": occurrence["artifact_id"],
+            "turn": self._turn_payload(conn, turn_id) if turn_id else None,
+        }
+        return result
+
+    def claim_due_occurrence(
+        self,
+        *,
+        owner: str,
+        lease_seconds: int = 30,
+        now: str | None = None,
+    ) -> dict[str, Any] | None:
+        if not owner:
+            raise ValidationError("scheduler owner is required")
+        if not isinstance(lease_seconds, int) or isinstance(lease_seconds, bool) or lease_seconds <= 0:
+            raise ValidationError("lease_seconds must be a positive integer")
+        now = self._schedule_timestamp(now or self._now(), "now")
+        expires = (dt.datetime.fromisoformat(now) + dt.timedelta(seconds=lease_seconds)).isoformat(timespec="milliseconds")
+        with self._tx() as conn:
+            row = conn.execute(
+                "SELECT o.*, s.state AS schedule_state, s.version AS schedule_version FROM schedule_occurrences o JOIN schedules s ON s.schedule_id=o.schedule_id WHERE o.scheduled_for <= ? AND o.state IN ('PENDING','CLAIMED') AND (o.state='PENDING' OR o.lease_expires_at <= ?) AND s.state IN ('SCHEDULED','CLAIMED') ORDER BY o.scheduled_for, o.schedule_id, o.trigger_instance_id LIMIT 1",
+                (now, now),
+            ).fetchone()
+            if row is None:
+                return None
+            old_version = int(row["version"])
+            changed = conn.execute(
+                "UPDATE schedule_occurrences SET state='CLAIMED', version=?, lease_owner=?, lease_expires_at=?, attempt_count=attempt_count+1, updated_at=? WHERE schedule_id=? AND trigger_instance_id=? AND version=? AND (state='PENDING' OR (state='CLAIMED' AND lease_expires_at <= ?))",
+                (old_version + 1, owner, expires, now, row["schedule_id"], row["trigger_instance_id"], old_version, now),
+            ).rowcount
+            if changed != 1:
+                return None
+            schedule_changed = conn.execute(
+                "UPDATE schedules SET state='CLAIMED', version=version+1, lease_owner=?, lease_expires_at=?, attempt_count=attempt_count+1, updated_at=? WHERE schedule_id=? AND version=? AND state IN ('SCHEDULED','CLAIMED')",
+                (owner, expires, now, row["schedule_id"], row["schedule_version"]),
+            ).rowcount
+            if schedule_changed != 1:
+                raise LeaseConflict("schedule version compare-and-set failed")
+            claimed = conn.execute(
+                "SELECT * FROM schedule_occurrences WHERE schedule_id=? AND trigger_instance_id=?",
+                (row["schedule_id"], row["trigger_instance_id"]),
+            ).fetchone()
+            return _row(claimed) if claimed is not None else None
+
+    def commit_scheduled_occurrence(
+        self,
+        schedule_id: str,
+        trigger_instance_id: str,
+        *,
+        owner: str,
+        now: str | None = None,
+    ) -> dict[str, Any]:
+        schedule_id = self._schedule_identifier(schedule_id, "schedule_id")
+        trigger_instance_id = self._schedule_identifier(trigger_instance_id, "trigger_instance_id")
+        now = self._schedule_timestamp(now or self._now(), "now")
+        with self._tx() as conn:
+            occurrence = conn.execute(
+                "SELECT o.*, s.user_id, s.parent_turn_id, s.project_id, s.session_key, s.origin_device_id, s.delivery_target_device_id, s.reminder_text, s.generation_instruction, s.fire_at_utc, s.state AS schedule_state FROM schedule_occurrences o JOIN schedules s ON s.schedule_id=o.schedule_id WHERE o.schedule_id=? AND o.trigger_instance_id=?",
+                (schedule_id, trigger_instance_id),
+            ).fetchone()
+            if occurrence is None:
+                raise NotFoundError("scheduled occurrence not found")
+            if occurrence["state"] == "FIRED" and occurrence["turn_id"]:
+                return self._scheduled_delivery_payload(conn, occurrence)
+            if occurrence["state"] != "CLAIMED" or occurrence["lease_owner"] != owner or not occurrence["lease_expires_at"] or occurrence["lease_expires_at"] <= now:
+                raise LeaseConflict("scheduled occurrence lease is not owned or has expired")
+            turn_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"recorder-next:scheduled-turn:{schedule_id}:{trigger_instance_id}"))
+            existing_turn = conn.execute("SELECT * FROM turns WHERE turn_id=?", (turn_id,)).fetchone()
+            if existing_turn is not None:
+                previous = conn.execute("SELECT * FROM turns WHERE turn_id=?", (existing_turn["previous_turn_id"],)).fetchone()
+                if previous is None:
+                    previous = {
+                        "turn_id": existing_turn["previous_turn_id"],
+                        "origin_device_id": existing_turn["previous_turn_origin_device_id"],
+                    }
+                target_device_id = existing_turn["delivery_target_device_id"] or existing_turn["origin_device_id"]
+            else:
+                previous = conn.execute(
+                    "SELECT * FROM turns WHERE user_id=? AND turn_source='client' AND accepted_seq IS NOT NULL ORDER BY accepted_seq DESC, updated_at DESC, turn_id DESC LIMIT 1",
+                    (occurrence["user_id"],),
+                ).fetchone()
+                if previous is None:
+                    raise ConflictError("server schedule has no durable client-originated target turn")
+                target_device_id = previous["origin_device_id"]
+            if existing_turn is None:
+                manifest = {
+                    "schema_version": 1,
+                    "user_id": occurrence["user_id"],
+                    "turn_id": turn_id,
+                    "origin_device_id": occurrence["origin_device_id"],
+                    "client_created_at": occurrence["scheduled_for"],
+                    "parts": [],
+                    "turn_source": "server_schedule",
+                    "schedule_id": schedule_id,
+                    "trigger_instance_id": trigger_instance_id,
+                    "parent_turn_id": occurrence["parent_turn_id"],
+                    "previous_turn_id": previous["turn_id"],
+                    "previous_turn_origin_device_id": previous["origin_device_id"],
+                    "project_id": occurrence["project_id"],
+                    "session_key": occurrence["session_key"],
+                }
+                initial_fingerprint = sha256_json(manifest)
+                conn.execute(
+                    "INSERT INTO turns(turn_id, user_id, origin_device_id, client_created_at, initial_fingerprint, manifest_json, state, turn_source, schedule_id, trigger_instance_id, parent_turn_id, previous_turn_id, previous_turn_origin_device_id, scheduled_for, fired_at, project_id, session_key, delivery_target_device_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, 'FINAL_READY', 'server_schedule', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        turn_id,
+                        occurrence["user_id"],
+                        occurrence["origin_device_id"],
+                        occurrence["scheduled_for"],
+                        initial_fingerprint,
+                        _json(manifest),
+                        schedule_id,
+                        trigger_instance_id,
+                        occurrence["parent_turn_id"],
+                        previous["turn_id"],
+                        previous["origin_device_id"],
+                        occurrence["scheduled_for"],
+                        now,
+                        occurrence["project_id"],
+                        occurrence["session_key"],
+                        target_device_id,
+                        now,
+                        now,
+                    ),
+                )
+            text = normalize_hermes_text(occurrence["reminder_text"])
+            content_hash = hermes_content_hash(text)
+            conn.execute(
+                "INSERT OR IGNORE INTO final_versions(turn_id, event_version, source, outcome, error_kind, source_ref, content_hash, combined_content_hash, combined_content, committed_at) VALUES (?, 1, 'server_schedule', 'success', NULL, ?, ?, ?, NULL, ?)",
+                (turn_id, f"{schedule_id}:{trigger_instance_id}", content_hash, content_hash, now),
+            )
+            payload = {
+                "type": "FINAL",
+                "turn_id": turn_id,
+                "turn_source": "server_schedule",
+                "schedule_id": schedule_id,
+                "trigger_instance_id": trigger_instance_id,
+                "parent_turn_id": occurrence["parent_turn_id"],
+                "project_id": occurrence["project_id"],
+                "session_key": occurrence["session_key"],
+                "origin_device_id": occurrence["origin_device_id"],
+                "previous_turn_id": previous["turn_id"],
+                "previous_turn_origin_device_id": previous["origin_device_id"],
+                "delivery_target_device_id": target_device_id,
+                "scheduled_for": occurrence["scheduled_for"],
+                "fired_at": now,
+                "event_id": str(uuid.uuid5(uuid.NAMESPACE_URL, f"recorder-next:event:{turn_id}:FINAL:1")),
+                "event_kind": "FINAL",
+                "event_version": 1,
+                "outcome": "success",
+                "text": text,
+                "tts_expected": True,
+                "created_at": now,
+            }
+            event = self._insert_event_tx(
+                conn,
+                turn_id=turn_id,
+                event_kind="FINAL",
+                event_version=1,
+                required_device_id=target_device_id,
+                payload=payload,
+                outcome="success",
+                error_kind=None,
+                create_outbox=True,
+                created_at=now,
+            )
+            artifact = self._create_tts_tx(
+                conn,
+                turn_id=turn_id,
+                event_id=event["event_id"],
+                event_kind="FINAL",
+                artifact_version=1,
+                source_text=text,
+                output_kind="FINAL_TTS",
+                delivery_target_device_id=target_device_id,
+                created_at=now,
+            )
+            conn.execute(
+                "UPDATE turns SET final_event_version=1, final_combined_hash=?, final_content=?, final_outcome='success', final_error_kind=NULL, updated_at=? WHERE turn_id=? AND final_event_version=0",
+                (content_hash, text, now, turn_id),
+            )
+            conn.execute(
+                "UPDATE schedule_occurrences SET state='FIRED', version=version+1, lease_owner=NULL, lease_expires_at=NULL, previous_turn_id=?, previous_turn_origin_device_id=?, delivery_target_device_id=?, turn_id=?, event_id=?, artifact_id=?, fired_at=?, updated_at=? WHERE schedule_id=? AND trigger_instance_id=? AND state='CLAIMED' AND lease_owner=?",
+                (previous["turn_id"], previous["origin_device_id"], target_device_id, turn_id, event["event_id"], artifact["artifact_id"], now, now, schedule_id, trigger_instance_id, owner),
+            )
+            if conn.execute("SELECT changes()").fetchone()[0] != 1:
+                raise LeaseConflict("scheduled occurrence completion compare-and-set failed")
+            conn.execute(
+                "UPDATE schedules SET state='FIRED', version=version+1, lease_owner=NULL, lease_expires_at=NULL, delivery_target_device_id=?, confirmation_event_id=confirmation_event_id, fired_at=?, updated_at=? WHERE schedule_id=? AND state='CLAIMED' AND lease_owner=?",
+                (target_device_id, now, now, schedule_id, owner),
+            )
+            return self._scheduled_delivery_payload(
+                conn,
+                conn.execute(
+                    "SELECT * FROM schedule_occurrences WHERE schedule_id=? AND trigger_instance_id=?",
+                    (schedule_id, trigger_instance_id),
+                ).fetchone(),
+            )
+
+    def fire_due_schedules(
+        self,
+        *,
+        owner: str = "scheduler-1",
+        lease_seconds: int = 30,
+        limit: int = 50,
+        now: str | None = None,
+    ) -> list[dict[str, Any]]:
+        if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 1000:
+            raise ValidationError("scheduler limit must be an integer from 1 to 1000")
+        effective_now = self._schedule_timestamp(now or self._now(), "now")
+        results: list[dict[str, Any]] = []
+        for _ in range(limit):
+            claim = self.claim_due_occurrence(owner=owner, lease_seconds=lease_seconds, now=effective_now)
+            if claim is None:
+                break
+            results.append(
+                self.commit_scheduled_occurrence(
+                    claim["schedule_id"],
+                    claim["trigger_instance_id"],
+                    owner=owner,
+                    now=effective_now,
+                )
+            )
+        return results
+
     def set_recording_lease(self, device_id: str, *, active: bool, lease_seconds: int = 60) -> None:
-        now = utc_now()
-        expires = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=lease_seconds)).isoformat(timespec="milliseconds") if active else None
+        now = self._now()
+        expires = (dt.datetime.fromisoformat(now.replace("Z", "+00:00")) + dt.timedelta(seconds=lease_seconds)).isoformat(timespec="milliseconds") if active else None
         with self._tx() as conn:
             conn.execute(
                 "INSERT INTO recording_leases(device_id, active, lease_expires_at, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT(device_id) DO UPDATE SET active=excluded.active, lease_expires_at=excluded.lease_expires_at, updated_at=excluded.updated_at",
@@ -1547,7 +2167,7 @@ class RecorderStore:
         return complete
 
     def recover(self, *, now: str | None = None) -> dict[str, int]:
-        now = now or utc_now()
+        now = now or self._now()
         with self._tx() as conn:
             source_pending = [row["turn_id"] for row in conn.execute("SELECT turn_id FROM turns WHERE source_deleted=0 AND authoritative_asr_outcome='VALID_TRANSCRIPT'").fetchall()]
             router_count = conn.execute(
@@ -1566,11 +2186,21 @@ class RecorderStore:
                 "UPDATE turns SET state='EXPIRED', updated_at=? WHERE state='LATE_RESULT_GRACE' AND final_error_kind='hermes' AND grace_until <= ?",
                 (now, now),
             ).rowcount
+            schedule_occurrences_requeued = conn.execute(
+                "UPDATE schedule_occurrences SET state='PENDING', version=version+1, lease_owner=NULL, lease_expires_at=NULL, updated_at=? WHERE state='CLAIMED' AND lease_expires_at <= ?",
+                (now, now),
+            ).rowcount
+            schedules_requeued = conn.execute(
+                "UPDATE schedules SET state='SCHEDULED', version=version+1, lease_owner=NULL, lease_expires_at=NULL, updated_at=? WHERE state='CLAIMED' AND lease_expires_at <= ?",
+                (now, now),
+            ).rowcount
             result = {
                 "router_leases_requeued": router_count,
                 "session_ingress_requeued": ingress_count,
                 "grace_failed": grace_failed,
                 "grace_expired": grace_expired,
+                "schedule_occurrences_requeued": schedule_occurrences_requeued,
+                "schedules_requeued": schedules_requeued,
                 "source_deletions_retried": 0,
             }
         for pending_turn_id in source_pending:
@@ -1589,8 +2219,8 @@ class RecorderStore:
     def pending_tts(self, *, limit: int = 50) -> list[dict[str, Any]]:
         with self._read() as conn:
             rows = conn.execute(
-                "SELECT t.* FROM tts_artifacts t LEFT JOIN recording_leases r ON r.device_id=t.origin_device_id WHERE t.status IN ('PENDING','DELIVERY_PENDING') AND (r.device_id IS NULL OR r.active=0 OR r.lease_expires_at <= ?) ORDER BY t.origin_device_id, t.delivery_seq LIMIT ?",
-                (utc_now(), limit),
+                "SELECT t.* FROM tts_artifacts t LEFT JOIN recording_leases r ON r.device_id=COALESCE(t.delivery_target_device_id, t.origin_device_id) WHERE t.status IN ('PENDING','DELIVERY_PENDING','FAILED_GENERATION') AND (r.device_id IS NULL OR r.active=0 OR r.lease_expires_at <= ?) ORDER BY COALESCE(t.delivery_target_device_id, t.origin_device_id), t.delivery_seq LIMIT ?",
+                (self._now(), limit),
             ).fetchall()
             return [_row(row) or {} for row in rows]
 
@@ -1711,6 +2341,6 @@ class RecorderStore:
             return self._turn_payload(conn, turn_id)
 
     def db_snapshot(self) -> dict[str, int]:
-        tables = ["turns", "turn_parts", "turn_chunks", "events", "outbox", "router_queue", "projects", "session_ingress", "hermes_results", "final_versions", "tts_artifacts", "asr_attempts"]
+        tables = ["turns", "turn_parts", "turn_chunks", "events", "outbox", "router_queue", "projects", "session_ingress", "hermes_results", "final_versions", "tts_artifacts", "asr_attempts", "schedules", "schedule_occurrences"]
         with self._read() as conn:
             return {table: conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] for table in tables}

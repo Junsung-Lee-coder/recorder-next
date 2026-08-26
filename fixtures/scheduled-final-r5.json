@@ -1,0 +1,33 @@
+{
+  "fixture_id": "scheduled-final-r5-synthetic-01",
+  "generated": true,
+  "privacy": "synthetic-no-user-data",
+  "clock": {
+    "initial": "2026-08-26T00:00:00.000+00:00",
+    "fire_at": "2026-08-26T00:00:30.000+00:00",
+    "fired_at": "2026-08-26T00:00:30.000+00:00"
+  },
+  "schedule": {
+    "schedule_id": "schedule-phone-to-wear-01",
+    "parent_turn_id": "018f5a2e-7b6e-7abc-8d11-1234567890e1",
+    "project_id": "stable-project-phone",
+    "session_key": "project:stable-project-phone:default",
+    "fire_at_utc": "2026-08-26T00:00:30.000+00:00",
+    "state": "FIRED"
+  },
+  "latest_client_turn_before_fire": {
+    "previous_turn_id": "018f5a2e-7b6e-7abc-8d11-1234567890e2",
+    "previous_turn_origin_device_id": "opaque-watch-device"
+  },
+  "scheduled_final": {
+    "turn_source": "server_schedule",
+    "event_kind": "FINAL",
+    "event_version": 1,
+    "delivery_target_device_id": "opaque-watch-device",
+    "tts_expected": true
+  },
+  "ack_contract": {
+    "phone_relay_receipt": "does_not_complete_playback",
+    "watch_playback_complete_ack": "required_for_PLAYED"
+  }
+}

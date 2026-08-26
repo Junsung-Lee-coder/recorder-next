@@ -72,6 +72,8 @@ class RecorderR1RepairTests(unittest.TestCase):
                 artifact["artifact_id"],
                 device_id="relay-phone",
                 payload_sha256=ready["payload_sha256"],
+                turn_id=turn_id,
+                artifact_version=artifact["artifact_version"],
             )
 
             status, _, response = service.handle_http(

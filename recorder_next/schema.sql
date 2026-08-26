@@ -58,6 +58,15 @@ CREATE TABLE IF NOT EXISTS turns (
     route_decision_id TEXT,
     project_id TEXT,
     session_key TEXT,
+    turn_source TEXT NOT NULL DEFAULT 'client',
+    schedule_id TEXT,
+    trigger_instance_id TEXT,
+    parent_turn_id TEXT,
+    previous_turn_id TEXT,
+    previous_turn_origin_device_id TEXT,
+    scheduled_for TEXT,
+    fired_at TEXT,
+    delivery_target_device_id TEXT,
     archived_at TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
@@ -234,6 +243,7 @@ CREATE TABLE IF NOT EXISTS tts_artifacts (
     artifact_version INTEGER NOT NULL,
     output_kind TEXT NOT NULL,
     origin_device_id TEXT NOT NULL,
+    delivery_target_device_id TEXT,
     payload_sha256 TEXT,
     storage_path TEXT,
     source_text TEXT,
@@ -248,6 +258,59 @@ CREATE TABLE IF NOT EXISTS tts_artifacts (
     FOREIGN KEY(event_id) REFERENCES events(event_id) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS idx_tts_device_order ON tts_artifacts(origin_device_id, status, delivery_seq);
+
+CREATE TABLE IF NOT EXISTS schedules (
+    schedule_id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    parent_turn_id TEXT NOT NULL,
+    project_id TEXT NOT NULL,
+    session_key TEXT NOT NULL,
+    origin_device_id TEXT NOT NULL,
+    delivery_target_device_id TEXT NOT NULL,
+    fire_at_utc TEXT NOT NULL,
+    timezone_offset TEXT NOT NULL,
+    reminder_text TEXT NOT NULL,
+    generation_instruction TEXT,
+    confirmation_text TEXT NOT NULL,
+    request_sha256 TEXT NOT NULL UNIQUE,
+    state TEXT NOT NULL DEFAULT 'SCHEDULED' CHECK(state IN ('SCHEDULED','CLAIMED','FIRED','FAILED','CANCELLED')),
+    version INTEGER NOT NULL DEFAULT 1,
+    lease_owner TEXT,
+    lease_expires_at TEXT,
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    trigger_instance_id TEXT NOT NULL,
+    confirmation_event_id TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    fired_at TEXT,
+    FOREIGN KEY(parent_turn_id) REFERENCES turns(turn_id) ON DELETE RESTRICT
+);
+CREATE INDEX IF NOT EXISTS idx_schedules_due ON schedules(state, fire_at_utc);
+
+CREATE TABLE IF NOT EXISTS schedule_occurrences (
+    schedule_id TEXT NOT NULL,
+    trigger_instance_id TEXT NOT NULL,
+    scheduled_for TEXT NOT NULL,
+    previous_turn_id TEXT,
+    previous_turn_origin_device_id TEXT,
+    delivery_target_device_id TEXT,
+    state TEXT NOT NULL DEFAULT 'PENDING' CHECK(state IN ('PENDING','CLAIMED','FIRED','FAILED')),
+    version INTEGER NOT NULL DEFAULT 1,
+    lease_owner TEXT,
+    lease_expires_at TEXT,
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    turn_id TEXT,
+    event_id TEXT,
+    artifact_id TEXT,
+    fired_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY(schedule_id, trigger_instance_id),
+    UNIQUE(turn_id),
+    FOREIGN KEY(schedule_id) REFERENCES schedules(schedule_id) ON DELETE CASCADE,
+    FOREIGN KEY(turn_id) REFERENCES turns(turn_id) ON DELETE RESTRICT
+);
+CREATE INDEX IF NOT EXISTS idx_schedule_occurrences_due ON schedule_occurrences(state, scheduled_for);
 
 CREATE TABLE IF NOT EXISTS playback_journal (
     artifact_id TEXT PRIMARY KEY,
@@ -279,4 +342,4 @@ CREATE TABLE IF NOT EXISTS audit_events (
     created_at TEXT NOT NULL
 );
 
-INSERT OR IGNORE INTO schema_meta(key, value) VALUES ('schema_version', '1');
+INSERT OR IGNORE INTO schema_meta(key, value) VALUES ('schema_version', '2');

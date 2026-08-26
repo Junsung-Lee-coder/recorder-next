@@ -152,8 +152,20 @@ class TTSRetentionTests(unittest.TestCase):
             ready = store.get_artifact(artifact["artifact_id"])
             self.assertTrue(Path(ready["storage_path"]).exists())
             with self.assertRaises(Exception):
-                store.ack_playback(artifact["artifact_id"], device_id="other-device", payload_sha256=ready["payload_sha256"])
-            played = store.ack_playback(artifact["artifact_id"], device_id="phone-1", payload_sha256=ready["payload_sha256"])
+                store.ack_playback(
+                    artifact["artifact_id"],
+                    device_id="other-device",
+                    payload_sha256=ready["payload_sha256"],
+                    turn_id=turn_id,
+                    artifact_version=artifact["artifact_version"],
+                )
+            played = store.ack_playback(
+                artifact["artifact_id"],
+                device_id="phone-1",
+                payload_sha256=ready["payload_sha256"],
+                turn_id=turn_id,
+                artifact_version=artifact["artifact_version"],
+            )
             self.assertEqual(played["status"], "PLAYED")
             self.assertFalse(Path(ready["storage_path"]).exists())
 
