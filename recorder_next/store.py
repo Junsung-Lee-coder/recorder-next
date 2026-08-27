@@ -1851,6 +1851,62 @@ class RecorderStore:
         }
         return result
 
+    @staticmethod
+    def _validate_existing_scheduled_turn_identity(
+        *,
+        existing_turn: sqlite3.Row,
+        occurrence: sqlite3.Row,
+        schedule_id: str,
+        trigger_instance_id: str,
+        turn_id: str,
+        previous: sqlite3.Row,
+        delivery_target_device_id: str,
+    ) -> None:
+        expected_fields = {
+            "turn_id": turn_id,
+            "user_id": occurrence["user_id"],
+            "origin_device_id": occurrence["origin_device_id"],
+            "client_created_at": occurrence["scheduled_for"],
+            "current_project_number": None,
+            "prefer_current_project": 0,
+            "turn_source": "server_schedule",
+            "schedule_id": schedule_id,
+            "trigger_instance_id": trigger_instance_id,
+            "parent_turn_id": occurrence["parent_turn_id"],
+            "previous_turn_id": previous["turn_id"],
+            "previous_turn_origin_device_id": previous["origin_device_id"],
+            "scheduled_for": occurrence["scheduled_for"],
+            "project_id": occurrence["project_id"],
+            "session_key": occurrence["session_key"],
+            "delivery_target_device_id": delivery_target_device_id,
+        }
+        if any(existing_turn[field] != expected for field, expected in expected_fields.items()):
+            raise ConflictError("deterministic scheduled turn is owned by an incompatible turn")
+        if previous["user_id"] != occurrence["user_id"] or previous["turn_source"] != "client" or previous["accepted_seq"] is None:
+            raise ConflictError("scheduled turn previous turn is not a durable client turn")
+        try:
+            manifest = _loads(existing_turn["manifest_json"])
+        except (TypeError, ValueError):
+            manifest = None
+        expected_manifest = {
+            "schema_version": 1,
+            "user_id": occurrence["user_id"],
+            "turn_id": turn_id,
+            "origin_device_id": occurrence["origin_device_id"],
+            "client_created_at": occurrence["scheduled_for"],
+            "parts": [],
+            "turn_source": "server_schedule",
+            "schedule_id": schedule_id,
+            "trigger_instance_id": trigger_instance_id,
+            "parent_turn_id": occurrence["parent_turn_id"],
+            "previous_turn_id": previous["turn_id"],
+            "previous_turn_origin_device_id": previous["origin_device_id"],
+            "project_id": occurrence["project_id"],
+            "session_key": occurrence["session_key"],
+        }
+        if manifest != expected_manifest or existing_turn["initial_fingerprint"] != sha256_json(expected_manifest):
+            raise ConflictError("deterministic scheduled turn envelope is incompatible")
+
     def claim_due_occurrence(
         self,
         *,
@@ -1908,21 +1964,48 @@ class RecorderStore:
             ).fetchone()
             if occurrence is None:
                 raise NotFoundError("scheduled occurrence not found")
+            turn_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"recorder-next:scheduled-turn:{schedule_id}:{trigger_instance_id}"))
+            occurrence_target_device_id = occurrence["delivery_target_device_id"]
+            schedule_target_device_id = occurrence["schedule_delivery_target_device_id"]
+            if occurrence_target_device_id and schedule_target_device_id and occurrence_target_device_id != schedule_target_device_id:
+                raise ConflictError("scheduled occurrence delivery target conflicts with its schedule")
+            durable_target_device_id = occurrence_target_device_id or schedule_target_device_id
+            if not durable_target_device_id:
+                raise ConflictError("scheduled occurrence has no durable delivery target")
             if occurrence["state"] == "FIRED" and occurrence["turn_id"]:
+                if occurrence["turn_id"] != turn_id:
+                    raise ConflictError("scheduled occurrence turn identity is inconsistent")
+                existing_turn = conn.execute("SELECT * FROM turns WHERE turn_id=?", (turn_id,)).fetchone()
+                previous = conn.execute("SELECT * FROM turns WHERE turn_id=?", (existing_turn["previous_turn_id"],)).fetchone() if existing_turn is not None and existing_turn["previous_turn_id"] else None
+                if existing_turn is None or previous is None:
+                    raise ConflictError("scheduled occurrence points to an incomplete scheduled turn")
+                self._validate_existing_scheduled_turn_identity(
+                    existing_turn=existing_turn,
+                    occurrence=occurrence,
+                    schedule_id=schedule_id,
+                    trigger_instance_id=trigger_instance_id,
+                    turn_id=turn_id,
+                    previous=previous,
+                    delivery_target_device_id=durable_target_device_id,
+                )
                 return self._scheduled_delivery_payload(conn, occurrence)
             if occurrence["state"] != "CLAIMED" or occurrence["lease_owner"] != owner or not occurrence["lease_expires_at"] or occurrence["lease_expires_at"] <= now:
                 raise LeaseConflict("scheduled occurrence lease is not owned or has expired")
-            turn_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"recorder-next:scheduled-turn:{schedule_id}:{trigger_instance_id}"))
             existing_turn = conn.execute("SELECT * FROM turns WHERE turn_id=?", (turn_id,)).fetchone()
-            durable_target_device_id = occurrence["delivery_target_device_id"] or occurrence["schedule_delivery_target_device_id"]
             if existing_turn is not None:
-                previous = conn.execute("SELECT * FROM turns WHERE turn_id=?", (existing_turn["previous_turn_id"],)).fetchone()
+                previous = conn.execute("SELECT * FROM turns WHERE turn_id=?", (existing_turn["previous_turn_id"],)).fetchone() if existing_turn["previous_turn_id"] else None
                 if previous is None:
-                    previous = {
-                        "turn_id": existing_turn["previous_turn_id"],
-                        "origin_device_id": existing_turn["previous_turn_origin_device_id"],
-                    }
-                target_device_id = durable_target_device_id or existing_turn["delivery_target_device_id"] or existing_turn["origin_device_id"]
+                    raise ConflictError("deterministic scheduled turn is owned by an incompatible turn")
+                self._validate_existing_scheduled_turn_identity(
+                    existing_turn=existing_turn,
+                    occurrence=occurrence,
+                    schedule_id=schedule_id,
+                    trigger_instance_id=trigger_instance_id,
+                    turn_id=turn_id,
+                    previous=previous,
+                    delivery_target_device_id=durable_target_device_id,
+                )
+                target_device_id = durable_target_device_id
             else:
                 previous = conn.execute(
                     "SELECT * FROM turns WHERE user_id=? AND turn_source='client' AND accepted_seq IS NOT NULL ORDER BY accepted_seq DESC, updated_at DESC, turn_id DESC LIMIT 1",
@@ -1930,7 +2013,7 @@ class RecorderStore:
                 ).fetchone()
                 if previous is None:
                     raise ConflictError("server schedule has no durable client-originated target turn")
-                target_device_id = durable_target_device_id or previous["origin_device_id"]
+                target_device_id = durable_target_device_id
             if existing_turn is None:
                 manifest = {
                     "schema_version": 1,

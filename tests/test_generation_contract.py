@@ -13,7 +13,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).parents[1]
 BUILDER = ROOT / "release" / "build_candidate.py"
-FAILED_PRODUCT_SHA = "08802ff70fc2b4972407a6cb221169677ec1cf81ad625edcac88c154e7d25b07"
+FAILED_PRODUCT_SHA = "5b317a65106498ae84591eecfd6000525339e702380da47dc7802ab22482e384"
 
 
 def digest(path: Path) -> str:

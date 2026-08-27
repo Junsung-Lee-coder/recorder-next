@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build one deterministic, candidate-only Recorder Next rev18 generation."""
+"""Build one deterministic, candidate-only Recorder Next rev19 generation."""
 from __future__ import annotations
 
 import argparse
@@ -53,7 +53,7 @@ from control_contract import (
     write_json,
 )
 
-GENERATION = "bearer-r7-rev18"
+GENERATION = "bearer-r7-rev19"
 CONTROL_TEST_SOURCES = {
     "tests/test_activation_controls.py",
     "tests/test_generation_contract.py",
@@ -365,8 +365,8 @@ def build(repo: Path, output: Path) -> Path:
     if product_result.returncode != 0:
         raise BuildError(f"product suite failed: {product_result.stderr}")
     product_test_count = parse_test_count(product_log)
-    if product_test_count != 85:
-        raise BuildError(f"product suite ran {product_test_count}, expected 85")
+    if product_test_count != 87:
+        raise BuildError(f"product suite ran {product_test_count}, expected 87")
 
     manifest = manifest_template(generation, members, digest, archive, roles, transaction_path, transaction, candidate_sha256, candidate_id_value)
     # The preflight report is deterministic and does not bind later evidence hashes.

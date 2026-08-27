@@ -7,6 +7,7 @@ import sqlite3
 import tempfile
 import threading
 import unittest
+import uuid
 from pathlib import Path
 
 from recorder_next.clock import DeterministicClock
@@ -175,6 +176,81 @@ class ScheduledFinalStoreTests(unittest.TestCase):
             schedule = store.get_schedule("schedule-1")
             self.assertEqual(schedule["state"], "FIRED")
             self.assertEqual(len(schedule["occurrences"]), 1)
+
+    def test_preclaimed_scheduled_uuid_is_rejected_without_scheduled_side_effects(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            clock = DeterministicClock("2026-08-26T00:00:00+00:00")
+            store, _, project = _accepted_parent(Path(tmp), clock)
+            schedule = store.create_schedule(
+                _schedule_command(
+                    project,
+                    fire_at="2026-08-26T00:00:00+00:00",
+                    origin="watch-1",
+                    target="watch-1",
+                    schedule_id="schedule-collision",
+                )
+            )
+            scheduled_turn_id = str(
+                uuid.uuid5(
+                    uuid.NAMESPACE_URL,
+                    f"recorder-next:scheduled-turn:{schedule['schedule_id']}:{schedule['trigger_instance_id']}",
+                )
+            )
+            collision = _accepted_later_turn(
+                store,
+                turn_id=scheduled_turn_id,
+                device="phone-1",
+                project_number="P-client",
+            )
+            self.assertEqual(collision["turn_source"], "client")
+            self.assertIsNone(collision["schedule_id"])
+            self.assertIsNone(collision["trigger_instance_id"])
+
+            claim = store.claim_due_occurrence(owner="scheduler")
+            self.assertIsNotNone(claim)
+            assert claim is not None
+            claimed_snapshot = store.db_snapshot()
+            with self.assertRaises(ConflictError):
+                store.commit_scheduled_occurrence(
+                    claim["schedule_id"],
+                    claim["trigger_instance_id"],
+                    owner="scheduler",
+                )
+
+            self.assertEqual(store.db_snapshot(), claimed_snapshot)
+            preserved = store.get_turn(scheduled_turn_id)
+            self.assertEqual(preserved["state"], "ACCEPTED")
+            self.assertEqual(preserved["turn_source"], "client")
+            self.assertIsNone(preserved["schedule_id"])
+            self.assertIsNone(preserved["trigger_instance_id"])
+            self.assertEqual(preserved["final_event_version"], 0)
+            self.assertEqual(preserved["tts_artifacts"], [])
+            self.assertEqual(preserved["outbox"], [])
+            occurrence = store.get_schedule("schedule-collision")["occurrences"][0]
+            self.assertEqual(occurrence["state"], "CLAIMED")
+            self.assertIsNone(occurrence["turn_id"])
+            self.assertIsNone(occurrence["event_id"])
+            self.assertIsNone(occurrence["artifact_id"])
+
+    def test_scheduled_occurrence_replay_returns_original_delivery_without_duplicates(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            clock = DeterministicClock("2026-08-26T00:00:00+00:00")
+            store, _, project = _accepted_parent(Path(tmp), clock)
+            store.create_schedule(_schedule_command(project, fire_at="2026-08-26T00:00:00+00:00"))
+            first = store.fire_due_schedules(owner="scheduler")[0]
+            occurrence = store.get_schedule("schedule-1")["occurrences"][0]
+            before_replay = store.db_snapshot()
+
+            replay = store.commit_scheduled_occurrence(
+                "schedule-1",
+                occurrence["trigger_instance_id"],
+                owner="scheduler-replay",
+            )
+
+            self.assertEqual(replay["turn_id"], first["turn_id"])
+            self.assertEqual(replay["event_id"], first["event_id"])
+            self.assertEqual(replay["artifact_id"], first["artifact_id"])
+            self.assertEqual(store.db_snapshot(), before_replay)
 
     def test_explicit_schedule_target_wins_over_latest_phone_origin_for_scheduled_delivery(self):
         with tempfile.TemporaryDirectory() as tmp:
