@@ -1818,8 +1818,8 @@ class RecorderStore:
                 ),
             )
             conn.execute(
-                "INSERT INTO schedule_occurrences(schedule_id, trigger_instance_id, scheduled_for, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
-                (schedule_id, trigger_instance_id, fire_at, now, now),
+                "INSERT INTO schedule_occurrences(schedule_id, trigger_instance_id, scheduled_for, delivery_target_device_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (schedule_id, trigger_instance_id, fire_at, delivery_target, now, now),
             )
             confirmation = self._commit_schedule_confirmation_tx(
                 conn,
@@ -1903,7 +1903,7 @@ class RecorderStore:
         now = self._schedule_timestamp(now or self._now(), "now")
         with self._tx() as conn:
             occurrence = conn.execute(
-                "SELECT o.*, s.user_id, s.parent_turn_id, s.project_id, s.session_key, s.origin_device_id, s.delivery_target_device_id, s.reminder_text, s.generation_instruction, s.fire_at_utc, s.state AS schedule_state FROM schedule_occurrences o JOIN schedules s ON s.schedule_id=o.schedule_id WHERE o.schedule_id=? AND o.trigger_instance_id=?",
+                "SELECT o.*, s.user_id, s.parent_turn_id, s.project_id, s.session_key, s.origin_device_id, s.delivery_target_device_id AS schedule_delivery_target_device_id, s.reminder_text, s.generation_instruction, s.fire_at_utc, s.state AS schedule_state FROM schedule_occurrences o JOIN schedules s ON s.schedule_id=o.schedule_id WHERE o.schedule_id=? AND o.trigger_instance_id=?",
                 (schedule_id, trigger_instance_id),
             ).fetchone()
             if occurrence is None:
@@ -1914,6 +1914,7 @@ class RecorderStore:
                 raise LeaseConflict("scheduled occurrence lease is not owned or has expired")
             turn_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"recorder-next:scheduled-turn:{schedule_id}:{trigger_instance_id}"))
             existing_turn = conn.execute("SELECT * FROM turns WHERE turn_id=?", (turn_id,)).fetchone()
+            durable_target_device_id = occurrence["delivery_target_device_id"] or occurrence["schedule_delivery_target_device_id"]
             if existing_turn is not None:
                 previous = conn.execute("SELECT * FROM turns WHERE turn_id=?", (existing_turn["previous_turn_id"],)).fetchone()
                 if previous is None:
@@ -1921,7 +1922,7 @@ class RecorderStore:
                         "turn_id": existing_turn["previous_turn_id"],
                         "origin_device_id": existing_turn["previous_turn_origin_device_id"],
                     }
-                target_device_id = existing_turn["delivery_target_device_id"] or existing_turn["origin_device_id"]
+                target_device_id = durable_target_device_id or existing_turn["delivery_target_device_id"] or existing_turn["origin_device_id"]
             else:
                 previous = conn.execute(
                     "SELECT * FROM turns WHERE user_id=? AND turn_source='client' AND accepted_seq IS NOT NULL ORDER BY accepted_seq DESC, updated_at DESC, turn_id DESC LIMIT 1",
@@ -1929,7 +1930,7 @@ class RecorderStore:
                 ).fetchone()
                 if previous is None:
                     raise ConflictError("server schedule has no durable client-originated target turn")
-                target_device_id = previous["origin_device_id"]
+                target_device_id = durable_target_device_id or previous["origin_device_id"]
             if existing_turn is None:
                 manifest = {
                     "schema_version": 1,

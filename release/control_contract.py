@@ -1,4 +1,4 @@
-"""Shared exact-byte contract checks for the Recorder Next rev17 packet.
+"""Shared exact-byte contract checks for the Recorder Next rev18 packet.
 
 This module is copied into each frozen generation.  The candidate, packet,
 preflight, and stage checks all consume the same closed schemas and canonical
@@ -20,7 +20,7 @@ from typing import Any, Mapping, Sequence
 HEX64 = __import__("re").compile(r"^[0-9a-f]{64}$")
 MODE = __import__("re").compile(r"^[0-7]{4}$")
 
-MANIFEST_SCHEMA = "recorder-next-r7-rev17-manifest/v5"
+MANIFEST_SCHEMA = "recorder-next-r7-rev18-manifest/v5"
 PACKET_SCHEMA = "recorder-next-activation-packet/v2"
 PREFLIGHT_SCHEMA = "recorder-next-preflight/v3"
 CANDIDATE_VERIFIER_SCHEMA = "recorder-next-candidate-verifier/v2"
@@ -34,17 +34,17 @@ CANDIDATE_HASH_PREFIX = "recorder-next-r7-candidate/v3"
 CANDIDATE_HASH_ALGORITHM = 'sha256(\\"recorder-next-r7-candidate/v3\\"\\0generation\\0product_sha256\\0)'
 PRODUCT_IDENTITY = "recorder-next-plus-local-single-recorder-runtime"
 EXPECTED_PRODUCT_FILE_COUNT = 44
-EXPECTED_PRODUCT_SHA = "08802ff70fc2b4972407a6cb221169677ec1cf81ad625edcac88c154e7d25b07"
+EXPECTED_PRODUCT_SHA = "5b317a65106498ae84591eecfd6000525339e702380da47dc7802ab22482e384"
 PRODUCT_BYTES_CHANGED_FROM_FAILED_CANDIDATE = True
-CHANGED_PRODUCT_PATHS_FROM_FAILED_CANDIDATE = ["recorder_next/adapters.py"]
-ARCHIVE_NAME = "candidate-source-r7-rev17.tar"
+CHANGED_PRODUCT_PATHS_FROM_FAILED_CANDIDATE = ["recorder_next/store.py", "tests/test_generation_contract.py", "tests/test_scheduled_final.py"]
+ARCHIVE_NAME = "candidate-source-r7-rev18.tar"
 PREDECESSOR = {
     "disposition": "preserved_failed_predecessor",
-    "candidate_id": "recorder-next-bearer-r7-rev16-cd0f2f352f752472",
-    "candidate_sha256": "cd0f2f352f752472e5268986421d996ce916166f5eecb075db17bce1d238988e",
-    "product_sha256": "d52d58a0a68bb7d74a5fc40b559916766d6985bbb136578020c1b0e79f049693",
-    "archive_sha256": "fce8d88da883d64c8d34826658483009a0e1865e966464c07631b7a8220d0885",
-    "declared_source_bundle_sha256": "fce8d88da883d64c8d34826658483009a0e1865e966464c07631b7a8220d0885",
+    "candidate_id": "recorder-next-bearer-r7-rev17-c4613ccff4a53a5c",
+    "candidate_sha256": "c4613ccff4a53a5cc6303479c53127923ae5b0093d8b68a42f50a0aac19c9b95",
+    "product_sha256": "08802ff70fc2b4972407a6cb221169677ec1cf81ad625edcac88c154e7d25b07",
+    "archive_sha256": "b23b88a40b6eb832dfc8a0e7c62ca734f936b150a8cea77a387be7681065d924",
+    "declared_source_bundle_sha256": "b23b88a40b6eb832dfc8a0e7c62ca734f936b150a8cea77a387be7681065d924",
 }
 MUTATION_COUNTER_KEYS = (
     "installation",
@@ -350,8 +350,8 @@ def _validate_test_matrix(generation: Path, data: Mapping[str, Any], members: li
     test_payload = "".join(f"{row['path']}\0{row['size']}\0{row['sha256']}\n" for row in test_rows).encode("utf-8")
     if matrix["test_source_rows"] != test_rows or matrix["test_source_file_count"] != len(test_rows) or matrix["test_source_sha256"] != sha256_bytes(test_payload):
         raise ContractError("candidate test source provenance drifted")
-    if len(ids) != 84:
-        raise ContractError(f"candidate product test count is {len(ids)}, expected 84")
+    if len(ids) != 85:
+        raise ContractError(f"candidate product test count is {len(ids)}, expected 85")
 
 
 def _validate_manifest_shape(data: Any) -> dict[str, Any]:

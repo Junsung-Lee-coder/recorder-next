@@ -13,7 +13,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).parents[1]
 BUILDER = ROOT / "release" / "build_candidate.py"
-EXPECTED_PRODUCT_SHA = "08802ff70fc2b4972407a6cb221169677ec1cf81ad625edcac88c154e7d25b07"
+FAILED_PRODUCT_SHA = "08802ff70fc2b4972407a6cb221169677ec1cf81ad625edcac88c154e7d25b07"
 
 
 def digest(path: Path) -> str:
@@ -40,9 +40,13 @@ class FrozenGenerationTests(unittest.TestCase):
             manifest = json.loads((generation / "candidate-manifest.json").read_text(encoding="utf-8"))
             self.assertEqual(manifest["status"], "FROZEN")
             self.assertEqual(manifest["candidate_file_count"], 44)
-            self.assertEqual(manifest["product_sha256"], EXPECTED_PRODUCT_SHA)
+            self.assertRegex(manifest["product_sha256"], r"^[0-9a-f]{64}$")
+            self.assertNotEqual(manifest["product_sha256"], FAILED_PRODUCT_SHA)
             self.assertEqual(manifest["product_bytes_changed_from_failed_candidate"], True)
-            self.assertEqual(manifest["changed_product_paths_from_failed_candidate"], ["recorder_next/adapters.py"])
+            self.assertEqual(
+                manifest["changed_product_paths_from_failed_candidate"],
+                ["recorder_next/store.py", "tests/test_generation_contract.py", "tests/test_scheduled_final.py"],
+            )
             self.assertEqual(manifest["approved_for_live_change"], False)
             self.assertEqual(manifest["mutation_counters"]["installation"], 0)
             self.assertEqual(manifest["mutation_counters"]["rollback"], 0)

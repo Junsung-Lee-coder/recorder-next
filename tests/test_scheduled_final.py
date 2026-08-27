@@ -176,7 +176,38 @@ class ScheduledFinalStoreTests(unittest.TestCase):
             self.assertEqual(schedule["state"], "FIRED")
             self.assertEqual(len(schedule["occurrences"]), 1)
 
-    def test_latest_account_turn_selects_wear_across_project_and_freezes_target(self):
+    def test_explicit_schedule_target_wins_over_latest_phone_origin_for_scheduled_delivery(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            clock = DeterministicClock("2026-08-26T00:00:00+00:00")
+            store, _, project = _accepted_parent(root, clock, device="phone-1", project_number="P-phone")
+            schedule = store.create_schedule(
+                _schedule_command(
+                    project,
+                    fire_at="2026-08-26T00:00:00+00:00",
+                    origin="phone-1",
+                    target="watch-1",
+                    schedule_id="schedule-phone-to-watch",
+                )
+            )
+
+            self.assertEqual(schedule["delivery_target_device_id"], "watch-1")
+            self.assertEqual(schedule["occurrences"][0]["delivery_target_device_id"], "watch-1")
+
+            fired = store.fire_due_schedules(owner="scheduler")
+            self.assertEqual(len(fired), 1)
+            scheduled = fired[0]["turn"]
+            event = scheduled["events"][0]
+            artifact = scheduled["tts_artifacts"][0]
+            self.assertEqual(scheduled["delivery_target_device_id"], "watch-1")
+            self.assertEqual(event["required_device_id"], "watch-1")
+            self.assertEqual(artifact["delivery_target_device_id"], "watch-1")
+            watch_outbox = store.pending_outbox("watch-1")
+            self.assertIn(event["event_id"], [row["event_id"] for row in watch_outbox])
+            self.assertNotIn(event["event_id"], [row["event_id"] for row in store.pending_outbox("phone-1")])
+            self.assertEqual(store.get_schedule("schedule-phone-to-watch")["occurrences"][0]["delivery_target_device_id"], "watch-1")
+
+    def test_explicit_target_stays_phone_across_latest_watch_turn(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             clock = DeterministicClock("2026-08-26T00:00:00+00:00")
@@ -201,9 +232,9 @@ class ScheduledFinalStoreTests(unittest.TestCase):
             scheduled = fired[0]["turn"]
             self.assertEqual(scheduled["previous_turn_id"], later["turn_id"])
             self.assertEqual(scheduled["previous_turn_origin_device_id"], "watch-1")
-            self.assertEqual(scheduled["delivery_target_device_id"], "watch-1")
-            self.assertEqual(scheduled["events"][0]["required_device_id"], "watch-1")
-            self.assertEqual(scheduled["tts_artifacts"][0]["delivery_target_device_id"], "watch-1")
+            self.assertEqual(scheduled["delivery_target_device_id"], "phone-1")
+            self.assertEqual(scheduled["events"][0]["required_device_id"], "phone-1")
+            self.assertEqual(scheduled["tts_artifacts"][0]["delivery_target_device_id"], "phone-1")
 
             later_again = _accepted_later_turn(
                 store,
@@ -217,7 +248,7 @@ class ScheduledFinalStoreTests(unittest.TestCase):
             self.assertEqual(persisted["previous_turn_id"], later["turn_id"])
             self.assertNotEqual(persisted["previous_turn_id"], later_again["turn_id"])
 
-    def test_latest_account_turn_selects_phone_in_inverse_sequence(self):
+    def test_explicit_target_stays_watch_in_inverse_latest_phone_sequence(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             clock = DeterministicClock("2026-08-26T00:00:00+00:00")
@@ -241,9 +272,9 @@ class ScheduledFinalStoreTests(unittest.TestCase):
             scheduled = fired[0]["turn"]
             self.assertEqual(scheduled["previous_turn_id"], later["turn_id"])
             self.assertEqual(scheduled["previous_turn_origin_device_id"], "phone-1")
-            self.assertEqual(scheduled["delivery_target_device_id"], "phone-1")
+            self.assertEqual(scheduled["delivery_target_device_id"], "watch-1")
 
-    def test_target_snapshot_is_atomic_between_claim_and_server_turn_creation(self):
+    def test_explicit_target_snapshot_is_atomic_between_claim_and_server_turn_creation(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             clock = DeterministicClock("2026-08-26T00:00:00+00:00")
@@ -269,7 +300,7 @@ class ScheduledFinalStoreTests(unittest.TestCase):
                 claim["trigger_instance_id"],
                 owner="scheduler",
             )
-            self.assertEqual(fired["turn"]["delivery_target_device_id"], "watch-1")
+            self.assertEqual(fired["turn"]["delivery_target_device_id"], "phone-1")
 
     def test_concurrent_workers_and_expired_lease_are_lossless(self):
         with tempfile.TemporaryDirectory() as tmp:
