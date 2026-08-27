@@ -31,4 +31,7 @@ realtime_asr = "disabled"
 batch_asr = "disabled"
 local_asr = "disabled"
 # hermes_base_url is intentionally omitted; set it only in deployment configuration.
+# The deployment unit uses LoadCredential= and this path is expanded at startup.
+hermes_api_key_file = "$CREDENTIALS_DIRECTORY/recorder_api_key"
+# Credential rotation requires restarting Recorder Next only.
 tts = "fixture"

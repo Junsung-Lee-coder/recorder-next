@@ -440,6 +440,13 @@ def create_configured_service(config: "RecorderConfig") -> RecorderService:
 
     if not isinstance(config, RecorderConfig):
         raise TypeError("config must be RecorderConfig")
+    hermes = None
+    if config.hermes_base_url:
+        from .adapters import CredentialError, HttpHermesGateway
+
+        if not config.hermes_api_key_file:
+            raise CredentialError("Hermes API credential path is required")
+        hermes = HttpHermesGateway(config.hermes_base_url, api_key_file=config.hermes_api_key_file)
     store = RecorderStore(
         config.database,
         storage_root=config.storage_root,
@@ -452,9 +459,4 @@ def create_configured_service(config: "RecorderConfig") -> RecorderService:
         max_parts=config.max_parts,
         min_free_bytes=config.min_free_bytes,
     )
-    hermes = None
-    if config.hermes_base_url:
-        from .adapters import HttpHermesGateway
-
-        hermes = HttpHermesGateway(config.hermes_base_url)
     return RecorderService(store, hermes=hermes, hermes_max_attempts=config.hermes_max_attempts, hermes_grace_seconds=config.hermes_grace_seconds)

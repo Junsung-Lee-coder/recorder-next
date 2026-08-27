@@ -7,14 +7,143 @@ change Hermes core or make an exactly-once claim about a remote chat call.
 from __future__ import annotations
 
 import json
+import os
 import re
+import stat
 import urllib.error
 import urllib.request
 from urllib.parse import quote
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Mapping, Protocol
 
 from .models import AsrResult, HermesResult, RouterDecision, TTSResult
+
+
+class CredentialError(ValueError):
+    """Raised when the configured Hermes credential is unsafe or malformed."""
+
+
+def _trusted_systemd_credential_path(path: str | os.PathLike[str]) -> tuple[Path, str] | None:
+    """Return the trusted systemd credential root and direct child name.
+
+    A system manager may own the credential inode and add a named read ACL for
+    the service UID.  That is intentionally trusted only for a direct child of
+    the manager-provided ``$CREDENTIALS_DIRECTORY``; arbitrary paths continue
+    through the strict owner-only checks below.
+    """
+
+    raw_root = os.environ.get("CREDENTIALS_DIRECTORY")
+    raw_path = os.fspath(path)
+    if not raw_root or not os.path.isabs(raw_root) or not os.path.isabs(raw_path):
+        return None
+    root = Path(os.path.normpath(raw_root))
+    candidate = Path(os.path.abspath(raw_path))
+    if root == Path(os.sep):
+        return None
+    try:
+        relative = candidate.relative_to(root)
+    except ValueError:
+        return None
+    if len(relative.parts) != 1 or relative.name in {"", ".", ".."}:
+        return None
+    return root, relative.name
+
+
+def _open_directory_without_symlinks(path: Path) -> int:
+    """Open an absolute directory one component at a time without links."""
+
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_DIRECTORY", 0)
+    descriptor = os.open(os.sep, flags)
+    try:
+        for component in path.parts[1:]:
+            child = os.open(component, flags, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = child
+    except OSError:
+        os.close(descriptor)
+        raise
+    return descriptor
+
+
+def _open_api_key_file(path: str | os.PathLike[str]) -> tuple[int, bool]:
+    """Open the file and report whether systemd credential trust was used."""
+
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    trusted = _trusted_systemd_credential_path(path)
+    if trusted is None:
+        return os.open(os.fspath(path), flags), False
+
+    root, leaf = trusted
+    root_descriptor = _open_directory_without_symlinks(root)
+    try:
+        root_info = os.fstat(root_descriptor)
+        if not stat.S_ISDIR(root_info.st_mode) or root_info.st_uid != 0 or stat.S_IMODE(root_info.st_mode) != 0o550:
+            raise CredentialError("credential directory is untrusted")
+        return os.open(leaf, flags, dir_fd=root_descriptor), True
+    finally:
+        os.close(root_descriptor)
+
+
+def _read_api_key_file(path: str | os.PathLike[str]) -> str:
+    """Read one API_SERVER_KEY without exposing its value.
+
+    Direct source files must be owned by the running UID and use exactly 0400
+    or 0600.  A root-owned 0440 file is accepted only when systemd supplied it
+    as a direct child of its trusted 0550 credential directory.
+    """
+
+    try:
+        descriptor, trusted = _open_api_key_file(path)
+    except CredentialError:
+        raise
+    except OSError:
+        raise CredentialError("credential file is missing or unreadable") from None
+
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode):
+            raise CredentialError("credential file must be regular")
+        permissions = stat.S_IMODE(info.st_mode)
+        if trusted:
+            if info.st_uid != 0 or permissions != 0o440:
+                raise CredentialError("systemd credential metadata is unsafe")
+        else:
+            if info.st_uid != os.getuid():
+                raise CredentialError("credential file ownership is unsafe")
+            if permissions not in {0o400, 0o600}:
+                raise CredentialError("credential file permissions are unsafe")
+        with os.fdopen(descriptor, "rb") as handle:
+            descriptor = -1
+            raw = handle.read(4097)
+    except CredentialError:
+        raise
+    except (OSError, ValueError):
+        raise CredentialError("credential file is unreadable") from None
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+    if not raw or len(raw) > 4096:
+        raise CredentialError("credential file format is invalid")
+    if raw.endswith(b"\r\n"):
+        line_bytes = raw[:-2]
+    elif raw.endswith(b"\n"):
+        line_bytes = raw[:-1]
+    else:
+        line_bytes = raw
+    if b"\r" in line_bytes or b"\n" in line_bytes:
+        raise CredentialError("credential file format is invalid")
+    try:
+        line = line_bytes.decode("ascii")
+    except UnicodeDecodeError:
+        raise CredentialError("credential file format is invalid") from None
+    if not line.startswith("API_SERVER_KEY="):
+        raise CredentialError("credential file format is invalid")
+    token = line[len("API_SERVER_KEY=") :]
+    if not token or any(not 0x21 <= ord(character) <= 0x7E for character in token):
+        raise CredentialError("credential file format is invalid")
+    return token
 
 
 class RouterAdapter(Protocol):
@@ -124,10 +253,24 @@ class MemoryHermesGateway:
 class HttpHermesGateway:
     """Minimal adapter for the existing Hermes HTTP session/chat seam."""
 
-    def __init__(self, base_url: str, *, timeout: float = 10.0, gateway_session_key: str | None = None):
+    def __init__(
+        self,
+        base_url: str,
+        *,
+        timeout: float = 10.0,
+        gateway_session_key: str | None = None,
+        api_key_file: str | os.PathLike[str] | None = None,
+    ):
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
         self.gateway_session_key = gateway_session_key
+        self._api_key = _read_api_key_file(api_key_file) if api_key_file is not None else None
+
+    def _session_headers(self, session_key: str) -> dict[str, str]:
+        headers = {"X-Hermes-Session-Key": session_key}
+        if self._api_key is not None:
+            headers["Authorization"] = f"Bearer {self._api_key}"
+        return headers
 
     def _request(self, method: str, path: str, payload: Mapping[str, Any] | None = None, *, extra_headers: Mapping[str, str] | None = None) -> Any:
         body = None if payload is None else json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -219,7 +362,9 @@ class HttpHermesGateway:
         body["marker"] = marker
         body["hermes_submission_id"] = submission_id
         try:
-            result = self._request("POST", f"/api/sessions/{encoded_session}/chat", body, extra_headers={"X-Hermes-Session-Key": session_key, "Idempotency-Key": submission_id})
+            headers = self._session_headers(session_key)
+            headers["Idempotency-Key"] = submission_id
+            result = self._request("POST", f"/api/sessions/{encoded_session}/chat", body, extra_headers=headers)
         except (urllib.error.URLError, TimeoutError):
             return None
         return self._parse_result(result)
@@ -231,7 +376,7 @@ class HttpHermesGateway:
     def history_messages(self, *, session_key: str, marker: str) -> list[HermesResult]:
         encoded_session = quote(session_key, safe="")
         try:
-            result = self._request("GET", f"/api/sessions/{encoded_session}/messages", extra_headers={"X-Hermes-Session-Key": session_key})
+            result = self._request("GET", f"/api/sessions/{encoded_session}/messages", extra_headers=self._session_headers(session_key))
         except (urllib.error.URLError, TimeoutError):
             return []
         messages = result.get("messages", result if isinstance(result, list) else [])

@@ -11,7 +11,8 @@ Recorder Next is a server-only, SQLite-authoritative adapter between Phone/Watch
 - ordered per-user Router queue with persistent lease/CAS takeover
 - project registry and `project:<stable_project_id>:default` session seam
 - transactional route receipt + ROUTED outbox + Hermes session ingress
-- Hermes adapter with message-history fallback and bounded late-result grace
+- Hermes adapter with message-history fallback, bounded late-result grace, and
+  optional startup-resolved Bearer authentication
 - normalized/hash-bound Hermes result references and append-only FINAL versions
 - ASR realtime → batch → local generation arbitration seam
 - origin-device-only text/event/playback ACKs; Watch relay is not playback completion
@@ -70,6 +71,14 @@ The machine-readable contract is `api/openapi.json` and is also served at `GET /
 
 Authentication/key management is intentionally a deployment seam in this standalone candidate. The event, bridge-read, and artifact handlers still enforce registered active device identity; playback completion remains bound to the frozen delivery target and exact artifact receipt.
 
+When the configured Hermes provider is enabled, `hermes_api_key_file` must name
+one owner-only credential file containing exactly one ASCII
+`API_SERVER_KEY=<value>` entry. The adapter reads it once during startup and
+sends `Authorization: Bearer <value>` alongside the existing `X-Hermes-Session-Key`; the value is never logged or persisted. The systemd
+template uses `LoadCredential=recorder_api_key:...` and
+`$CREDENTIALS_DIRECTORY/recorder_api_key`. Rotate the source only with a
+Recorder Next restart; do not restart Hermes Gateway.
+
 ## Layout
 
 - `recorder_next/store.py` — SQLite schema, transactions, state transitions, leases, outboxes, registry, spool
@@ -78,3 +87,7 @@ Authentication/key management is intentionally a deployment seam in this standal
 - `recorder_next/schema.sql` + `migrations/001_initial.sql` — authoritative schema artifacts
 - `recorder_next/openapi.py` + `api/openapi.json` — machine-readable v1 contract
 - `systemd/recorder-next.service` + `config.example.toml` — non-live deployment artifacts
+
+## Release-control binding
+
+This candidate-only activation and rollback packet is an exact ordered argv contract. Fresh preflight revalidates the packet and binds every manifest, freeze, runtime-preimage, test-ID, and test-source referent by canonical path, size, SHA-256, and semantic fields; any drift is a fail-closed hold.

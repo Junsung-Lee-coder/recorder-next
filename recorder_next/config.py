@@ -26,6 +26,7 @@ class RecorderConfig:
     asr_provider_timeout_seconds: int = 10
     tts_retry_seconds: int = 10
     hermes_base_url: str | None = None
+    hermes_api_key_file: str | None = None
     tts_provider: str = "fixture"
 
     @classmethod
@@ -56,6 +57,9 @@ class RecorderConfig:
             asr_provider_timeout_seconds=int(retries.get("asr_provider_timeout_seconds", cls.asr_provider_timeout_seconds)),
             tts_retry_seconds=int(retries.get("tts_retry_seconds", cls.tts_retry_seconds)),
             hermes_base_url=providers.get("hermes_base_url"),
+            hermes_api_key_file=providers.get(
+                "hermes_api_key_file", os.environ.get("RECORDER_NEXT_HERMES_API_KEY_FILE")
+            ),
             tts_provider=str(providers.get("tts", cls.tts_provider)),
         )
 
@@ -63,6 +67,10 @@ class RecorderConfig:
         base = Path(base_dir)
         db = Path(self.database)
         root = Path(self.storage_root)
+        credential = self.hermes_api_key_file
+        if credential is not None:
+            credential_path = Path(os.path.expanduser(os.path.expandvars(str(credential))))
+            credential = str(credential_path if credential_path.is_absolute() else base / credential_path)
         return RecorderConfig(
             host=self.host,
             port=self.port,
@@ -81,5 +89,6 @@ class RecorderConfig:
             asr_provider_timeout_seconds=self.asr_provider_timeout_seconds,
             tts_retry_seconds=self.tts_retry_seconds,
             hermes_base_url=self.hermes_base_url,
+            hermes_api_key_file=credential,
             tts_provider=self.tts_provider,
         )
