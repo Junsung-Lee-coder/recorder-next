@@ -1,0 +1,20 @@
+{
+  "fixture_id": "recorder-next-v1-deterministic-001",
+  "privacy": "synthetic-only",
+  "user_id": "fixture-user",
+  "origin_device_id": "fixture-phone",
+  "turn_id": "018f5a2e-7b6e-7abc-8d11-1234567890d1",
+  "project": {
+    "project_number": "P-001",
+    "name": "Synthetic Recorder Project",
+    "aliases": ["fixture"],
+    "description": "Generated test-only project"
+  },
+  "text_input": "Synthetic request for deterministic acceptance tests.",
+  "hermes_results": [
+    {"assistant_message_id": "fixture-message-1", "content": "Synthetic first final."},
+    {"assistant_message_id": "fixture-message-2", "content": "Synthetic appended final."}
+  ],
+  "audio_bytes_hex": "70636d2d66697874757265",
+  "tts_expectation": "fixture provider output only; not real speech"
+}

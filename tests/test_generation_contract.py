@@ -39,13 +39,34 @@ class FrozenGenerationTests(unittest.TestCase):
             generation = self._build(Path(tmp))
             manifest = json.loads((generation / "candidate-manifest.json").read_text(encoding="utf-8"))
             self.assertEqual(manifest["status"], "FROZEN")
-            self.assertEqual(manifest["candidate_file_count"], 44)
+            self.assertEqual(manifest["candidate_file_count"], 50)
             self.assertRegex(manifest["product_sha256"], r"^[0-9a-f]{64}$")
             self.assertNotEqual(manifest["product_sha256"], FAILED_PRODUCT_SHA)
             self.assertEqual(manifest["product_bytes_changed_from_failed_candidate"], True)
             self.assertEqual(
                 manifest["changed_product_paths_from_failed_candidate"],
-                ["recorder_next/store.py", "tests/test_generation_contract.py", "tests/test_scheduled_final.py"],
+                [
+                    "README.md",
+                    "api/openapi.json",
+                    "config.example.toml",
+                    "migrations/003_feature_groups.sql",
+                    "migrations/004_eavesdrop_decisions.sql",
+                    "recorder_next/__init__.py",
+                    "recorder_next/adapters.py",
+                    "recorder_next/config.py",
+                    "recorder_next/features.py",
+                    "recorder_next/migrations/003_feature_groups.sql",
+                    "recorder_next/migrations/004_eavesdrop_decisions.sql",
+                    "recorder_next/openapi.py",
+                    "recorder_next/schema.sql",
+                    "recorder_next/service.py",
+                    "recorder_next/store.py",
+                    "tests/test_adapters.py",
+                    "tests/test_extended_contract.py",
+                    "tests/test_feature_groups.py",
+                    "tests/test_generated_multimodal.py",
+                    "tests/test_scheduled_final.py",
+                ],
             )
             self.assertEqual(manifest["approved_for_live_change"], False)
             self.assertEqual(manifest["mutation_counters"]["installation"], 0)
@@ -174,7 +195,7 @@ class FrozenGenerationTests(unittest.TestCase):
             generation = self._build(Path(tmp))
             manifest = json.loads((generation / "candidate-manifest.json").read_text(encoding="utf-8"))
             packet = json.loads((generation / "control/activation-packet.json").read_text(encoding="utf-8"))
-            self.assertEqual(manifest["candidate_file_count"], 44)
+            self.assertEqual(manifest["candidate_file_count"], 50)
             self.assertIn("control_roles", manifest)
             self.assertIn("freeze_vector", manifest)
             self.assertIn("preflight_evidence", packet)

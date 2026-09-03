@@ -1,0 +1,592 @@
+{
+  "activation_sequence": [
+    {
+      "commands": [
+        [
+          "/usr/bin/python3",
+          "-B",
+          "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/feature-groups-r1-rev20/control/verify_candidate.py",
+          "--generation",
+          "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/feature-groups-r1-rev20",
+          "--read-only"
+        ],
+        [
+          "/usr/bin/python3",
+          "-B",
+          "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/feature-groups-r1-rev20/control/release_op.py",
+          "verify-stage",
+          "--manifest",
+          "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/feature-groups-r1-rev20/control/transaction-manifest.json",
+          "--manifest-sha256",
+          "e8a7dd69c2e3cbf79428e6ab77af5a89ab26712314c4ae64313005b3d203548c",
+          "--operator-sha256",
+          "e6ebc57cd81fff53dae88923eafb0f17b9f2fe554eceddc27315842031134a34",
+          "--stage-root",
+          "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/feature-groups-r1-rev20",
+          "--live-root",
+          "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/feature-groups-r1-rev20/fixture/live",
+          "--receipt-root",
+          "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/feature-groups-r1-rev20/fixture/receipts",
+          "--state-root",
+          "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/feature-groups-r1-rev20/fixture/state",
+          "--candidate-manifest",
+          "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/feature-groups-r1-rev20/candidate-manifest.json",
+          "--candidate-id",
+          "recorder-next-feature-groups-r1-rev20-90ff26b7cc4cf821",
+          "--candidate-sha256",
+          "90ff26b7cc4cf821b01630dc86d017ee92894955b226943f8f4bff8d96ba02c7",
+          "--archive",
+          "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/candidate-source-feature-groups-r1-rev20.tar",
+          "--archive-sha256",
+          "75d428859ff2d00ef91165cff4280861977f1cb0973c1f3eef10b27bd613a8f3",
+          "--read-only"
+        ],
+        [
+          "/usr/bin/python3",
+          "-B",
+          "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/feature-groups-r1-rev20/control/preflight_rev14.py",
+          "--generation",
+          "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/feature-groups-r1-rev20",
+          "--read-only"
+        ]
+      ],
+      "gate": "all candidate rows, stage referents, and read-only preflight predicates pass",
+      "mutation": false,
+      "name": "bind_candidate_and_preimages",
+      "step": 1
+    },
+    {
+      "commands": [
+        [
+          "/usr/bin/sha256sum",
+          "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/feature-groups-r1-rev20/control/release_op.py"
+        ],
+        [
+          "/usr/bin/python3",
+          "-B",
+          "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/feature-groups-r1-rev20/control/release_op.py",
+          "apply",
+          "--manifest",
+          "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/feature-groups-r1-rev20/control/transaction-manifest.json",
+          "--manifest-sha256",
+          "e8a7dd69c2e3cbf79428e6ab77af5a89ab26712314c4ae64313005b3d203548c",
+          "--operator-sha256",
+          "e6ebc57cd81fff53dae88923eafb0f17b9f2fe554eceddc27315842031134a34",
+          "--stage-root",
+          "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/feature-groups-r1-rev20",
+          "--live-root",
+          "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/feature-groups-r1-rev20/fixture/live",
+          "--receipt-root",
+          "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/feature-groups-r1-rev20/fixture/receipts",
+          "--state-root",
+          "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/feature-groups-r1-rev20/fixture/state",
+          "--candidate-manifest",
+          "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/feature-groups-r1-rev20/candidate-manifest.json"
+        ]
+      ],
+      "executed": false,
+      "gate": "independent review PASS and exact live preimages are revalidated before journaled apply",
+      "mutation": true,
+      "name": "install_operator_and_apply_exact_cohort",
+      "step": 2
+    }
+  ],
+  "apply": {
+    "apply_receipt": "apply-feature-groups-r1-rev20.json",
+    "argv": [
+      "/usr/bin/python3",
+      "-B",
+      "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/feature-groups-r1-rev20/control/release_op.py",
+      "apply",
+      "--manifest",
+      "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/feature-groups-r1-rev20/control/transaction-manifest.json",
+      "--manifest-sha256",
+      "e8a7dd69c2e3cbf79428e6ab77af5a89ab26712314c4ae64313005b3d203548c",
+      "--operator-sha256",
+      "e6ebc57cd81fff53dae88923eafb0f17b9f2fe554eceddc27315842031134a34",
+      "--stage-root",
+      "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/feature-groups-r1-rev20",
+      "--live-root",
+      "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/feature-groups-r1-rev20/fixture/live",
+      "--receipt-root",
+      "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/feature-groups-r1-rev20/fixture/receipts",
+      "--state-root",
+      "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/feature-groups-r1-rev20/fixture/state",
+      "--candidate-manifest",
+      "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/feature-groups-r1-rev20/candidate-manifest.json"
+    ],
+    "executed": false,
+    "journal": "transaction-feature-groups-r1-rev20.json",
+    "mutation": true,
+    "receipt_root": "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/feature-groups-r1-rev20/fixture/receipts",
+    "rollback_receipt": "rollback-feature-groups-r1-rev20.json"
+  },
+  "candidate_id": "recorder-next-feature-groups-r1-rev20-90ff26b7cc4cf821",
+  "candidate_sha256": "90ff26b7cc4cf821b01630dc86d017ee92894955b226943f8f4bff8d96ba02c7",
+  "commands": {
+    "apply": {
+      "argv": [
+        "/usr/bin/python3",
+        "-B",
+        "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/feature-groups-r1-rev20/control/release_op.py",
+        "apply",
+        "--manifest",
+        "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/feature-groups-r1-rev20/control/transaction-manifest.json",
+        "--manifest-sha256",
+        "e8a7dd69c2e3cbf79428e6ab77af5a89ab26712314c4ae64313005b3d203548c",
+        "--operator-sha256",
+        "e6ebc57cd81fff53dae88923eafb0f17b9f2fe554eceddc27315842031134a34",
+        "--stage-root",
+        "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/feature-groups-r1-rev20",
+        "--live-root",
+        "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/feature-groups-r1-rev20/fixture/live",
+        "--receipt-root",
+        "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/feature-groups-r1-rev20/fixture/receipts",
+        "--state-root",
+        "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/feature-groups-r1-rev20/fixture/state",
+        "--candidate-manifest",
+        "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/feature-groups-r1-rev20/candidate-manifest.json"
+      ],
+      "executed": false,
+      "read_only": false
+    },
+    "candidate_verifier": {
+      "argv": [
+        "/usr/bin/python3",
+        "-B",
+        "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/feature-groups-r1-rev20/control/verify_candidate.py",
+        "--generation",
+        "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/feature-groups-r1-rev20",
+        "--read-only"
+      ],
+      "executed": false,
+      "read_only": true
+    },
+    "operator_stage_verifier": {
+      "argv": [
+        "/usr/bin/python3",
+        "-B",
+        "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/feature-groups-r1-rev20/control/release_op.py",
+        "verify-stage",
+        "--manifest",
+        "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/feature-groups-r1-rev20/control/transaction-manifest.json",
+        "--manifest-sha256",
+        "e8a7dd69c2e3cbf79428e6ab77af5a89ab26712314c4ae64313005b3d203548c",
+        "--operator-sha256",
+        "e6ebc57cd81fff53dae88923eafb0f17b9f2fe554eceddc27315842031134a34",
+        "--stage-root",
+        "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/feature-groups-r1-rev20",
+        "--live-root",
+        "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/feature-groups-r1-rev20/fixture/live",
+        "--receipt-root",
+        "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/feature-groups-r1-rev20/fixture/receipts",
+        "--state-root",
+        "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/feature-groups-r1-rev20/fixture/state",
+        "--candidate-manifest",
+        "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/feature-groups-r1-rev20/candidate-manifest.json",
+        "--candidate-id",
+        "recorder-next-feature-groups-r1-rev20-90ff26b7cc4cf821",
+        "--candidate-sha256",
+        "90ff26b7cc4cf821b01630dc86d017ee92894955b226943f8f4bff8d96ba02c7",
+        "--archive",
+        "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/candidate-source-feature-groups-r1-rev20.tar",
+        "--archive-sha256",
+        "75d428859ff2d00ef91165cff4280861977f1cb0973c1f3eef10b27bd613a8f3",
+        "--read-only"
+      ],
+      "executed": false,
+      "read_only": true
+    },
+    "packet_checker": {
+      "argv": [
+        "/usr/bin/python3",
+        "-B",
+        "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/feature-groups-r1-rev20/control/activation_packet_check.py",
+        "--packet",
+        "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/feature-groups-r1-rev20/control/activation-packet.json",
+        "--read-only"
+      ],
+      "executed": false,
+      "read_only": true
+    },
+    "preflight": {
+      "argv": [
+        "/usr/bin/python3",
+        "-B",
+        "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/feature-groups-r1-rev20/control/preflight_rev14.py",
+        "--generation",
+        "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/feature-groups-r1-rev20",
+        "--read-only"
+      ],
+      "executed": false,
+      "read_only": true
+    },
+    "restore_legacy": {
+      "argv": [
+        "/usr/bin/python3",
+        "-B",
+        "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/feature-groups-r1-rev20/control/release_op.py",
+        "restore-legacy",
+        "--manifest",
+        "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/feature-groups-r1-rev20/control/transaction-manifest.json",
+        "--manifest-sha256",
+        "e8a7dd69c2e3cbf79428e6ab77af5a89ab26712314c4ae64313005b3d203548c",
+        "--operator-sha256",
+        "e6ebc57cd81fff53dae88923eafb0f17b9f2fe554eceddc27315842031134a34",
+        "--stage-root",
+        "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/feature-groups-r1-rev20",
+        "--live-root",
+        "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/feature-groups-r1-rev20/fixture/live",
+        "--receipt-root",
+        "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/feature-groups-r1-rev20/fixture/receipts",
+        "--state-root",
+        "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/feature-groups-r1-rev20/fixture/state",
+        "--candidate-manifest",
+        "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/feature-groups-r1-rev20/candidate-manifest.json",
+        "--apply-receipt",
+        "apply-feature-groups-r1-rev20.json",
+        "--rollback-receipt",
+        "rollback-feature-groups-r1-rev20.json",
+        "--restore-manifest",
+        "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/feature-groups-r1-rev20/control/transaction-manifest.json",
+        "--restore-only-bound-preimages"
+      ],
+      "executed": false,
+      "read_only": false
+    },
+    "rollback": {
+      "argv": [
+        "/usr/bin/python3",
+        "-B",
+        "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/feature-groups-r1-rev20/control/release_op.py",
+        "rollback",
+        "--manifest",
+        "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/feature-groups-r1-rev20/control/transaction-manifest.json",
+        "--manifest-sha256",
+        "e8a7dd69c2e3cbf79428e6ab77af5a89ab26712314c4ae64313005b3d203548c",
+        "--operator-sha256",
+        "e6ebc57cd81fff53dae88923eafb0f17b9f2fe554eceddc27315842031134a34",
+        "--stage-root",
+        "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/feature-groups-r1-rev20",
+        "--live-root",
+        "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/feature-groups-r1-rev20/fixture/live",
+        "--receipt-root",
+        "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/feature-groups-r1-rev20/fixture/receipts",
+        "--state-root",
+        "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/feature-groups-r1-rev20/fixture/state",
+        "--candidate-manifest",
+        "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/feature-groups-r1-rev20/candidate-manifest.json",
+        "--apply-receipt",
+        "apply-feature-groups-r1-rev20.json"
+      ],
+      "executed": false,
+      "read_only": false
+    },
+    "rollback_authorization": {
+      "argv": [
+        "/usr/bin/python3",
+        "-B",
+        "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/feature-groups-r1-rev20/control/release_op.py",
+        "authorize-rollback",
+        "--manifest",
+        "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/feature-groups-r1-rev20/control/transaction-manifest.json",
+        "--manifest-sha256",
+        "e8a7dd69c2e3cbf79428e6ab77af5a89ab26712314c4ae64313005b3d203548c",
+        "--operator-sha256",
+        "e6ebc57cd81fff53dae88923eafb0f17b9f2fe554eceddc27315842031134a34",
+        "--stage-root",
+        "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/feature-groups-r1-rev20",
+        "--live-root",
+        "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/feature-groups-r1-rev20/fixture/live",
+        "--receipt-root",
+        "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/feature-groups-r1-rev20/fixture/receipts",
+        "--state-root",
+        "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/feature-groups-r1-rev20/fixture/state",
+        "--candidate-manifest",
+        "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/feature-groups-r1-rev20/candidate-manifest.json",
+        "--apply-receipt",
+        "apply-feature-groups-r1-rev20.json",
+        "--rollback-receipt",
+        "rollback-feature-groups-r1-rev20.json",
+        "--read-only"
+      ],
+      "executed": false,
+      "read_only": true
+    },
+    "rollback_readback": {
+      "argv": [
+        "/usr/bin/python3",
+        "-B",
+        "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/feature-groups-r1-rev20/control/release_op.py",
+        "readback-rollback",
+        "--manifest",
+        "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/feature-groups-r1-rev20/control/transaction-manifest.json",
+        "--manifest-sha256",
+        "e8a7dd69c2e3cbf79428e6ab77af5a89ab26712314c4ae64313005b3d203548c",
+        "--operator-sha256",
+        "e6ebc57cd81fff53dae88923eafb0f17b9f2fe554eceddc27315842031134a34",
+        "--stage-root",
+        "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/feature-groups-r1-rev20",
+        "--live-root",
+        "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/feature-groups-r1-rev20/fixture/live",
+        "--receipt-root",
+        "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/feature-groups-r1-rev20/fixture/receipts",
+        "--state-root",
+        "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/feature-groups-r1-rev20/fixture/state",
+        "--candidate-manifest",
+        "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/feature-groups-r1-rev20/candidate-manifest.json",
+        "--rollback-receipt",
+        "rollback-feature-groups-r1-rev20.json",
+        "--protected-ports",
+        "127.0.0.1:8642,127.0.0.1:8653",
+        "--read-only"
+      ],
+      "executed": false,
+      "read_only": true
+    }
+  },
+  "execution_policy": "read_only_smokes_only",
+  "freeze_vector": {
+    "entry_count": 74,
+    "excluded": [
+      "freeze-vector.json"
+    ],
+    "path": "freeze-vector.json",
+    "sha256": "766954961f6fc32503cdeab599a12335d1db7cadbfbd72f9495eed249cf82dc8",
+    "sidecar": "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/feature-groups-r1-rev20.freeze-vector.sha256"
+  },
+  "generation": "feature-groups-r1-rev20",
+  "install": {
+    "argv": [
+      "/usr/bin/sha256sum",
+      "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/feature-groups-r1-rev20/control/release_op.py"
+    ],
+    "executed": false,
+    "identity": {
+      "mode": "0444",
+      "path": "/usr/local/libexec/recorder-next-release-op.py",
+      "sha256": "e6ebc57cd81fff53dae88923eafb0f17b9f2fe554eceddc27315842031134a34"
+    },
+    "mutation": false
+  },
+  "install_plan": {
+    "argv": [
+      "install",
+      "-D",
+      "-o",
+      "root",
+      "-g",
+      "root",
+      "-m",
+      "0444",
+      "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/feature-groups-r1-rev20/control/release_op.py",
+      "/usr/local/libexec/recorder-next-release-op.py"
+    ],
+    "executed": false,
+    "mutation": true,
+    "reason": "The direct install plan is retained for identity review only; the activation packet never dispatches an unjournaled install. The journaled operator apply owns this target.",
+    "via": "journaled_operator_target"
+  },
+  "managed_cohort": [
+    {
+      "mode": "0444",
+      "sha256": "f12526861a56347bda9ad5911342f7a350fcf4e67ae28796868e0dbc1f28f73a",
+      "source": "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/feature-groups-r1-rev20/control/recorder-next.toml",
+      "target": "/etc/recorder-next/recorder-next.toml",
+      "via": "journaled_operator"
+    },
+    {
+      "mode": "0444",
+      "sha256": "f5b2353ec57d2ff8914b04c1993cb9b7e06337d7d218dedbba6989b9a80eace0",
+      "source": "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/feature-groups-r1-rev20/candidate/systemd/recorder-next.service",
+      "target": "/etc/systemd/system/recorder-next.service",
+      "via": "journaled_operator"
+    },
+    {
+      "mode": "0444",
+      "sha256": "e6ebc57cd81fff53dae88923eafb0f17b9f2fe554eceddc27315842031134a34",
+      "source": "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/feature-groups-r1-rev20/control/release_op.py",
+      "target": "/usr/local/libexec/recorder-next-release-op.py",
+      "via": "journaled_operator"
+    }
+  ],
+  "mutation_counters": {
+    "app_device": 0,
+    "gateway": 0,
+    "installation": 0,
+    "live_service": 0,
+    "publication": 0,
+    "rollback": 0,
+    "secret_output": 0,
+    "systemd": 0
+  },
+  "operator": {
+    "module": "recorder_next",
+    "path": "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/feature-groups-r1-rev20/control/release_op.py",
+    "runtime_python": "/usr/bin/python3",
+    "sha256": "e6ebc57cd81fff53dae88923eafb0f17b9f2fe554eceddc27315842031134a34",
+    "unit": "recorder-next.service"
+  },
+  "preflight_evidence": {
+    "path": "evidence/preflight-final.json",
+    "schema": "recorder-next-preflight/v3",
+    "sha256": "2c6edcbe6b57d891f4320a4d8a0f2286393f9b2c93be280aaeff5b693359a82f"
+  },
+  "product_sha256": "def267f5fa28891a481da41ecf12d314ba4c09066e8fcade389b124116e99fba",
+  "rollback": {
+    "apply_receipt": "apply-feature-groups-r1-rev20.json",
+    "argv": [
+      "/usr/bin/python3",
+      "-B",
+      "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/feature-groups-r1-rev20/control/release_op.py",
+      "rollback",
+      "--manifest",
+      "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/feature-groups-r1-rev20/control/transaction-manifest.json",
+      "--manifest-sha256",
+      "e8a7dd69c2e3cbf79428e6ab77af5a89ab26712314c4ae64313005b3d203548c",
+      "--operator-sha256",
+      "e6ebc57cd81fff53dae88923eafb0f17b9f2fe554eceddc27315842031134a34",
+      "--stage-root",
+      "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/feature-groups-r1-rev20",
+      "--live-root",
+      "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/feature-groups-r1-rev20/fixture/live",
+      "--receipt-root",
+      "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/feature-groups-r1-rev20/fixture/receipts",
+      "--state-root",
+      "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/feature-groups-r1-rev20/fixture/state",
+      "--candidate-manifest",
+      "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/feature-groups-r1-rev20/candidate-manifest.json",
+      "--apply-receipt",
+      "apply-feature-groups-r1-rev20.json"
+    ],
+    "executed": false,
+    "journal": "transaction-feature-groups-r1-rev20.json",
+    "mutation": true,
+    "receipt_root": "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/feature-groups-r1-rev20/fixture/receipts",
+    "rollback_receipt": "rollback-feature-groups-r1-rev20.json"
+  },
+  "rollback_sequence": [
+    {
+      "commands": [
+        [
+          "/usr/bin/python3",
+          "-B",
+          "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/feature-groups-r1-rev20/control/release_op.py",
+          "authorize-rollback",
+          "--manifest",
+          "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/feature-groups-r1-rev20/control/transaction-manifest.json",
+          "--manifest-sha256",
+          "e8a7dd69c2e3cbf79428e6ab77af5a89ab26712314c4ae64313005b3d203548c",
+          "--operator-sha256",
+          "e6ebc57cd81fff53dae88923eafb0f17b9f2fe554eceddc27315842031134a34",
+          "--stage-root",
+          "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/feature-groups-r1-rev20",
+          "--live-root",
+          "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/feature-groups-r1-rev20/fixture/live",
+          "--receipt-root",
+          "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/feature-groups-r1-rev20/fixture/receipts",
+          "--state-root",
+          "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/feature-groups-r1-rev20/fixture/state",
+          "--candidate-manifest",
+          "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/feature-groups-r1-rev20/candidate-manifest.json",
+          "--apply-receipt",
+          "apply-feature-groups-r1-rev20.json",
+          "--rollback-receipt",
+          "rollback-feature-groups-r1-rev20.json",
+          "--read-only"
+        ],
+        [
+          "/usr/bin/python3",
+          "-B",
+          "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/feature-groups-r1-rev20/control/preflight_rev14.py",
+          "--generation",
+          "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/feature-groups-r1-rev20",
+          "--read-only"
+        ]
+      ],
+      "gate": "inode-bound apply receipt and journal are exact",
+      "mutation": false,
+      "name": "authorize_exact_apply_receipt",
+      "step": 1
+    },
+    {
+      "commands": [
+        [
+          "/usr/bin/python3",
+          "-B",
+          "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/feature-groups-r1-rev20/control/release_op.py",
+          "restore-legacy",
+          "--manifest",
+          "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/feature-groups-r1-rev20/control/transaction-manifest.json",
+          "--manifest-sha256",
+          "e8a7dd69c2e3cbf79428e6ab77af5a89ab26712314c4ae64313005b3d203548c",
+          "--operator-sha256",
+          "e6ebc57cd81fff53dae88923eafb0f17b9f2fe554eceddc27315842031134a34",
+          "--stage-root",
+          "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/feature-groups-r1-rev20",
+          "--live-root",
+          "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/feature-groups-r1-rev20/fixture/live",
+          "--receipt-root",
+          "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/feature-groups-r1-rev20/fixture/receipts",
+          "--state-root",
+          "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/feature-groups-r1-rev20/fixture/state",
+          "--candidate-manifest",
+          "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/feature-groups-r1-rev20/candidate-manifest.json",
+          "--apply-receipt",
+          "apply-feature-groups-r1-rev20.json",
+          "--rollback-receipt",
+          "rollback-feature-groups-r1-rev20.json",
+          "--restore-manifest",
+          "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/feature-groups-r1-rev20/control/transaction-manifest.json",
+          "--restore-only-bound-preimages"
+        ]
+      ],
+      "executed": false,
+      "gate": "only receipt-bound preimages are restored",
+      "mutation": true,
+      "name": "restore_legacy_preimages",
+      "step": 2
+    },
+    {
+      "commands": [
+        [
+          "/usr/bin/python3",
+          "-B",
+          "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/feature-groups-r1-rev20/control/release_op.py",
+          "readback-rollback",
+          "--manifest",
+          "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/feature-groups-r1-rev20/control/transaction-manifest.json",
+          "--manifest-sha256",
+          "e8a7dd69c2e3cbf79428e6ab77af5a89ab26712314c4ae64313005b3d203548c",
+          "--operator-sha256",
+          "e6ebc57cd81fff53dae88923eafb0f17b9f2fe554eceddc27315842031134a34",
+          "--stage-root",
+          "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/feature-groups-r1-rev20",
+          "--live-root",
+          "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/feature-groups-r1-rev20/fixture/live",
+          "--receipt-root",
+          "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/feature-groups-r1-rev20/fixture/receipts",
+          "--state-root",
+          "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/feature-groups-r1-rev20/fixture/state",
+          "--candidate-manifest",
+          "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/feature-groups-r1-rev20/candidate-manifest.json",
+          "--rollback-receipt",
+          "rollback-feature-groups-r1-rev20.json",
+          "--protected-ports",
+          "127.0.0.1:8642,127.0.0.1:8653",
+          "--read-only"
+        ]
+      ],
+      "gate": "rollback receipt, target vector, and protected surfaces read back exactly",
+      "mutation": false,
+      "name": "rollback_readback",
+      "step": 3
+    }
+  ],
+  "schema": "recorder-next-activation-packet/v2",
+  "status": "CANDIDATE_ONLY",
+  "transaction_manifest": {
+    "path": "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/feature-groups-r1-rev20/control/transaction-manifest.json",
+    "sha256": "e8a7dd69c2e3cbf79428e6ab77af5a89ab26712314c4ae64313005b3d203548c"
+  }
+}

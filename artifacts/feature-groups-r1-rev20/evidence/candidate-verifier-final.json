@@ -1,0 +1,13 @@
+{
+  "candidate_file_count": 50,
+  "candidate_id": "recorder-next-feature-groups-r1-rev20-90ff26b7cc4cf821",
+  "candidate_sha256": "90ff26b7cc4cf821b01630dc86d017ee92894955b226943f8f4bff8d96ba02c7",
+  "commands_executed": 0,
+  "generation": "feature-groups-r1-rev20",
+  "product_sha256": "def267f5fa28891a481da41ecf12d314ba4c09066e8fcade389b124116e99fba",
+  "read_only": true,
+  "schema": "recorder-next-candidate-verifier/v2",
+  "status": "PASS",
+  "test_count": 109,
+  "test_id_sha256": "3285d98108d3e3ce514ce890d7594bda6e64d8483b2a8e9eb560f0c9d5bf9e1b"
+}

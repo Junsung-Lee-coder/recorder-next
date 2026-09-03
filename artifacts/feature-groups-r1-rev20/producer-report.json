@@ -1,0 +1,57 @@
+{
+  "candidate_file_count": 50,
+  "candidate_id": "recorder-next-feature-groups-r1-rev20-90ff26b7cc4cf821",
+  "candidate_sha256": "90ff26b7cc4cf821b01630dc86d017ee92894955b226943f8f4bff8d96ba02c7",
+  "control_matrix": {
+    "operator": "e6ebc57cd81fff53dae88923eafb0f17b9f2fe554eceddc27315842031134a34",
+    "status": "PASS",
+    "test_count": 14
+  },
+  "generation": "feature-groups-r1-rev20",
+  "mutation_counters": {
+    "app_device": 0,
+    "gateway": 0,
+    "installation": 0,
+    "live_service": 0,
+    "publication": 0,
+    "rollback": 0,
+    "secret_output": 0,
+    "systemd": 0
+  },
+  "preflight": {
+    "approved_for_live_change": false,
+    "candidate_id": "recorder-next-feature-groups-r1-rev20-90ff26b7cc4cf821",
+    "candidate_only": true,
+    "candidate_sha256": "90ff26b7cc4cf821b01630dc86d017ee92894955b226943f8f4bff8d96ba02c7",
+    "commands_executed": 0,
+    "control_role_count": 10,
+    "errors": [],
+    "freeze_vector_path": "freeze-vector.json",
+    "freeze_vector_sidecar": "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/feature-groups-r1-rev20.freeze-vector.sha256",
+    "generation": "feature-groups-r1-rev20",
+    "live_authorized": false,
+    "operator_sha256": "e6ebc57cd81fff53dae88923eafb0f17b9f2fe554eceddc27315842031134a34",
+    "product_sha256": "def267f5fa28891a481da41ecf12d314ba4c09066e8fcade389b124116e99fba",
+    "read_only": true,
+    "ready_to_begin": true,
+    "required_live_gate": "independent review PASS plus explicit live authorization; no live mutation in this generation",
+    "schema": "recorder-next-preflight/v3",
+    "status": "PASS",
+    "transaction_manifest_sha256": "e8a7dd69c2e3cbf79428e6ab77af5a89ab26712314c4ae64313005b3d203548c"
+  },
+  "product_bytes_changed_from_failed_candidate": true,
+  "product_sha256": "def267f5fa28891a481da41ecf12d314ba4c09066e8fcade389b124116e99fba",
+  "schema": "recorder-next-producer-report/v3",
+  "source_archive": {
+    "path": "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/candidate-source-feature-groups-r1-rev20.tar",
+    "role": "candidate_archive",
+    "sha256": "75d428859ff2d00ef91165cff4280861977f1cb0973c1f3eef10b27bd613a8f3",
+    "size": 1024000
+  },
+  "status": "PASS",
+  "test_matrix": {
+    "count": 109,
+    "sorted_test_id_sha256": "3285d98108d3e3ce514ce890d7594bda6e64d8483b2a8e9eb560f0c9d5bf9e1b",
+    "status": "PASS"
+  }
+}

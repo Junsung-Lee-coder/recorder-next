@@ -1,0 +1,10 @@
+Looking in indexes: https://pypi.org/simple, https://www.piwheels.org/simple
+Processing ./.
+  Preparing metadata (pyproject.toml): started
+  Preparing metadata (pyproject.toml): finished with status 'done'
+Building wheels for collected packages: recorder-next
+  Building wheel for recorder-next (pyproject.toml): started
+  Building wheel for recorder-next (pyproject.toml): finished with status 'done'
+  Created wheel for recorder-next: filename=recorder_next-1.0.0-py3-none-any.whl size=100695 sha256=43be73da1f2bab4be456dcd6552a7f7726edd88532dab82129c50f5084834a9d
+  Stored in directory: /home/rumi/.cache/pip/wheels/de/18/75/481aff2f790cd88938f14610c8ad22011cb872bbaf3808fef5
+Successfully built recorder-next

@@ -1,0 +1,69 @@
+{
+  "candidate": {
+    "id": "recorder-next-feature-groups-r1-rev20-90ff26b7cc4cf821",
+    "product_sha256": "def267f5fa28891a481da41ecf12d314ba4c09066e8fcade389b124116e99fba",
+    "sha256": "90ff26b7cc4cf821b01630dc86d017ee92894955b226943f8f4bff8d96ba02c7"
+  },
+  "generation": "feature-groups-r1-rev20",
+  "operator_sha256": "e6ebc57cd81fff53dae88923eafb0f17b9f2fe554eceddc27315842031134a34",
+  "receipts": {
+    "apply": "apply-feature-groups-r1-rev20.json",
+    "journal": "transaction-feature-groups-r1-rev20.json",
+    "lock": "operator.lock",
+    "rollback": "rollback-feature-groups-r1-rev20.json"
+  },
+  "roots": {
+    "live": "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/feature-groups-r1-rev20/fixture/live",
+    "receipts": "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/feature-groups-r1-rev20/fixture/receipts",
+    "stage": "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/feature-groups-r1-rev20",
+    "state": "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/feature-groups-r1-rev20/fixture/state"
+  },
+  "runtime": {
+    "exec_start": "/usr/bin/python3 -m recorder_next --config /etc/recorder-next/recorder-next.toml",
+    "module": "recorder_next",
+    "python": "/usr/bin/python3",
+    "unit": "recorder-next.service"
+  },
+  "schema": "recorder-next-transaction/v1",
+  "targets": [
+    {
+      "postimage": {
+        "mode": "0444",
+        "sha256": "f12526861a56347bda9ad5911342f7a350fcf4e67ae28796868e0dbc1f28f73a"
+      },
+      "preimage": {
+        "exists": true,
+        "mode": "0444",
+        "sha256": "e655b43bbbf7483c0c7ff1fb0b88c448a81862297883e7404a4cae27df06be38"
+      },
+      "source": "control/recorder-next.toml",
+      "target": "etc/recorder-next/recorder-next.toml"
+    },
+    {
+      "postimage": {
+        "mode": "0444",
+        "sha256": "f5b2353ec57d2ff8914b04c1993cb9b7e06337d7d218dedbba6989b9a80eace0"
+      },
+      "preimage": {
+        "exists": false,
+        "mode": null,
+        "sha256": null
+      },
+      "source": "candidate/systemd/recorder-next.service",
+      "target": "etc/systemd/system/recorder-next.service"
+    },
+    {
+      "postimage": {
+        "mode": "0444",
+        "sha256": "e6ebc57cd81fff53dae88923eafb0f17b9f2fe554eceddc27315842031134a34"
+      },
+      "preimage": {
+        "exists": false,
+        "mode": null,
+        "sha256": null
+      },
+      "source": "control/release_op.py",
+      "target": "usr/local/libexec/recorder-next-release-op.py"
+    }
+  ]
+}

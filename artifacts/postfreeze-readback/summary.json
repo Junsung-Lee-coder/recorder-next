@@ -1,0 +1,27 @@
+{
+  "candidate_id": "recorder-next-feature-groups-r1-rev20-90ff26b7cc4cf821",
+  "candidate_sha256": "90ff26b7cc4cf821b01630dc86d017ee92894955b226943f8f4bff8d96ba02c7",
+  "checks": {
+    "candidate-verifier": {
+      "returncode": 0,
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stdout_sha256": "4d2578ff2f7a4f1880237c2b4b9fa3b3c88db5f3b6a392224470c180356ff2ec"
+    },
+    "packet-check": {
+      "returncode": 0,
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stdout_sha256": "31203d414a0f3006048327906c12b1baf9e2deba311911603359cd78049dcf8d"
+    },
+    "preflight": {
+      "returncode": 0,
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stdout_sha256": "2c6edcbe6b57d891f4320a4d8a0f2286393f9b2c93be280aaeff5b693359a82f"
+    },
+    "stage-verifier": {
+      "returncode": 0,
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stdout_sha256": "1b5e6beb536c05d5d3763d42e9a2b0269ec533d5a1b155ebda8609715b50076e"
+    }
+  },
+  "product_sha256": "def267f5fa28891a481da41ecf12d314ba4c09066e8fcade389b124116e99fba"
+}

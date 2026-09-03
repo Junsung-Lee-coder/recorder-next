@@ -1,0 +1,18 @@
+{
+  "archive_sha256": "75d428859ff2d00ef91165cff4280861977f1cb0973c1f3eef10b27bd613a8f3",
+  "candidate_id": "recorder-next-feature-groups-r1-rev20-90ff26b7cc4cf821",
+  "candidate_sha256": "90ff26b7cc4cf821b01630dc86d017ee92894955b226943f8f4bff8d96ba02c7",
+  "commands_executed": 0,
+  "generation": "feature-groups-r1-rev20",
+  "operator_sha256": "e6ebc57cd81fff53dae88923eafb0f17b9f2fe554eceddc27315842031134a34",
+  "read_only": true,
+  "schema": "recorder-next-stage-verifier/v2",
+  "source_archive": {
+    "path": "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/candidate-source-feature-groups-r1-rev20.tar",
+    "role": "candidate_archive",
+    "sha256": "75d428859ff2d00ef91165cff4280861977f1cb0973c1f3eef10b27bd613a8f3",
+    "size": 1024000
+  },
+  "source_count": 3,
+  "status": "PASS"
+}
