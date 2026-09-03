@@ -361,10 +361,33 @@ class HttpHermesGateway:
         encoded_session = quote(session_key, safe="")
         body["marker"] = marker
         body["hermes_submission_id"] = submission_id
+        headers = self._session_headers(session_key)
+        headers["Idempotency-Key"] = submission_id
+        chat_path = f"/api/sessions/{encoded_session}/chat"
         try:
-            headers = self._session_headers(session_key)
-            headers["Idempotency-Key"] = submission_id
-            result = self._request("POST", f"/api/sessions/{encoded_session}/chat", body, extra_headers=headers)
+            result = self._request("POST", chat_path, body, extra_headers=headers)
+        except urllib.error.HTTPError as exc:
+            if exc.code != 404:
+                return None
+            try:
+                self._request(
+                    "POST",
+                    "/api/sessions",
+                    {
+                        "id": session_key,
+                        "source": "api_server",
+                    },
+                    extra_headers=self._session_headers(session_key),
+                )
+            except urllib.error.HTTPError as create_exc:
+                if create_exc.code != 409:
+                    return None
+            except (urllib.error.URLError, TimeoutError):
+                return None
+            try:
+                result = self._request("POST", chat_path, body, extra_headers=headers)
+            except (urllib.error.URLError, TimeoutError):
+                return None
         except (urllib.error.URLError, TimeoutError):
             return None
         return self._parse_result(result)
@@ -379,7 +402,10 @@ class HttpHermesGateway:
             result = self._request("GET", f"/api/sessions/{encoded_session}/messages", extra_headers=self._session_headers(session_key))
         except (urllib.error.URLError, TimeoutError):
             return []
-        messages = result.get("messages", result if isinstance(result, list) else [])
+        if isinstance(result, Mapping):
+            messages = result.get("messages") or result.get("data") or []
+        else:
+            messages = result if isinstance(result, list) else []
         if not isinstance(messages, list):
             return []
         marker_index = -1
@@ -406,13 +432,26 @@ class HttpHermesGateway:
     def _parse_result(result: Any) -> HermesResult | None:
         if not isinstance(result, Mapping):
             return None
-        text = result.get("text") or result.get("content") or result.get("assistant_content")
+        message = result.get("message")
+        nested_message = message if isinstance(message, Mapping) else {}
+        text = (
+            result.get("text")
+            or result.get("content")
+            or result.get("assistant_content")
+            or nested_message.get("content")
+        )
         if isinstance(text, list):
             text = "".join(str(item.get("text", "")) for item in text if isinstance(item, Mapping))
         if not text:
             return None
         return HermesResult(
-            str(result.get("assistant_message_id") or result.get("message_id") or result.get("id") or "hermes-response"),
+            str(
+                result.get("assistant_message_id")
+                or result.get("message_id")
+                or nested_message.get("id")
+                or result.get("id")
+                or "hermes-response"
+            ),
             str(text),
             True,
             "hermes-chat",

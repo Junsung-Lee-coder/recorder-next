@@ -1,10 +1,75 @@
+import io
 import json
 import unittest
+import urllib.error
 
 from recorder_next.adapters import HttpHermesGateway
 
 
 class HermesAdapterContractTests(unittest.TestCase):
+    def test_http_submit_provisions_missing_session_and_parses_current_envelope(self):
+        class ProbeGateway(HttpHermesGateway):
+            def __init__(self):
+                super().__init__("http://127.0.0.1:9")
+                self.calls = []
+
+            def _request(self, method, path, payload=None, *, extra_headers=None):
+                self.calls.append((method, path, payload, dict(extra_headers or {})))
+                chat_calls = [call for call in self.calls if call[1].endswith("/chat")]
+                if path.endswith("/chat") and len(chat_calls) == 1:
+                    raise urllib.error.HTTPError(
+                        path,
+                        404,
+                        "session not found",
+                        {},
+                        io.BytesIO(b'{"error":{"code":"session_not_found"}}'),
+                    )
+                if method == "POST" and path == "/api/sessions":
+                    return {"object": "hermes.session", "session": {"id": payload["id"]}}
+                return {
+                    "object": "hermes.session.chat.completion",
+                    "session_id": "project:abc:default",
+                    "message": {"role": "assistant", "content": "ok-current-envelope"},
+                }
+
+        gateway = ProbeGateway()
+        result = gateway.submit(
+            session_key="project:abc:default",
+            request={"input": "normalized"},
+            submission_id="sub-current",
+            marker="marker-current",
+        )
+
+        self.assertEqual(result.content, "ok-current-envelope")
+        self.assertEqual([call[0:2] for call in gateway.calls], [
+            ("POST", "/api/sessions/project%3Aabc%3Adefault/chat"),
+            ("POST", "/api/sessions"),
+            ("POST", "/api/sessions/project%3Aabc%3Adefault/chat"),
+        ])
+        self.assertEqual(gateway.calls[1][2]["id"], "project:abc:default")
+        self.assertNotIn("title", gateway.calls[1][2])
+        self.assertEqual(gateway.calls[2][3]["Idempotency-Key"], "sub-current")
+
+    def test_http_history_parses_current_data_envelope(self):
+        class ProbeGateway(HttpHermesGateway):
+            def __init__(self):
+                super().__init__("http://127.0.0.1:9")
+
+            def _request(self, method, path, payload=None, *, extra_headers=None):
+                return {
+                    "object": "list",
+                    "data": [
+                        {"id": "u-1", "role": "user", "content": "marker-current"},
+                        {"id": "a-1", "role": "assistant", "content": "history-current-envelope"},
+                    ],
+                }
+
+        result = ProbeGateway().history(
+            session_key="project:abc:default",
+            marker="marker-current",
+        )
+        self.assertEqual(result.content, "history-current-envelope")
+
     def test_http_submit_projects_only_input_marker_and_submission_identity(self):
         class ProbeGateway(HttpHermesGateway):
             def __init__(self):
