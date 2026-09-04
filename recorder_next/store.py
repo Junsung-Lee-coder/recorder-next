@@ -1615,30 +1615,20 @@ class RecorderStore:
         user_id: str | None = None,
         limit: int = 50,
     ) -> list[dict[str, Any]]:
+        if not isinstance(user_id, str) or not user_id:
+            raise UnauthorizedError("outbox reads require an authenticated user and device")
         with self._read() as conn:
-            if user_id is not None:
-                self._assert_device(conn, user_id, device_id)
-                rows = conn.execute(
-                    "SELECT o.* FROM outbox o JOIN turns t ON t.turn_id=o.turn_id WHERE o.required_device_id=? AND t.user_id=? AND o.state='PENDING' ORDER BY o.turn_event_seq, o.created_at LIMIT ?",
-                    (device_id, user_id, limit * 4),
-                ).fetchall()
-            else:
-                rows = conn.execute(
-                    "SELECT * FROM outbox WHERE required_device_id=? AND state='PENDING' ORDER BY turn_event_seq, created_at LIMIT ?",
-                    (device_id, limit * 4),
-                ).fetchall()
+            self._assert_device(conn, user_id, device_id)
+            rows = conn.execute(
+                "SELECT o.* FROM outbox o JOIN turns t ON t.turn_id=o.turn_id WHERE o.required_device_id=? AND t.user_id=? AND o.state='PENDING' ORDER BY o.turn_event_seq, o.created_at LIMIT ?",
+                (device_id, user_id, limit * 4),
+            ).fetchall()
             result: list[dict[str, Any]] = []
             for row in rows:
-                if user_id is not None:
-                    blocked = conn.execute(
-                        "SELECT 1 FROM outbox o JOIN turns t ON t.turn_id=o.turn_id WHERE o.required_device_id=? AND o.turn_id=? AND t.user_id=? AND o.turn_event_seq < ? AND o.state='PENDING' LIMIT 1",
-                        (device_id, row["turn_id"], user_id, row["turn_event_seq"]),
-                    ).fetchone()
-                else:
-                    blocked = conn.execute(
-                        "SELECT 1 FROM outbox WHERE required_device_id=? AND turn_id=? AND turn_event_seq < ? AND state='PENDING' LIMIT 1",
-                        (device_id, row["turn_id"], row["turn_event_seq"]),
-                    ).fetchone()
+                blocked = conn.execute(
+                    "SELECT 1 FROM outbox o JOIN turns t ON t.turn_id=o.turn_id WHERE o.required_device_id=? AND o.turn_id=? AND t.user_id=? AND o.turn_event_seq < ? AND o.state='PENDING' LIMIT 1",
+                    (device_id, row["turn_id"], user_id, row["turn_event_seq"]),
+                ).fetchone()
                 if blocked:
                     continue
                 item = _row(row) or {}

@@ -54,7 +54,7 @@ from control_contract import (
     write_json,
 )
 
-GENERATION = "feature-groups-r2-rev32"
+GENERATION = "feature-groups-r2-rev33"
 CONTROL_TEST_SOURCES = {
     "tests/test_activation_controls.py",
     "tests/test_generation_contract.py",

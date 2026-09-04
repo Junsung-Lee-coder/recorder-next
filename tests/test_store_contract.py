@@ -107,7 +107,7 @@ class UploadAndAcceptanceTests(unittest.TestCase):
             )
             routed = store.commit_route(turn_id, decision, owner="router-a")
             self.assertEqual(routed["state"], "HERMES_PENDING")
-            pending = store.pending_outbox("phone-1")
+            pending = store.pending_outbox("phone-1", user_id="user-1")
             self.assertEqual([item["event_kind"] for item in pending], ["ROUTED"])
             route_event = pending[0]
             store.ack_event(turn_id, route_event["event_id"], device_id="phone-1", event_version=1, payload_sha256=route_event["payload_sha256"])
@@ -117,15 +117,15 @@ class UploadAndAcceptanceTests(unittest.TestCase):
             first = store.commit_hermes_result(submission_id, HermesResult("msg-1", "첫 답\r\n", True))
             self.assertEqual(first["final_event_version"], 1)
             self.assertEqual(first["state"], "FINAL_READY")
-            final_pending = store.pending_outbox("phone-1")
+            final_pending = store.pending_outbox("phone-1", user_id="user-1")
             self.assertEqual([item["event_version"] for item in final_pending], [1])
             second = store.commit_hermes_result(submission_id, HermesResult("msg-2", "두 번째 답", True))
             self.assertEqual(second["final_event_version"], 2)
             self.assertEqual(second["final_content"], "첫 답\n\n두 번째 답")
             self.assertEqual(len(second["tts_artifacts"]), 2)  # ROUTED_TTS + FINAL_TTS(v1), no v2 TTS
-            final_v1 = [item for item in store.pending_outbox("phone-1") if item["event_kind"] == "FINAL"][0]
+            final_v1 = [item for item in store.pending_outbox("phone-1", user_id="user-1") if item["event_kind"] == "FINAL"][0]
             store.ack_event(turn_id, final_v1["event_id"], device_id="phone-1", event_version=1, payload_sha256=final_v1["payload_sha256"])
-            pending_v2 = store.pending_outbox("phone-1")
+            pending_v2 = store.pending_outbox("phone-1", user_id="user-1")
             self.assertEqual([item["event_version"] for item in pending_v2], [2])
 
     def test_expired_router_lease_can_be_taken_over_but_cannot_commit_as_old_owner(self):

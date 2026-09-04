@@ -370,6 +370,9 @@ class RecorderR1RepairTests(unittest.TestCase):
             )
             store.accept_turn(turn_id)
 
+            with self.assertRaises(UnauthorizedError):
+                store.pending_outbox("shared-phone")
+
             for target in (
                 f"/v1/turns/{turn_id}",
                 f"/v1/turns/{turn_id}/parts/text-1/missing",

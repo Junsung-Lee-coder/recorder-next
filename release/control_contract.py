@@ -34,7 +34,7 @@ CANDIDATE_HASH_PREFIX = "recorder-next-r7-candidate/v3"
 CANDIDATE_HASH_ALGORITHM = 'sha256(\\"recorder-next-r7-candidate/v3\\"\\0generation\\0product_sha256\\0)'
 PRODUCT_IDENTITY = "recorder-next-server-product-items-1-through-8"
 EXPECTED_PRODUCT_FILE_COUNT = 50
-EXPECTED_PRODUCT_SHA = "51e85316c3c27c8c9871284f5dce044c6513f882db6568c7396f33dee0bc6500"
+EXPECTED_PRODUCT_SHA = "b01b345f39d6e40e7ca5bd720de86a80fda7caf603cfcefb59c3ffdf1e3560c8"
 PRODUCT_BYTES_CHANGED_FROM_FAILED_CANDIDATE = True
 CHANGED_PRODUCT_PATHS_FROM_FAILED_CANDIDATE = [
     "api/openapi.json",
@@ -49,7 +49,7 @@ CHANGED_PRODUCT_PATHS_FROM_FAILED_CANDIDATE = [
     "tests/test_r1_repairs.py",
     "tests/test_scheduled_final.py",
 ]
-ARCHIVE_NAME = "candidate-source-feature-groups-r2-rev32.tar"
+ARCHIVE_NAME = "candidate-source-feature-groups-r2-rev33.tar"
 PREDECESSOR = {
     "disposition": "preserved_failed_predecessor",
     "candidate_id": "recorder-next-feature-groups-r1-rev20-90ff26b7cc4cf821",

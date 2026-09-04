@@ -278,9 +278,9 @@ class ScheduledFinalStoreTests(unittest.TestCase):
             self.assertEqual(scheduled["delivery_target_device_id"], "watch-1")
             self.assertEqual(event["required_device_id"], "watch-1")
             self.assertEqual(artifact["delivery_target_device_id"], "watch-1")
-            watch_outbox = store.pending_outbox("watch-1")
+            watch_outbox = store.pending_outbox("watch-1", user_id="schedule-user")
             self.assertIn(event["event_id"], [row["event_id"] for row in watch_outbox])
-            self.assertNotIn(event["event_id"], [row["event_id"] for row in store.pending_outbox("phone-1")])
+            self.assertNotIn(event["event_id"], [row["event_id"] for row in store.pending_outbox("phone-1", user_id="schedule-user")])
             self.assertEqual(store.get_schedule("schedule-phone-to-watch")["occurrences"][0]["delivery_target_device_id"], "watch-1")
 
     def test_explicit_target_stays_phone_across_latest_watch_turn(self):

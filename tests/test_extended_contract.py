@@ -127,7 +127,7 @@ class GraceAndArchiveTests(unittest.TestCase):
             store.accept_turn(manifest["turn_id"])
             project = store.create_project("user-1", project_number="P-001", name="Fixture")
             store.commit_route(manifest["turn_id"], RouterDecision("route", project["stable_project_id"], project["default_session_key"], 1, "전달", "fixture"))
-            route = store.pending_outbox("phone-1")[0]
+            route = store.pending_outbox("phone-1", user_id="user-1")[0]
             store.ack_event(manifest["turn_id"], route["event_id"], device_id="phone-1", event_version=1, payload_sha256=route["payload_sha256"])
             with store._read() as conn:
                 submission = conn.execute("SELECT hermes_submission_id FROM session_ingress WHERE turn_id=?", (manifest["turn_id"],)).fetchone()[0]
