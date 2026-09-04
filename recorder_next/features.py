@@ -11,6 +11,7 @@ from __future__ import annotations
 import base64
 import binascii
 import datetime as dt
+import errno
 import hashlib
 import json
 import os
@@ -60,6 +61,15 @@ class FeatureGroups:
         self.eavesdrop_agent = eavesdrop_agent or EavesdropRoutingAgent()
 
     # ---- Shared validation and no-follow file helpers ---------------------
+
+    @staticmethod
+    def _lexical_absolute(path: Path, *, reject_parent: bool = False) -> Path:
+        """Normalize lexical dots without resolving symlink components."""
+
+        raw = Path(os.fspath(path))
+        if reject_parent and ".." in raw.parts:
+            raise UnauthorizedError("managed path contains parent traversal")
+        return Path(os.path.abspath(os.fspath(path)))
 
     @staticmethod
     def _time(value: str | None, store: Any) -> str:
@@ -158,8 +168,8 @@ class FeatureGroups:
     def _ensure_no_symlink_path(root: Path, path: Path, *, allow_missing_leaf: bool = True) -> None:
         """Reject symlinked path components without resolving them."""
 
-        root = root.absolute()
-        path = path.absolute()
+        root = FeatureGroups._lexical_absolute(root)
+        path = FeatureGroups._lexical_absolute(path, reject_parent=True)
         try:
             relative = path.relative_to(root)
         except ValueError as exc:
@@ -186,25 +196,41 @@ class FeatureGroups:
 
     @classmethod
     def _mkdir_managed_path(cls, root: Path, path: Path) -> None:
-        """Create a managed directory tree without following existing links."""
+        """Create a managed directory tree with anchored no-follow traversal."""
 
-        root = root.absolute()
-        path = path.absolute()
+        root = cls._lexical_absolute(root)
+        path = cls._lexical_absolute(path, reject_parent=True)
         try:
             relative = path.relative_to(root)
         except ValueError as exc:
             raise UnauthorizedError("managed directory escapes the storage root") from exc
-        cls._ensure_no_symlink_path(root, root, allow_missing_leaf=False)
-        current = root
-        for component in relative.parts:
-            current = current / component
-            try:
-                info = os.lstat(current)
-            except FileNotFoundError:
-                current.mkdir()
-                continue
-            if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
-                raise UnauthorizedError("managed directory contains an unsafe component")
+        directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        root_descriptor: int | None = None
+        directory_descriptor: int | None = None
+        try:
+            root_descriptor = os.open(root, directory_flags)
+            directory_descriptor = root_descriptor
+            for component in relative.parts:
+                try:
+                    next_descriptor = os.open(component, directory_flags, dir_fd=directory_descriptor)
+                except FileNotFoundError:
+                    try:
+                        os.mkdir(component, mode=0o755, dir_fd=directory_descriptor)
+                    except FileExistsError:
+                        pass
+                    next_descriptor = os.open(component, directory_flags, dir_fd=directory_descriptor)
+                if directory_descriptor != root_descriptor:
+                    os.close(directory_descriptor)
+                directory_descriptor = next_descriptor
+        except OSError as exc:
+            if exc.errno == errno.ELOOP:
+                raise UnauthorizedError("managed directory contains a symlink") from exc
+            raise NotReadyError("managed directory is unavailable") from exc
+        finally:
+            if directory_descriptor is not None and directory_descriptor != root_descriptor:
+                os.close(directory_descriptor)
+            if root_descriptor is not None:
+                os.close(root_descriptor)
 
     @classmethod
     def _read_managed_bytes(
@@ -216,8 +242,8 @@ class FeatureGroups:
         expected_sha256: str | None = None,
     ) -> bytes:
         cls._ensure_no_symlink_path(root, path, allow_missing_leaf=False)
-        root = root.absolute()
-        path = path.absolute()
+        root = cls._lexical_absolute(root)
+        path = cls._lexical_absolute(path, reject_parent=True)
         try:
             relative = path.relative_to(root)
         except ValueError as exc:
@@ -268,10 +294,30 @@ class FeatureGroups:
 
     @staticmethod
     def _read_source_bytes(path: Path) -> bytes:
-        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        path = FeatureGroups._lexical_absolute(path, reject_parent=True)
+        directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        file_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        root_descriptor: int | None = None
+        directory_descriptor: int | None = None
+        descriptor: int | None = None
         try:
-            descriptor = os.open(path, flags)
+            root_descriptor = os.open(Path(path.anchor or "/"), directory_flags)
+            directory_descriptor = root_descriptor
+            for component in path.parent.parts[1:]:
+                next_descriptor = os.open(component, directory_flags, dir_fd=directory_descriptor)
+                if directory_descriptor != root_descriptor:
+                    os.close(directory_descriptor)
+                directory_descriptor = next_descriptor
+            descriptor = os.open(path.name, file_flags, dir_fd=directory_descriptor)
         except OSError as exc:
+            if descriptor is not None:
+                os.close(descriptor)
+            if directory_descriptor is not None and directory_descriptor != root_descriptor:
+                os.close(directory_descriptor)
+            if root_descriptor is not None:
+                os.close(root_descriptor)
+            if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+                raise UnauthorizedError("update artifact source contains a symlink") from exc
             raise NotReadyError("update artifact source is unavailable") from exc
         try:
             info = os.fstat(descriptor)
@@ -285,15 +331,20 @@ class FeatureGroups:
                 chunks.append(chunk)
             return b"".join(chunks)
         finally:
-            os.close(descriptor)
+            if descriptor is not None:
+                os.close(descriptor)
+            if directory_descriptor is not None and directory_descriptor != root_descriptor:
+                os.close(directory_descriptor)
+            if root_descriptor is not None:
+                os.close(root_descriptor)
 
     @classmethod
     def _unlink_managed_file(cls, root: Path, path: Path) -> None:
         """Unlink a managed leaf without following a swapped parent."""
 
         cls._ensure_no_symlink_path(root, path, allow_missing_leaf=True)
-        root = root.absolute()
-        path = path.absolute()
+        root = cls._lexical_absolute(root)
+        path = cls._lexical_absolute(path, reject_parent=True)
         relative = path.relative_to(root)
         if not relative.parts:
             raise UnauthorizedError("managed storage root cannot be removed")

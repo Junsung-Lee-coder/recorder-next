@@ -1,5 +1,7 @@
 """Machine-readable Recorder Next v1 HTTP contract."""
 
+import re
+
 OPENAPI = {
     "openapi": "3.0.3",
     "info": {
@@ -73,7 +75,11 @@ OPENAPI = {
         "/v1/diagnostics/bundles": {"post": {"responses": {"201": {"description": "Bounded compressed diagnostic bundle"}}}},
         "/v1/diagnostics": {"get": {"responses": {"200": {"description": "Diagnostic metadata"}}}, "delete": {"responses": {"200": {"description": "Deletion receipt and tombstones"}}}},
         "/v1/diagnostics/delete": {"post": {"responses": {"200": {"description": "Deletion receipt and tombstones"}}}},
-        "/v1/internal/worker/{action}": {"post": {"responses": {"200": {"description": "Durable worker lease operation"}}}},
+        "/v1/internal/worker/claim": {"post": {"responses": {"200": {"description": "Claim one durable worker lease"}}}},
+        "/v1/internal/worker/recover": {"post": {"responses": {"200": {"description": "Recover expired worker leases"}}}},
+        "/v1/internal/worker/complete": {"post": {"responses": {"200": {"description": "Complete one durable worker lease"}}}},
+        "/v1/internal/worker/fail": {"post": {"responses": {"200": {"description": "Record one durable worker failure"}}}},
+        "/v1/internal/worker/run": {"post": {"responses": {"200": {"description": "Run one durable worker lease operation"}}}},
         "/v1/internal/worker/health": {"get": {"responses": {"200": {"description": "Bounded worker backlog and lease health"}}}},
         "/v1/eavesdrop/{session_id}/segments/{segment_sequence}/route": {"post": {"responses": {"200": {"description": "Idempotent fixed-project routing decision"}}}},
         "/v1/eavesdrop/{session_id}/decisions": {"get": {"responses": {"200": {"description": "Eavesdrop routing decision ledger"}}}},
@@ -84,6 +90,19 @@ OPENAPI = {
             "TurnId": {"name": "turn_id", "in": "path", "required": True, "schema": {"type": "string", "format": "uuid"}},
             "ArtifactId": {"name": "artifact_id", "in": "path", "required": True, "schema": {"type": "string"}},
             "DeviceId": {"name": "device_id", "in": "query", "required": True, "description": "Registered active device identity; a Phone may bridge-read a Watch-targeted artifact.", "schema": {"type": "string", "minLength": 1}},
+            "UserId": {"name": "user_id", "in": "query", "required": True, "description": "Owner identity paired with the registered active device.", "schema": {"type": "string", "minLength": 1}},
+            "DevicePath": {"name": "device_id", "in": "path", "required": True, "schema": {"type": "string", "minLength": 1}},
+            "PartId": {"name": "part_id", "in": "path", "required": True, "schema": {"type": "string", "minLength": 1}},
+            "Sequence": {"name": "sequence", "in": "path", "required": True, "schema": {"type": "integer", "minimum": 0}},
+            "EventId": {"name": "event_id", "in": "path", "required": True, "schema": {"type": "string", "format": "uuid"}},
+            "ProjectId": {"name": "project_id", "in": "path", "required": True, "schema": {"type": "string", "minLength": 1}},
+            "ScheduleId": {"name": "schedule_id", "in": "path", "required": True, "schema": {"type": "string", "minLength": 1}},
+            "Channel": {"name": "channel", "in": "path", "required": True, "schema": {"type": "string", "minLength": 1}},
+            "Generation": {"name": "generation", "in": "path", "required": True, "schema": {"type": "integer", "minimum": 1}},
+            "ArtifactName": {"name": "artifact_name", "in": "path", "required": True, "schema": {"type": "string", "minLength": 1}},
+            "SessionId": {"name": "session_id", "in": "path", "required": True, "schema": {"type": "string", "minLength": 1}},
+            "Action": {"name": "action", "in": "path", "required": True, "schema": {"type": "string", "enum": ["activate", "pause", "resume", "stop", "segments"]}},
+            "SegmentSequence": {"name": "segment_sequence", "in": "path", "required": True, "schema": {"type": "integer", "minimum": 0}},
         },
         "schemas": {
             "TurnState": {"type": "string", "enum": ["RECEIVING", "ACCEPTED", "PREPROCESSING", "ROUTING", "ROUTED", "HERMES_PENDING", "FINAL_READY", "DELIVERY_PENDING", "RETRY_WAIT", "LATE_RESULT_GRACE", "DELIVERED", "FAILED_PERMANENT", "EXPIRED"]},
@@ -93,9 +112,10 @@ OPENAPI = {
             "ServerTurnSource": {"type": "string", "enum": ["server_schedule"]},
             "PlaybackAck": {
                 "type": "object",
-                "required": ["device_id", "payload_sha256", "turn_id", "artifact_version"],
+                "required": ["user_id", "device_id", "payload_sha256", "turn_id", "artifact_version"],
                 "additionalProperties": False,
                 "properties": {
+                    "user_id": {"type": "string", "minLength": 1},
                     "device_id": {"type": "string", "minLength": 1},
                     "payload_sha256": {"type": "string", "minLength": 1},
                     "turn_id": {"type": "string", "format": "uuid", "minLength": 1},
@@ -106,3 +126,268 @@ OPENAPI = {
         },
     },
 }
+
+
+_PATH_VARIABLE = re.compile(r"{([^{}]+)}")
+_OPENAPI_METHODS = {"get", "put", "post", "delete", "patch", "head", "options", "trace"}
+_PATH_PARAMETER_COMPONENTS = {
+    "device_id": "DevicePath",
+    "turn_id": "TurnId",
+    "part_id": "PartId",
+    "sequence": "Sequence",
+    "event_id": "EventId",
+    "artifact_id": "ArtifactId",
+    "project_id": "ProjectId",
+    "schedule_id": "ScheduleId",
+    "channel": "Channel",
+    "generation": "Generation",
+    "artifact_name": "ArtifactName",
+    "session_id": "SessionId",
+    "action": "Action",
+    "segment_sequence": "SegmentSequence",
+}
+
+
+def _resolve_parameter(document: dict, parameter: object) -> dict:
+    if not isinstance(parameter, dict):
+        raise ValueError("OpenAPI parameter must be an object")
+    ref = parameter.get("$ref")
+    if ref is not None:
+        prefix = "#/components/parameters/"
+        if not isinstance(ref, str) or not ref.startswith(prefix):
+            raise ValueError("OpenAPI parameter reference is invalid")
+        parameter = document.get("components", {}).get("parameters", {}).get(ref[len(prefix):])
+        if not isinstance(parameter, dict):
+            raise ValueError(f"OpenAPI parameter reference is unresolved: {ref}")
+    return parameter
+
+
+def _parameter_name(document: dict, parameter: object) -> str:
+    parameter = _resolve_parameter(document, parameter)
+    name = parameter.get("name")
+    location = parameter.get("in")
+    if not isinstance(name, str) or not name or not isinstance(location, str):
+        raise ValueError("OpenAPI parameter requires name and in")
+    if location == "path" and parameter.get("required") is not True:
+        raise ValueError(f"OpenAPI path parameter {name!r} must be required")
+    return name
+
+
+def _add_path_parameters(document: dict) -> None:
+    for path, item in document.get("paths", {}).items():
+        if not isinstance(item, dict):
+            raise ValueError(f"OpenAPI path item is not an object: {path}")
+        variables = _PATH_VARIABLE.findall(path)
+        path_parameters = item.get("parameters")
+        if path_parameters is None:
+            path_parameters = []
+            if variables:
+                item["parameters"] = path_parameters
+        if not isinstance(path_parameters, list):
+            raise ValueError(f"OpenAPI path parameters must be a list: {path}")
+
+        declared = {_parameter_name(document, parameter) for parameter in path_parameters}
+        operation_parameters = {
+            _parameter_name(document, parameter)
+            for operation_name, operation in item.items()
+            if operation_name in _OPENAPI_METHODS and isinstance(operation, dict)
+            for parameter in operation.get("parameters", [])
+        }
+        for variable in variables:
+            if variable not in declared and variable not in operation_parameters:
+                component = _PATH_PARAMETER_COMPONENTS.get(variable)
+                if component is None:
+                    raise ValueError(f"OpenAPI has no path parameter component for {variable}")
+                path_parameters.append({"$ref": f"#/components/parameters/{component}"})
+                declared.add(variable)
+        if not path_parameters and "parameters" in item:
+            item.pop("parameters")
+
+
+def _add_owner_contract(document: dict) -> None:
+    schemas = document.setdefault("components", {}).setdefault("schemas", {})
+    schemas.setdefault(
+        "OwnerProof",
+        {
+            "type": "object",
+            "required": ["user_id", "device_id"],
+            "additionalProperties": False,
+            "properties": {
+                "user_id": {"type": "string", "minLength": 1},
+                "device_id": {"type": "string", "minLength": 1},
+            },
+        },
+    )
+    schemas.setdefault(
+        "TurnCreate",
+        {
+            "type": "object",
+            "required": ["user_id", "turn_id", "origin_device_id", "parts"],
+            "properties": {
+                "user_id": {"type": "string", "minLength": 1},
+                "turn_id": {"type": "string", "format": "uuid"},
+                "origin_device_id": {"type": "string", "minLength": 1},
+                "parts": {"type": "array", "minItems": 1},
+            },
+        },
+    )
+    schemas.setdefault(
+        "DeviceRevoke",
+        {
+            "type": "object",
+            "required": ["user_id", "actor_device_id"],
+            "properties": {
+                "user_id": {"type": "string", "minLength": 1},
+                "actor_device_id": {"type": "string", "minLength": 1},
+            },
+            "additionalProperties": False,
+        },
+    )
+    schemas.setdefault(
+        "FinishPart",
+        {
+            "type": "object",
+            "required": ["total_chunks", "total_bytes", "whole_stream_sha256"],
+            "properties": {
+                "total_chunks": {"type": "integer", "minimum": 1},
+                "total_bytes": {"type": "integer", "minimum": 0},
+                "whole_stream_sha256": {"type": "string", "minLength": 1},
+                "duration_ms": {"type": ["integer", "null"], "minimum": 0},
+            },
+        },
+    )
+    schemas.setdefault(
+        "EventAck",
+        {
+            "type": "object",
+            "required": ["user_id", "device_id", "event_version", "payload_sha256"],
+            "properties": {
+                "user_id": {"type": "string", "minLength": 1},
+                "device_id": {"type": "string", "minLength": 1},
+                "event_version": {"type": "integer", "minimum": 1},
+                "payload_sha256": {"type": "string", "minLength": 1},
+            },
+        },
+    )
+    schemas.setdefault(
+        "RelayReceived",
+        {
+            "type": "object",
+            "required": ["user_id", "device_id", "payload_sha256"],
+            "properties": {
+                "user_id": {"type": "string", "minLength": 1},
+                "device_id": {"type": "string", "minLength": 1},
+                "payload_sha256": {"type": "string", "minLength": 1},
+            },
+        },
+    )
+    query_owner_paths = {
+        "/v1/turns/{turn_id}": {"get"},
+        "/v1/turns/{turn_id}/parts/{part_id}/chunks/{sequence}": {"put", "post"},
+        "/v1/turns/{turn_id}/parts/{part_id}/missing": {"get"},
+        "/v1/turns/{turn_id}/parts/{part_id}/finish": {"post"},
+        "/v1/turns/{turn_id}/archive": {"post"},
+        "/v1/outbox": {"get"},
+        "/v1/tts/{artifact_id}": {"get"},
+        "/v1/tts/{artifact_id}/bridge-read": {"get"},
+        "/v1/history": {"get"},
+        "/v1/projects": {"get"},
+        "/v1/projects/search": {"get"},
+        "/v1/projects/{project_id}": {"get", "patch"},
+        "/v1/projects/{project_id}/archive": {"post"},
+        "/v1/schedules/{schedule_id}": {"get"},
+        "/v1/diagnostics": {"get"},
+        "/v1/diagnostics/export": {"get"},
+    }
+    for path, methods in query_owner_paths.items():
+        item = document["paths"].get(path)
+        if not isinstance(item, dict):
+            continue
+        for method in methods:
+            operation = item.get(method)
+            if not isinstance(operation, dict):
+                continue
+            parameters = operation.setdefault("parameters", [])
+            if not isinstance(parameters, list):
+                raise ValueError(f"OpenAPI operation parameters must be a list: {path} {method}")
+            names = {
+                (_resolve_parameter(document, parameter).get("name"), _resolve_parameter(document, parameter).get("in"))
+                for parameter in parameters
+            }
+            for component in ("UserId", "DeviceId"):
+                parameter = document["components"]["parameters"][component]
+                key = (parameter["name"], parameter["in"])
+                if key not in names:
+                    parameters.append({"$ref": f"#/components/parameters/{component}"})
+                    names.add(key)
+
+    body_refs = {
+        "/v1/devices/{device_id}/revoke": {"post": "DeviceRevoke"},
+        "/v1/turns": {"post": "TurnCreate"},
+        "/v1/turns/{turn_id}/accept": {"post": "OwnerProof"},
+        "/v1/turns/{turn_id}/parts/{part_id}/finish": {"post": "FinishPart"},
+        "/v1/turns/{turn_id}/events/{event_id}/ack": {"post": "EventAck"},
+        "/v1/tts/{artifact_id}/relay-received": {"post": "RelayReceived"},
+        "/v1/tts/{artifact_id}/playback-ack": {"post": "PlaybackAck"},
+        "/v1/diagnostics": {"delete": "OwnerProof"},
+        "/v1/diagnostics/delete": {"post": "OwnerProof"},
+    }
+    for path, methods in body_refs.items():
+        item = document["paths"].get(path)
+        if not isinstance(item, dict):
+            continue
+        for method, schema in methods.items():
+            operation = item.get(method)
+            if isinstance(operation, dict):
+                operation["requestBody"] = {"required": True, "content": {"application/json": {"schema": {"$ref": f"#/components/schemas/{schema}"}}}}
+
+
+def validate_openapi_contract(document: dict | None = None) -> bool:
+    """Validate resolved path parameters and the exact worker operation set."""
+
+    document = OPENAPI if document is None else document
+    if not isinstance(document, dict) or not isinstance(document.get("paths"), dict):
+        raise ValueError("OpenAPI document must contain an object-valued paths member")
+    if "/v1/internal/worker/{action}" in document["paths"]:
+        raise ValueError("generic worker action route is not part of the contract")
+    required_worker_paths = {
+        "/v1/internal/worker/claim",
+        "/v1/internal/worker/recover",
+        "/v1/internal/worker/complete",
+        "/v1/internal/worker/fail",
+        "/v1/internal/worker/run",
+    }
+    if not required_worker_paths.issubset(document["paths"]):
+        raise ValueError("OpenAPI worker contract is incomplete")
+    for path, item in document["paths"].items():
+        variables = set(_PATH_VARIABLE.findall(path))
+        declared: dict[str, int] = {}
+        locations: dict[str, set[str]] = {}
+        parameters = item.get("parameters", [])
+        if not isinstance(parameters, list):
+            raise ValueError(f"OpenAPI path parameters must be a list: {path}")
+        for parameter in parameters:
+            resolved = _resolve_parameter(document, parameter)
+            name = _parameter_name(document, resolved)
+            declared[name] = declared.get(name, 0) + 1
+            locations.setdefault(name, set()).add(resolved["in"])
+        for operation_name, operation in item.items():
+            if operation_name not in _OPENAPI_METHODS or not isinstance(operation, dict):
+                continue
+            operation_parameters = operation.get("parameters", [])
+            if not isinstance(operation_parameters, list):
+                raise ValueError(f"OpenAPI operation parameters must be a list: {path} {operation_name}")
+            for parameter in operation_parameters:
+                resolved = _resolve_parameter(document, parameter)
+                name = _parameter_name(document, resolved)
+                declared[name] = declared.get(name, 0) + 1
+                locations.setdefault(name, set()).add(resolved["in"])
+        for variable in variables:
+            if declared.get(variable, 0) != 1 or locations.get(variable) != {"path"}:
+                raise ValueError(f"OpenAPI path variable {variable!r} is not declared exactly once: {path}")
+    return True
+
+
+_add_path_parameters(OPENAPI)
+_add_owner_contract(OPENAPI)
+validate_openapi_contract(OPENAPI)

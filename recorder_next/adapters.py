@@ -26,6 +26,20 @@ from .canonical import sha256_bytes
 from .models import AsrResult, HermesResult, RouterDecision, TTSResult
 
 
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Never replay a credential-bearing request at a redirected origin."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise urllib.error.HTTPError(req.full_url, code, "redirects are disabled for provider requests", headers, fp)
+
+
+_NO_REDIRECT_OPENER = urllib.request.build_opener(_NoRedirectHandler())
+
+
+def _urlopen_no_redirect(request: urllib.request.Request, *, timeout: float):
+    return _NO_REDIRECT_OPENER.open(request, timeout=timeout)
+
+
 class CredentialError(ValueError):
     """Raised when the configured Hermes credential is unsafe or malformed."""
 
@@ -288,7 +302,7 @@ class HttpHermesGateway:
             method=method,
             headers={"Content-Type": "application/json", "Accept": "application/json", **dict(extra_headers or {})},
         )
-        with urllib.request.urlopen(request, timeout=self.timeout) as response:
+        with _urlopen_no_redirect(request, timeout=self.timeout) as response:
             raw = response.read()
         return json.loads(raw.decode("utf-8")) if raw else {}
 
@@ -606,7 +620,7 @@ class _HTTPProvider:
             headers["Authorization"] = f"Bearer {self._credential}"
         request = urllib.request.Request(self.endpoint, data=body, method="POST", headers=headers)
         try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+            with _urlopen_no_redirect(request, timeout=self.timeout) as response:
                 raw = response.read(max_response_bytes + 1)
                 if len(raw) > max_response_bytes:
                     raise ProviderFailure("response_too_large", retryable=False)
@@ -628,7 +642,7 @@ class _HTTPProvider:
             headers["Authorization"] = f"Bearer {self._credential}"
         request = urllib.request.Request(url, method="GET", headers=headers)
         try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+            with _urlopen_no_redirect(request, timeout=self.timeout) as response:
                 raw = response.read(64 * 1024 + 1)
                 status_code = int(getattr(response, "status", 200))
         except urllib.error.HTTPError as exc:

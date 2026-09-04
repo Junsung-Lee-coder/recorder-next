@@ -35,6 +35,9 @@ class RecorderRequestHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         self._dispatch("POST")
 
+    def do_DELETE(self) -> None:
+        self._dispatch("DELETE")
+
     def do_PUT(self) -> None:
         self._dispatch("PUT")
 
@@ -42,21 +45,14 @@ class RecorderRequestHandler(BaseHTTPRequestHandler):
         self._dispatch("PATCH")
 
     def _dispatch(self, method: str) -> None:
-        try:
-            length = int(self.headers.get("Content-Length", "0"))
-        except ValueError:
-            length = 0
-        if length < 0 or length > self.max_request_bytes:
-            encoded = b'{"error":{"code":"REQUEST_TOO_LARGE","message":"request body exceeds server limit"}}'
-            self.send_response(413)
-            self.send_header("Content-Type", "application/json; charset=utf-8")
-            self.send_header("Content-Length", str(len(encoded)))
-            self.send_header("Connection", "close")
-            self.end_headers()
-            self.wfile.write(encoded)
-            self.close_connection = True
+        length, framing_error = self._validated_content_length()
+        if framing_error is not None:
+            self._send_framing_error(*framing_error)
             return
-        body = self.rfile.read(max(0, length))
+        body = self.rfile.read(length) if length else b""
+        if len(body) != length:
+            self._send_framing_error(400, "INVALID_FRAMING", "request body is shorter than Content-Length")
+            return
         try:
             status, headers, payload = self.server.service.handle_http(method, self.path, self.headers, body)
         except RecorderError as exc:
@@ -83,6 +79,40 @@ class RecorderRequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
         if method != "HEAD":
             self.wfile.write(encoded)
+
+    def _validated_content_length(self) -> tuple[int, tuple[int, str, str] | None]:
+        if self.headers.get_all("Transfer-Encoding"):
+            return 0, (400, "INVALID_FRAMING", "Transfer-Encoding is not supported")
+        values = self.headers.get_all("Content-Length") or []
+        if len(values) > 1:
+            return 0, (400, "INVALID_FRAMING", "duplicate Content-Length is not permitted")
+        if not values:
+            return 0, None
+        raw = values[0].strip()
+        if not raw or not raw.isascii() or not raw.isdigit():
+            return 0, (400, "INVALID_FRAMING", "Content-Length must be a non-negative decimal integer")
+        # Avoid converting attacker-controlled arbitrarily long digit strings
+        # before the configured bound is known. Leading zeroes are harmless,
+        # but a non-zero value wider than the decimal bound is necessarily too
+        # large and must still receive a bounded framing response.
+        normalized = raw.lstrip("0") or "0"
+        maximum_digits = len(str(self.max_request_bytes))
+        if len(normalized) > maximum_digits:
+            return 0, (413, "REQUEST_TOO_LARGE", "request body exceeds server limit")
+        length = int(normalized)
+        if length > self.max_request_bytes:
+            return 0, (413, "REQUEST_TOO_LARGE", "request body exceeds server limit")
+        return length, None
+
+    def _send_framing_error(self, status: int, code: str, message: str) -> None:
+        encoded = json.dumps({"error": {"code": code, "message": message}}, separators=(",", ":")).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(encoded)))
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.wfile.write(encoded)
+        self.close_connection = True
 
 
 def create_http_server(service: RecorderService, *, host: str = "127.0.0.1", port: int = 8643) -> ThreadingHTTPServer:

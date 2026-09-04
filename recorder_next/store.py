@@ -299,8 +299,8 @@ class RecorderStore:
     def _safe_write(self, path: Path, payload: bytes) -> None:
         from .features import FeatureGroups
 
-        root = self.storage_root.absolute()
-        path = path.absolute()
+        root = FeatureGroups._lexical_absolute(self.storage_root)
+        path = FeatureGroups._lexical_absolute(path)
         FeatureGroups._mkdir_managed_path(root, path.parent)
         relative = path.relative_to(root)
         if not relative.parts:
@@ -460,11 +460,13 @@ class RecorderStore:
         ]
         return turn
 
-    def get_turn(self, turn_id: str) -> dict[str, Any]:
+    def get_turn(self, turn_id: str, *, user_id: str | None = None, device_id: str | None = None) -> dict[str, Any]:
         with self._read() as conn:
+            turn = self._turn_row(conn, turn_id)
+            self._assert_turn_owner_tx(conn, turn, user_id, device_id)
             return self._turn_payload(conn, turn_id)
 
-    def create_turn(self, manifest: Mapping[str, Any]) -> dict[str, Any]:
+    def create_turn(self, manifest: Mapping[str, Any], *, require_registered_device: bool = False) -> dict[str, Any]:
         manifest = dict(manifest)
         parts = manifest.get("parts")
         if not isinstance(parts, list):
@@ -502,6 +504,8 @@ class RecorderStore:
             raise QuotaExceeded("configured minimum free disk space is not available")
         now = utc_now()
         with self._tx() as conn:
+            if require_registered_device:
+                self._assert_device(conn, manifest["user_id"], manifest["origin_device_id"])
             existing = conn.execute("SELECT * FROM turns WHERE turn_id = ?", (turn_id,)).fetchone()
             if existing is not None:
                 if existing["initial_fingerprint"] != fingerprint:
@@ -569,8 +573,10 @@ class RecorderStore:
                 raise NotFoundError("device is not registered")
             return _row(row) or {}
 
-    def revoke_device(self, user_id: str, device_id: str) -> None:
+    def revoke_device(self, user_id: str, device_id: str, *, actor_device_id: str | None = None) -> None:
         with self._tx() as conn:
+            if actor_device_id is not None:
+                self._assert_device(conn, user_id, actor_device_id)
             updated = conn.execute(
                 "UPDATE devices SET status='revoked', revoked_at=? WHERE user_id=? AND device_id=? AND status='active'",
                 (utc_now(), user_id, device_id),
@@ -585,6 +591,44 @@ class RecorderStore:
         if row is None or row["status"] != "active":
             raise UnauthorizedError("device is not registered or has been revoked")
 
+    def assert_active_device(self, user_id: str, device_id: str) -> None:
+        """Validate a public owner proof without exposing device state."""
+
+        if not isinstance(user_id, str) or not user_id or not isinstance(device_id, str) or not device_id:
+            raise UnauthorizedError("a registered user and device are required")
+        with self._read() as conn:
+            self._assert_device(conn, user_id, device_id)
+
+    def _assert_turn_owner_tx(
+        self,
+        conn: sqlite3.Connection,
+        turn: sqlite3.Row,
+        user_id: str | None,
+        device_id: str | None,
+    ) -> None:
+        if user_id is None and device_id is None:
+            return
+        if not isinstance(user_id, str) or not user_id or not isinstance(device_id, str) or not device_id:
+            raise UnauthorizedError("a registered user and device are required")
+        if turn["user_id"] != user_id or turn["origin_device_id"] != device_id:
+            raise UnauthorizedError("turn is not owned by the authenticated origin device")
+        self._assert_device(conn, user_id, device_id)
+
+    def _assert_resource_owner_tx(
+        self,
+        conn: sqlite3.Connection,
+        resource_user_id: str,
+        user_id: str | None,
+        device_id: str | None,
+    ) -> None:
+        if user_id is None:
+            return
+        if not isinstance(user_id, str) or not user_id or not isinstance(device_id, str) or not device_id:
+            raise UnauthorizedError("a registered user and device are required")
+        if resource_user_id != user_id:
+            raise UnauthorizedError("resource is owned by another user")
+        self._assert_device(conn, user_id, device_id)
+
     def put_chunk(
         self,
         turn_id: str,
@@ -593,6 +637,8 @@ class RecorderStore:
         payload: bytes,
         *,
         expected_sha256: str | None = None,
+        user_id: str | None = None,
+        device_id: str | None = None,
     ) -> dict[str, Any]:
         if not isinstance(sequence, int) or sequence < 0:
             raise ValidationError("sequence must be a non-negative integer")
@@ -605,6 +651,7 @@ class RecorderStore:
         path: Path | None = None
         with self._tx() as conn:
             turn = self._turn_row(conn, turn_id)
+            self._assert_turn_owner_tx(conn, turn, user_id, device_id)
             part = conn.execute(
                 "SELECT * FROM turn_parts WHERE turn_id = ? AND part_id = ?", (turn_id, part_id)
             ).fetchone()
@@ -681,8 +728,18 @@ class RecorderStore:
             raise ValidationError(f"total_chunks exceeds configured maximum of {maximum}")
         return value
 
-    def missing_sequences(self, turn_id: str, part_id: str, total_chunks: int | None = None) -> list[int]:
+    def missing_sequences(
+        self,
+        turn_id: str,
+        part_id: str,
+        total_chunks: int | None = None,
+        *,
+        user_id: str | None = None,
+        device_id: str | None = None,
+    ) -> list[int]:
         with self._read() as conn:
+            turn = self._turn_row(conn, turn_id)
+            self._assert_turn_owner_tx(conn, turn, user_id, device_id)
             part = conn.execute(
                 "SELECT total_chunks, kind FROM turn_parts WHERE turn_id=? AND part_id=?", (turn_id, part_id)
             ).fetchone()
@@ -708,6 +765,8 @@ class RecorderStore:
         offset: int = 0,
         limit: int = DEFAULT_MISSING_PAGE_SIZE,
         encoding: str = "list",
+        user_id: str | None = None,
+        device_id: str | None = None,
     ) -> dict[str, Any]:
         if not isinstance(offset, int) or isinstance(offset, bool) or offset < 0:
             raise ValidationError("missing offset must be a non-negative integer")
@@ -716,6 +775,8 @@ class RecorderStore:
         if encoding not in {"list", "ranges"}:
             raise ValidationError("missing encoding must be list or ranges")
         with self._read() as conn:
+            turn = self._turn_row(conn, turn_id)
+            self._assert_turn_owner_tx(conn, turn, user_id, device_id)
             part = conn.execute(
                 "SELECT total_chunks, kind FROM turn_parts WHERE turn_id=? AND part_id=?", (turn_id, part_id)
             ).fetchone()
@@ -802,6 +863,8 @@ class RecorderStore:
         total_bytes: int,
         whole_stream_sha256: str,
         duration_ms: int | None = None,
+        user_id: str | None = None,
+        device_id: str | None = None,
     ) -> dict[str, Any]:
         total_chunks = self._validate_total_chunks(total_chunks)
         if not isinstance(total_bytes, int) or isinstance(total_bytes, bool) or total_bytes < 0:
@@ -812,6 +875,7 @@ class RecorderStore:
             raise ValidationError("duration_ms must be a non-negative integer or null")
         with self._tx() as conn:
             turn = self._turn_row(conn, turn_id)
+            self._assert_turn_owner_tx(conn, turn, user_id, device_id)
             part = conn.execute(
                 "SELECT * FROM turn_parts WHERE turn_id=? AND part_id=?", (turn_id, part_id)
             ).fetchone()
@@ -864,8 +928,17 @@ class RecorderStore:
                 ).fetchone()
             ) or {}
 
-    def read_part(self, turn_id: str, part_id: str) -> bytes:
+    def read_part(
+        self,
+        turn_id: str,
+        part_id: str,
+        *,
+        user_id: str | None = None,
+        device_id: str | None = None,
+    ) -> bytes:
         with self._read() as conn:
+            turn = self._turn_row(conn, turn_id)
+            self._assert_turn_owner_tx(conn, turn, user_id, device_id)
             part = conn.execute(
                 "SELECT * FROM turn_parts WHERE turn_id=? AND part_id=?", (turn_id, part_id)
             ).fetchone()
@@ -889,10 +962,18 @@ class RecorderStore:
         ).fetchone()
         return bool(row["total"] and row["total"] == row["complete"])
 
-    def accept_turn(self, turn_id: str, *, now: str | None = None) -> dict[str, Any]:
+    def accept_turn(
+        self,
+        turn_id: str,
+        *,
+        now: str | None = None,
+        user_id: str | None = None,
+        device_id: str | None = None,
+    ) -> dict[str, Any]:
         now = now or utc_now()
         with self._tx() as conn:
             turn = self._turn_row(conn, turn_id)
+            self._assert_turn_owner_tx(conn, turn, user_id, device_id)
             if turn["state"] != "RECEIVING":
                 return self._turn_payload(conn, turn_id)
             if not self._all_parts_complete(conn, turn_id):
@@ -1481,6 +1562,7 @@ class RecorderStore:
         turn_id: str,
         event_id: str,
         *,
+        user_id: str | None = None,
         device_id: str,
         event_version: int,
         payload_sha256: str,
@@ -1489,6 +1571,7 @@ class RecorderStore:
         now = now or utc_now()
         with self._tx() as conn:
             turn = self._turn_row(conn, turn_id)
+            self._assert_resource_owner_tx(conn, turn["user_id"], user_id, device_id)
             self._assert_device(conn, turn["user_id"], device_id)
             event = conn.execute("SELECT * FROM events WHERE event_id=? AND turn_id=?", (event_id, turn_id)).fetchone()
             if event is None:
@@ -1525,18 +1608,37 @@ class RecorderStore:
                     conn.execute("UPDATE outbox SET payload_json='{}' WHERE event_id=?", (event_id,))
             return self._turn_payload(conn, turn_id)
 
-    def pending_outbox(self, device_id: str, *, limit: int = 50) -> list[dict[str, Any]]:
+    def pending_outbox(
+        self,
+        device_id: str,
+        *,
+        user_id: str | None = None,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
         with self._read() as conn:
-            rows = conn.execute(
-                "SELECT * FROM outbox WHERE required_device_id=? AND state='PENDING' ORDER BY turn_event_seq, created_at LIMIT ?",
-                (device_id, limit * 4),
-            ).fetchall()
+            if user_id is not None:
+                self._assert_device(conn, user_id, device_id)
+                rows = conn.execute(
+                    "SELECT o.* FROM outbox o JOIN turns t ON t.turn_id=o.turn_id WHERE o.required_device_id=? AND t.user_id=? AND o.state='PENDING' ORDER BY o.turn_event_seq, o.created_at LIMIT ?",
+                    (device_id, user_id, limit * 4),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM outbox WHERE required_device_id=? AND state='PENDING' ORDER BY turn_event_seq, created_at LIMIT ?",
+                    (device_id, limit * 4),
+                ).fetchall()
             result: list[dict[str, Any]] = []
             for row in rows:
-                blocked = conn.execute(
-                    "SELECT 1 FROM outbox WHERE required_device_id=? AND turn_id=? AND turn_event_seq < ? AND state='PENDING' LIMIT 1",
-                    (device_id, row["turn_id"], row["turn_event_seq"]),
-                ).fetchone()
+                if user_id is not None:
+                    blocked = conn.execute(
+                        "SELECT 1 FROM outbox o JOIN turns t ON t.turn_id=o.turn_id WHERE o.required_device_id=? AND o.turn_id=? AND t.user_id=? AND o.turn_event_seq < ? AND o.state='PENDING' LIMIT 1",
+                        (device_id, row["turn_id"], user_id, row["turn_event_seq"]),
+                    ).fetchone()
+                else:
+                    blocked = conn.execute(
+                        "SELECT 1 FROM outbox WHERE required_device_id=? AND turn_id=? AND turn_event_seq < ? AND state='PENDING' LIMIT 1",
+                        (device_id, row["turn_id"], row["turn_event_seq"]),
+                    ).fetchone()
                 if blocked:
                     continue
                 item = _row(row) or {}
@@ -1546,20 +1648,28 @@ class RecorderStore:
                     break
             return result
 
-    def get_event(self, event_id: str) -> dict[str, Any]:
+    def get_event(self, event_id: str, *, user_id: str | None = None, device_id: str | None = None) -> dict[str, Any]:
         with self._read() as conn:
-            row = conn.execute("SELECT * FROM events WHERE event_id=?", (event_id,)).fetchone()
+            row = conn.execute(
+                "SELECT e.*, t.user_id, t.origin_device_id FROM events e JOIN turns t ON t.turn_id=e.turn_id WHERE e.event_id=?",
+                (event_id,),
+            ).fetchone()
             if row is None:
                 raise NotFoundError("event not found")
+            self._assert_resource_owner_tx(conn, row["user_id"], user_id, device_id)
             result = _row(row) or {}
             result["payload"] = _loads(result.pop("payload_json"), {})
             return result
 
-    def get_artifact(self, artifact_id: str) -> dict[str, Any]:
+    def get_artifact(self, artifact_id: str, *, user_id: str | None = None, device_id: str | None = None) -> dict[str, Any]:
         with self._read() as conn:
-            row = conn.execute("SELECT * FROM tts_artifacts WHERE artifact_id=?", (artifact_id,)).fetchone()
+            row = conn.execute(
+                "SELECT a.*, t.user_id FROM tts_artifacts a JOIN turns t ON t.turn_id=a.turn_id WHERE a.artifact_id=?",
+                (artifact_id,),
+            ).fetchone()
             if row is None:
                 raise NotFoundError("TTS artifact not found")
+            self._assert_resource_owner_tx(conn, row["user_id"], user_id, device_id)
             return _row(row) or {}
 
     def _read_tts(
@@ -1567,6 +1677,7 @@ class RecorderStore:
         artifact_id: str,
         *,
         device_id: str,
+        user_id: str | None = None,
         allow_phone_bridge: bool,
         require_phone_bridge: bool = False,
     ) -> tuple[dict[str, Any], bytes]:
@@ -1577,6 +1688,7 @@ class RecorderStore:
             ).fetchone()
             if row is None:
                 raise NotFoundError("TTS artifact not found")
+            self._assert_resource_owner_tx(conn, row["user_id"], user_id, device_id)
             self._assert_device(conn, row["user_id"], device_id)
             bridge = None
             if allow_phone_bridge:
@@ -1611,13 +1723,31 @@ class RecorderStore:
                     metadata["provider_metadata"] = json.loads(raw_provider_metadata)
             return metadata, audio
 
-    def read_tts(self, artifact_id: str, *, device_id: str) -> tuple[dict[str, Any], bytes]:
+    def read_tts(
+        self,
+        artifact_id: str,
+        *,
+        device_id: str,
+        user_id: str | None = None,
+    ) -> tuple[dict[str, Any], bytes]:
         """Read target audio or allow an active registered Phone to bridge it."""
-        return self._read_tts(artifact_id, device_id=device_id, allow_phone_bridge=True)
+        return self._read_tts(artifact_id, user_id=user_id, device_id=device_id, allow_phone_bridge=True)
 
-    def read_tts_for_bridge(self, artifact_id: str, *, bridge_device_id: str) -> tuple[dict[str, Any], bytes]:
+    def read_tts_for_bridge(
+        self,
+        artifact_id: str,
+        *,
+        bridge_device_id: str,
+        user_id: str | None = None,
+    ) -> tuple[dict[str, Any], bytes]:
         """Read target audio through the authenticated registered Phone bridge."""
-        return self._read_tts(artifact_id, device_id=bridge_device_id, allow_phone_bridge=True, require_phone_bridge=True)
+        return self._read_tts(
+            artifact_id,
+            user_id=user_id,
+            device_id=bridge_device_id,
+            allow_phone_bridge=True,
+            require_phone_bridge=True,
+        )
 
     def set_tts_result(self, artifact_id: str, result: TTSResult | Mapping[str, Any] | None, *, error: str | None = None) -> dict[str, Any]:
         if result is not None and not isinstance(result, TTSResult):
@@ -1694,7 +1824,14 @@ class RecorderStore:
             conn.execute("UPDATE tts_artifacts SET source_text=NULL, status='EXPIRED', relay_state='EXPIRED', retention_outcome='expired', updated_at=? WHERE artifact_id=? AND status != 'PLAYED'", (now, artifact_id))
             return _row(conn.execute("SELECT * FROM tts_artifacts WHERE artifact_id=?", (artifact_id,)).fetchone()) or {}
 
-    def relay_tts_received(self, artifact_id: str, *, device_id: str, payload_sha256: str) -> dict[str, Any]:
+    def relay_tts_received(
+        self,
+        artifact_id: str,
+        *,
+        device_id: str,
+        payload_sha256: str,
+        user_id: str | None = None,
+    ) -> dict[str, Any]:
         with self._tx() as conn:
             artifact = conn.execute(
                 "SELECT a.*, t.user_id FROM tts_artifacts a JOIN turns t ON t.turn_id=a.turn_id WHERE a.artifact_id=?",
@@ -1702,6 +1839,7 @@ class RecorderStore:
             ).fetchone()
             if artifact is None:
                 raise NotFoundError("TTS artifact not found")
+            self._assert_resource_owner_tx(conn, artifact["user_id"], user_id, device_id)
             self._assert_device(conn, artifact["user_id"], device_id)
             target = artifact["delivery_target_device_id"] or artifact["origin_device_id"]
             if target == device_id:
@@ -1735,6 +1873,7 @@ class RecorderStore:
         payload_sha256: str,
         turn_id: str | None = None,
         artifact_version: int | None = None,
+        user_id: str | None = None,
     ) -> dict[str, Any]:
         if not isinstance(turn_id, str) or not turn_id:
             raise ValidationError("turn_id is required for playback completion")
@@ -1750,6 +1889,7 @@ class RecorderStore:
             ).fetchone()
             if artifact is None:
                 raise NotFoundError("TTS artifact not found")
+            self._assert_resource_owner_tx(conn, artifact["user_id"], user_id, device_id)
             self._assert_device(conn, artifact["user_id"], device_id)
             if artifact["turn_id"] != turn_id:
                 raise UnauthorizedError("artifact does not belong to turn")
@@ -1817,9 +1957,24 @@ class RecorderStore:
             result["parent_turn"] = self._turn_payload(conn, result["parent_turn_id"])
         return result
 
-    def get_schedule(self, schedule_id: str) -> dict[str, Any]:
+    def get_schedule(
+        self,
+        schedule_id: str,
+        *,
+        user_id: str | None = None,
+        device_id: str | None = None,
+    ) -> dict[str, Any]:
         schedule_id = self._schedule_identifier(schedule_id, "schedule_id")
         with self._read() as conn:
+            owner = conn.execute(
+                "SELECT s.user_id, s.origin_device_id FROM schedules s WHERE s.schedule_id=?",
+                (schedule_id,),
+            ).fetchone()
+            if owner is None:
+                raise NotFoundError("schedule not found")
+            self._assert_resource_owner_tx(conn, owner["user_id"], user_id, device_id)
+            if user_id is not None and owner["origin_device_id"] != device_id:
+                raise UnauthorizedError("schedule is not owned by the authenticated origin device")
             return self._schedule_payload(conn, schedule_id)
 
     def _commit_schedule_confirmation_tx(
@@ -2610,11 +2765,20 @@ class RecorderStore:
                 raise ConflictError("project archive compare-and-set failed")
             return self._project_payload(conn.execute("SELECT * FROM projects WHERE stable_project_id=?", (project_id,)).fetchone())
 
-    def archive_turn(self, user_id: str, turn_id: str, *, source: str) -> dict[str, Any]:
+    def archive_turn(
+        self,
+        user_id: str,
+        turn_id: str,
+        *,
+        source: str,
+        device_id: str | None = None,
+    ) -> dict[str, Any]:
         with self._tx() as conn:
             turn = self._turn_row(conn, turn_id)
             if turn["user_id"] != user_id:
                 raise UnauthorizedError("turn belongs to another user")
+            if device_id is not None:
+                self._assert_turn_owner_tx(conn, turn, user_id, device_id)
             now = utc_now()
             conn.execute("UPDATE turns SET archived_at=?, updated_at=? WHERE turn_id=?", (now, now, turn_id))
             conn.execute(

@@ -508,7 +508,7 @@ voice = "ko-KR-SunHiNeural"
             store = RecorderStore(root / "db.sqlite3", storage_root=root / "data")
             service = RecorderService(store)
             status, _, _ = service.handle_http("GET", "/v1/history", {}, b"")
-            self.assertEqual(status, 400)
+            self.assertEqual(status, 401)
 
     def test_http_does_not_coerce_eavesdrop_identity_types(self):
         with tempfile.TemporaryDirectory() as tmp:

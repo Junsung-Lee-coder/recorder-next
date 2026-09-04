@@ -265,10 +265,11 @@ class HTTPContractTests(unittest.TestCase):
                 "prefer_current_project": False,
                 "text": "fixture",
             }
+            store.register_device("u", "d", "phone")
             status, _, created = service.handle_http("POST", "/v1/turns", {}, json_bytes(payload))
             self.assertEqual(status, 202)
             self.assertEqual(created["state"], "ACCEPTED")
-            status, _, fetched = service.handle_http("GET", "/v1/turns/018f5a2e-7b6e-7abc-8d11-1234567890b0", {}, b"")
+            status, _, fetched = service.handle_http("GET", "/v1/turns/018f5a2e-7b6e-7abc-8d11-1234567890b0?user_id=u&device_id=d", {}, b"")
             self.assertEqual(status, 200)
             self.assertEqual(fetched["accepted_seq"], 1)
 
@@ -286,9 +287,10 @@ class HTTPContractTests(unittest.TestCase):
                 "prefer_current_project": False,
                 "text": "fixture",
             }
+            store.register_device("u", "d", "phone")
             status, _, created = service.handle_http("POST", "/v1/turns", {}, json_bytes(payload))
             self.assertEqual(status, 202)
-            status, _, accepted = service.handle_http("POST", "/v1/turns/018f5a2e-7b6e-7abc-8d11-1234567890b1/accept", {}, b"")
+            status, _, accepted = service.handle_http("POST", "/v1/turns/018f5a2e-7b6e-7abc-8d11-1234567890b1/accept", {}, json_bytes({"user_id": "u", "device_id": "d"}))
             self.assertEqual(status, 200)
             self.assertEqual(accepted["accepted_seq"], created["accepted_seq"])
 
@@ -299,7 +301,7 @@ class HTTPContractTests(unittest.TestCase):
             store, turn_id, _, _ = setup_text_flow(tmp, turn_id="018f5a2e-7b6e-7abc-8d11-1234567890b6")
             service = RecorderService(store)
             event = store.get_turn(turn_id)["events"][1]
-            body = json_bytes({"device_id": "device-1", "event_version": 1, "payload_sha256": event["payload_sha256"]})
+            body = json_bytes({"user_id": "u", "device_id": "device-1", "event_version": 1, "payload_sha256": event["payload_sha256"]})
             status, _, result = service.handle_http("POST", f"/v1/turns/{turn_id}/events/{event['event_id']}/ack", {}, body)
             self.assertEqual(status, 200)
             self.assertEqual(result["outbox"][0]["state"], "ACKED")
@@ -314,10 +316,10 @@ class HTTPContractTests(unittest.TestCase):
             service = RecorderService(store)
             artifact = store.get_turn(turn_id)["tts_artifacts"][0]
             ready = store.set_tts_result(artifact["artifact_id"], {"audio": b"tts-bytes", "mode": "file"})
-            status, _, downloaded = service.handle_http("GET", f"/v1/tts/{artifact['artifact_id']}?device_id=device-1", {}, b"")
+            status, _, downloaded = service.handle_http("GET", f"/v1/tts/{artifact['artifact_id']}?user_id=u&device_id=device-1", {}, b"")
             self.assertEqual(status, 200)
             self.assertEqual(base64.b64decode(downloaded["audio_base64"]), b"tts-bytes")
-            status, _, denied = service.handle_http("GET", f"/v1/tts/{artifact['artifact_id']}?device_id=other", {}, b"")
+            status, _, denied = service.handle_http("GET", f"/v1/tts/{artifact['artifact_id']}?user_id=u&device_id=other", {}, b"")
             self.assertEqual(status, 401)
 
     def test_device_registration_and_revoke_are_versioned_api_seams(self):
@@ -326,7 +328,7 @@ class HTTPContractTests(unittest.TestCase):
             status, _, device = service.handle_http("POST", "/v1/devices", {}, json_bytes({"user_id": "u", "device_id": "phone-1", "kind": "phone"}))
             self.assertEqual(status, 201)
             self.assertEqual(device["status"], "active")
-            status, _, revoked = service.handle_http("POST", "/v1/devices/phone-1/revoke", {}, json_bytes({"user_id": "u"}))
+            status, _, revoked = service.handle_http("POST", "/v1/devices/phone-1/revoke", {}, json_bytes({"user_id": "u", "actor_device_id": "phone-1"}))
             self.assertEqual(status, 200)
             self.assertEqual(revoked["status"], "revoked")
 
@@ -338,6 +340,7 @@ class HTTPContractTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             service = RecorderService(RecorderStore(Path(tmp) / "db.sqlite3", storage_root=Path(tmp) / "data"))
+            service.store.register_device("u", "d", "phone")
             server = create_http_server(service, host="127.0.0.1", port=0)
             thread = threading.Thread(target=server.serve_forever, daemon=True)
             thread.start()

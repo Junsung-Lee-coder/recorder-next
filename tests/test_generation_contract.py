@@ -13,7 +13,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).parents[1]
 BUILDER = ROOT / "release" / "build_candidate.py"
-FAILED_PRODUCT_SHA = "5b317a65106498ae84591eecfd6000525339e702380da47dc7802ab22482e384"
+FAILED_PRODUCT_SHA = "def267f5fa28891a481da41ecf12d314ba4c09066e8fcade389b124116e99fba"
 
 
 def digest(path: Path) -> str:
@@ -46,25 +46,16 @@ class FrozenGenerationTests(unittest.TestCase):
             self.assertEqual(
                 manifest["changed_product_paths_from_failed_candidate"],
                 [
-                    "README.md",
                     "api/openapi.json",
-                    "config.example.toml",
-                    "migrations/003_feature_groups.sql",
-                    "migrations/004_eavesdrop_decisions.sql",
-                    "recorder_next/__init__.py",
                     "recorder_next/adapters.py",
-                    "recorder_next/config.py",
                     "recorder_next/features.py",
-                    "recorder_next/migrations/003_feature_groups.sql",
-                    "recorder_next/migrations/004_eavesdrop_decisions.sql",
+                    "recorder_next/http.py",
                     "recorder_next/openapi.py",
-                    "recorder_next/schema.sql",
                     "recorder_next/service.py",
                     "recorder_next/store.py",
-                    "tests/test_adapters.py",
                     "tests/test_extended_contract.py",
-                    "tests/test_feature_groups.py",
                     "tests/test_generated_multimodal.py",
+                    "tests/test_r1_repairs.py",
                     "tests/test_scheduled_final.py",
                 ],
             )

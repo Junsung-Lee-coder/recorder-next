@@ -54,7 +54,7 @@ from control_contract import (
     write_json,
 )
 
-GENERATION = "feature-groups-r1-rev20"
+GENERATION = "feature-groups-r2-rev32"
 CONTROL_TEST_SOURCES = {
     "tests/test_activation_controls.py",
     "tests/test_generation_contract.py",
@@ -371,8 +371,8 @@ def build(repo: Path, output: Path) -> Path:
     if product_result.returncode != 0:
         raise BuildError(f"product suite failed: {product_result.stderr}")
     product_test_count = parse_test_count(product_log)
-    if product_test_count != 109:
-        raise BuildError(f"product suite ran {product_test_count}, expected 109")
+    if product_test_count != 117:
+        raise BuildError(f"product suite ran {product_test_count}, expected 117")
 
     manifest = manifest_template(generation, members, digest, archive, roles, transaction_path, transaction, candidate_sha256, candidate_id_value)
     # The preflight report is deterministic and does not bind later evidence hashes.

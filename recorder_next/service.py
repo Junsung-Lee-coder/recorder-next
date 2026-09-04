@@ -485,8 +485,15 @@ class RecorderService:
             )
         return jobs
 
-    def accept_turn(self, turn_id: str, *, now: str | None = None) -> dict[str, Any]:
-        accepted = self.store.accept_turn(turn_id, now=now)
+    def accept_turn(
+        self,
+        turn_id: str,
+        *,
+        now: str | None = None,
+        user_id: str | None = None,
+        device_id: str | None = None,
+    ) -> dict[str, Any]:
+        accepted = self.store.accept_turn(turn_id, now=now, user_id=user_id, device_id=device_id)
         if accepted.get("state") == "ACCEPTED":
             self._enqueue_turn_stage(accepted, now=now)
         return accepted
@@ -557,7 +564,13 @@ class RecorderService:
     def run_background_worker_once(self, *, owner: str = "recorder-worker-1", now: str | None = None, lease_seconds: int = 30) -> dict[str, Any] | None:
         return self.run_durable_worker_once(owner=owner, handlers=self._default_worker_handlers(), now=now, lease_seconds=lease_seconds)
 
-    def accept_text_turn(self, manifest: Mapping[str, Any], text: str) -> dict[str, Any]:
+    def accept_text_turn(
+        self,
+        manifest: Mapping[str, Any],
+        text: str,
+        *,
+        require_registered_device: bool = False,
+    ) -> dict[str, Any]:
         manifest = dict(manifest)
         if manifest.get("parts"):
             raise ValidationError("accept_text_turn expects a manifest without parts")
@@ -575,16 +588,21 @@ class RecorderService:
                 "caption_hash": None,
             }
         ]
-        self.store.create_turn(manifest)
-        self.store.put_chunk(manifest["turn_id"], "text-1", 0, payload)
+        self.store.create_turn(manifest, require_registered_device=require_registered_device)
+        owner = {
+            "user_id": manifest.get("user_id") if require_registered_device else None,
+            "device_id": manifest.get("origin_device_id") if require_registered_device else None,
+        }
+        self.store.put_chunk(manifest["turn_id"], "text-1", 0, payload, **owner)
         self.store.finish_part(
             manifest["turn_id"],
             "text-1",
             total_chunks=1,
             total_bytes=len(payload),
             whole_stream_sha256=hashlib.sha256(payload).hexdigest(),
+            **owner,
         )
-        return self.accept_turn(manifest["turn_id"])
+        return self.accept_turn(manifest["turn_id"], **owner)
 
     # ---- Small HTTP surface ----------------------------------------------
 
@@ -654,6 +672,29 @@ class RecorderService:
             raise ValidationError(f"{key} exceeds configured maximum of {maximum}")
         return parsed
 
+    @classmethod
+    def _request_owner(cls, query: Mapping[str, str], headers: Mapping[str, str]) -> tuple[str, str]:
+        user_id = query.get("user_id")
+        device_id = query.get("device_id")
+        if user_id is None:
+            user_id = cls._header_value(headers, "X-Recorder-User-ID")
+        if device_id is None:
+            device_id = cls._header_value(headers, "X-Recorder-Device-ID")
+        if not isinstance(user_id, str) or not user_id or not isinstance(device_id, str) or not device_id:
+            raise UnauthorizedError("a registered user and device are required")
+        return user_id, device_id
+
+    @classmethod
+    def _payload_owner(cls, payload: Mapping[str, Any], *, device_key: str = "device_id") -> tuple[str, str]:
+        user_id = cls._json_string(payload, "user_id")
+        device_id = cls._json_string(payload, device_key)
+        return user_id, device_id
+
+    def _authenticated_owner(self, query: Mapping[str, str], headers: Mapping[str, str]) -> tuple[str, str]:
+        user_id, device_id = self._request_owner(query, headers)
+        self.store.assert_active_device(user_id, device_id)
+        return user_id, device_id
+
     def _handle_http(self, method: str, target: str, headers: Mapping[str, str], body: bytes) -> tuple[int, dict[str, str], Any]:
         if method == "HEAD":
             method = "GET"
@@ -709,11 +750,10 @@ class RecorderService:
         if segments[:4] == ["v1", "internal", "worker", "health"] and method == "GET":
             return 200, {}, self.store.worker_health(now=query.get("now"))
         if segments[:2] == ["v1", "history"] and len(segments) == 2 and method == "GET":
-            if "user_id" not in query:
-                raise ValidationError("user_id is required for history reads")
+            user_id, _device_id = self._authenticated_owner(query, headers)
             since_seq = self._query_integer(query, "since_seq", minimum=0)
             return 200, {}, self.store.history_read_model(
-                query["user_id"],
+                user_id,
                 project_id=query.get("project_id"),
                 include_archived=query.get("include_archived") == "true",
                 input_type=query.get("input_type"),
@@ -816,14 +856,16 @@ class RecorderService:
             return 200, {}, self.store.export_diagnostics(query["user_id"], query["device_id"])
         if segments[:3] == ["v1", "diagnostics", "delete"] and method == "POST":
             payload = self._json_body(body)
-            return 200, {}, self.store.delete_diagnostics(str(payload["user_id"]), str(payload["device_id"]), now=payload.get("now"))
+            user_id, device_id = self._payload_owner(payload)
+            return 200, {}, self.store.delete_diagnostics(user_id, device_id, now=payload.get("now"))
         if segments[:2] == ["v1", "diagnostics"] and len(segments) == 2 and method == "DELETE":
             payload = self._json_body(body) if body else {}
-            user_id = query.get("user_id") or payload.get("user_id")
-            device_id = query.get("device_id") or payload.get("device_id")
-            if not user_id or not device_id:
-                raise UnauthorizedError("diagnostics deletion requires user_id and device_id")
-            return 200, {}, self.store.delete_diagnostics(str(user_id), str(device_id), now=query.get("now") or payload.get("now"))
+            if "user_id" in query or "device_id" in query:
+                user_id, device_id = self._authenticated_owner(query, headers)
+            else:
+                user_id, device_id = self._payload_owner(payload)
+                self.store.assert_active_device(user_id, device_id)
+            return 200, {}, self.store.delete_diagnostics(user_id, device_id, now=query.get("now") or payload.get("now"))
         if segments[:3] == ["v1", "internal", "schedule_create"] and method == "POST":
             if self._header_value(headers, "X-Recorder-Internal-Trusted") != "1":
                 raise UnauthorizedError("schedule_create requires the trusted Recorder adapter")
@@ -845,14 +887,16 @@ class RecorderService:
             payload = self._json_body(body)
             return 200, {}, self.recover_scheduler(now=payload.get("now"))
         if segments[:2] == ["v1", "schedules"] and len(segments) == 3 and method == "GET":
-            return 200, {}, self.store.get_schedule(segments[2])
+            user_id, device_id = self._authenticated_owner(query, headers)
+            return 200, {}, self.store.get_schedule(segments[2], user_id=user_id, device_id=device_id)
         if segments[:2] == ["v1", "devices"] and len(segments) == 2 and method == "POST":
             payload = self._json_body(body)
             return 201, {}, self.store.register_device(self._json_string(payload, "user_id"), self._json_string(payload, "device_id"), self._json_string(payload, "kind"))
         if segments[:2] == ["v1", "devices"] and len(segments) == 4 and segments[3] == "revoke" and method == "POST":
             payload = self._json_body(body)
             user_id = self._json_string(payload, "user_id")
-            self.store.revoke_device(user_id, segments[2])
+            actor_device_id = self._json_string(payload, "actor_device_id")
+            self.store.revoke_device(user_id, segments[2], actor_device_id=actor_device_id)
             return 200, {}, self.store.get_device(user_id, segments[2])
         if segments[:2] == ["v1", "turns"] and len(segments) == 2 and method == "POST":
             payload = self._json_body(body)
@@ -860,17 +904,23 @@ class RecorderService:
                 if not isinstance(payload["text"], str):
                     raise ValidationError("text must be a JSON string")
                 manifest = {key: value for key, value in payload.items() if key != "text"}
-                return 202, {}, self.accept_text_turn(manifest, payload["text"])
-            return 201, {}, self.store.create_turn(payload)
+                self._payload_owner(manifest, device_key="origin_device_id")
+                return 202, {}, self.accept_text_turn(manifest, payload["text"], require_registered_device=True)
+            self._payload_owner(payload, device_key="origin_device_id")
+            return 201, {}, self.store.create_turn(payload, require_registered_device=True)
         if segments[:2] == ["v1", "turns"] and len(segments) == 4 and segments[3] == "accept" and method == "POST":
-            return 200, {}, self.accept_turn(segments[2])
+            payload = self._json_body(body)
+            user_id, device_id = self._payload_owner(payload)
+            return 200, {}, self.accept_turn(segments[2], user_id=user_id, device_id=device_id)
         if segments[:2] == ["v1", "turns"] and len(segments) == 3:
             turn_id = segments[2]
             if method == "GET":
-                return 200, {}, self.store.get_turn(turn_id)
+                user_id, device_id = self._authenticated_owner(query, headers)
+                return 200, {}, self.store.get_turn(turn_id, user_id=user_id, device_id=device_id)
         if len(segments) >= 5 and segments[:2] == ["v1", "turns"] and segments[3] == "parts":
             turn_id, part_id = segments[2], segments[4]
             if len(segments) == 6 and segments[5] == "missing" and method == "GET":
+                user_id, device_id = self._authenticated_owner(query, headers)
                 total = self._query_integer(query, "total_chunks")
                 offset = self._query_integer(query, "offset", default=0)
                 limit = self._query_integer(query, "limit", default=DEFAULT_MISSING_PAGE_SIZE, minimum=1, maximum=MAX_MISSING_PAGE_SIZE)
@@ -881,15 +931,19 @@ class RecorderService:
                     offset=offset or 0,
                     limit=limit or DEFAULT_MISSING_PAGE_SIZE,
                     encoding=query.get("encoding", "list"),
+                    user_id=user_id,
+                    device_id=device_id,
                 )
                 return 200, {}, {"turn_id": turn_id, "part_id": part_id, **page}
             if len(segments) == 7 and segments[5] == "chunks" and method in {"PUT", "POST"}:
+                user_id, device_id = self._authenticated_owner(query, headers)
                 if not segments[6].isdigit():
                     raise ValidationError("chunk sequence must be a non-negative integer")
                 sequence = int(segments[6])
-                result = self.store.put_chunk(turn_id, part_id, sequence, body, expected_sha256=self._header_value(headers, "X-Chunk-SHA256"))
+                result = self.store.put_chunk(turn_id, part_id, sequence, body, expected_sha256=self._header_value(headers, "X-Chunk-SHA256"), user_id=user_id, device_id=device_id)
                 return 200, {}, result
             if len(segments) == 6 and segments[5] == "finish" and method == "POST":
+                user_id, device_id = self._authenticated_owner(query, headers)
                 payload = self._json_body(body)
                 total_chunks = self._json_integer(payload, "total_chunks")
                 total_bytes = self._json_integer(payload, "total_bytes")
@@ -901,71 +955,82 @@ class RecorderService:
                     total_bytes=total_bytes,
                     whole_stream_sha256=payload["whole_stream_sha256"],
                     duration_ms=self._json_integer(payload, "duration_ms", allow_none=True) if "duration_ms" in payload else None,
+                    user_id=user_id,
+                    device_id=device_id,
                 )
         if len(segments) in {5, 6} and segments[:2] == ["v1", "turns"] and segments[3] == "events" and (len(segments) == 5 or segments[5] == "ack") and method == "POST":
             payload = self._json_body(body)
+            user_id, device_id = self._payload_owner(payload)
             event_version = self._json_integer(payload, "event_version")
             assert event_version is not None
-            return 200, {}, self.store.ack_event(segments[2], segments[4], device_id=self._json_string(payload, "device_id"), event_version=event_version, payload_sha256=self._json_string(payload, "payload_sha256"))
+            return 200, {}, self.store.ack_event(segments[2], segments[4], user_id=user_id, device_id=device_id, event_version=event_version, payload_sha256=self._json_string(payload, "payload_sha256"))
         if segments[:2] == ["v1", "outbox"] and method == "GET":
-            return 200, {}, {"items": self.store.pending_outbox(query["device_id"], limit=self._query_integer(query, "limit", default=50, minimum=1, maximum=500) or 50)}
+            user_id, device_id = self._authenticated_owner(query, headers)
+            return 200, {}, {"items": self.store.pending_outbox(device_id, user_id=user_id, limit=self._query_integer(query, "limit", default=50, minimum=1, maximum=500) or 50)}
         if len(segments) == 4 and segments[:2] == ["v1", "tts"] and segments[3] == "bridge-read" and method == "GET":
-            bridge_device_id = query.get("device_id")
-            if not bridge_device_id:
-                raise ValidationError("device_id is required for TTS bridge reads")
-            metadata, audio = self.store.read_tts_for_bridge(segments[2], bridge_device_id=bridge_device_id)
+            user_id, bridge_device_id = self._authenticated_owner(query, headers)
+            metadata, audio = self.store.read_tts_for_bridge(segments[2], user_id=user_id, bridge_device_id=bridge_device_id)
             metadata["audio_base64"] = base64.b64encode(audio).decode("ascii")
             return 200, {}, metadata
         if segments[:2] == ["v1", "tts"] and len(segments) == 3 and method == "GET":
-            device_id = query.get("device_id") or self._header_value(headers, "X-Recorder-Device-ID")
-            if not device_id:
-                raise ValidationError("device_id is required for TTS reads")
-            metadata, audio = self.store.read_tts(segments[2], device_id=device_id)
+            user_id, device_id = self._authenticated_owner(query, headers)
+            metadata, audio = self.store.read_tts(segments[2], user_id=user_id, device_id=device_id)
             metadata["audio_base64"] = base64.b64encode(audio).decode("ascii")
             return 200, {}, metadata
         if len(segments) == 4 and segments[:2] == ["v1", "tts"] and segments[3] == "playback-ack" and method == "POST":
             payload = self._json_body(body)
+            user_id, device_id = self._payload_owner(payload)
             return 200, {}, self.store.ack_playback(
                 segments[2],
-                device_id=self._json_string(payload, "device_id"),
+                user_id=user_id,
+                device_id=device_id,
                 payload_sha256=self._json_string(payload, "payload_sha256"),
                 turn_id=self._json_string(payload, "turn_id"),
                 artifact_version=self._json_integer(payload, "artifact_version"),
             )
         if len(segments) == 4 and segments[:2] == ["v1", "tts"] and segments[3] == "relay-received" and method == "POST":
             payload = self._json_body(body)
-            return 200, {}, self.store.relay_tts_received(segments[2], device_id=self._json_string(payload, "device_id"), payload_sha256=self._json_string(payload, "payload_sha256"))
+            user_id, device_id = self._payload_owner(payload)
+            return 200, {}, self.store.relay_tts_received(segments[2], user_id=user_id, device_id=device_id, payload_sha256=self._json_string(payload, "payload_sha256"))
         if segments[:2] == ["v1", "projects"] and len(segments) == 2:
             if method == "GET":
-                return 200, {}, {"items": self.store.list_projects(query["user_id"], include_archived=query.get("include_archived") == "true")}
+                user_id, _device_id = self._authenticated_owner(query, headers)
+                return 200, {}, {"items": self.store.list_projects(user_id, include_archived=query.get("include_archived") == "true")}
             if method == "POST":
                 payload = self._json_body(body)
+                user_id, device_id = self._payload_owner(payload)
+                self.store.assert_active_device(user_id, device_id)
                 optional_string = lambda key: self._json_string(payload, key) if key in payload and payload[key] is not None else None
-                return 201, {}, self.store.create_project(self._json_string(payload, "user_id"), project_number=self._json_string(payload, "project_number"), name=self._json_string(payload, "name"), aliases=payload.get("aliases"), description=payload.get("description", ""), idempotency_key=optional_string("idempotency_key"))
+                return 201, {}, self.store.create_project(user_id, project_number=self._json_string(payload, "project_number"), name=self._json_string(payload, "name"), aliases=payload.get("aliases"), description=payload.get("description", ""), idempotency_key=optional_string("idempotency_key"))
         if segments[:3] == ["v1", "projects", "search"] and method == "GET":
-            return 200, {}, {"items": self.store.search_projects(query["user_id"], query.get("q", ""), include_archived=query.get("include_archived") == "true")}
+            user_id, _device_id = self._authenticated_owner(query, headers)
+            return 200, {}, {"items": self.store.search_projects(user_id, query.get("q", ""), include_archived=query.get("include_archived") == "true")}
         if segments[:2] == ["v1", "projects"] and len(segments) >= 3:
             project_id = segments[2]
             if len(segments) == 3 and method == "GET":
-                return 200, {}, self.store.get_project(query["user_id"], project_id, include_archived=True)
+                user_id, _device_id = self._authenticated_owner(query, headers)
+                return 200, {}, self.store.get_project(user_id, project_id, include_archived=True)
             if len(segments) == 3 and method == "PATCH":
+                user_id, _device_id = self._authenticated_owner(query, headers)
                 payload = self._json_body(body)
                 expected_version = self._json_integer(payload, "expected_version")
                 assert expected_version is not None
                 patch = dict(payload)
                 patch.pop("expected_version", None)
-                return 200, {}, self.store.update_project(query["user_id"], project_id, expected_version=expected_version, patch=patch)
+                return 200, {}, self.store.update_project(user_id, project_id, expected_version=expected_version, patch=patch)
             if len(segments) == 4 and segments[3] == "archive" and method == "POST":
+                user_id, _device_id = self._authenticated_owner(query, headers)
                 payload = self._json_body(body)
                 expected_version = self._json_integer(payload, "expected_version")
                 assert expected_version is not None
-                return 200, {}, self.store.archive_project(query["user_id"], project_id, expected_version=expected_version)
+                return 200, {}, self.store.archive_project(user_id, project_id, expected_version=expected_version)
         if segments[:2] == ["v1", "turns"] and len(segments) == 4 and segments[3] == "archive" and method == "POST":
+            user_id, device_id = self._authenticated_owner(query, headers)
             payload = self._json_body(body)
             source = payload.get("source", "api")
             if not isinstance(source, str) or not source:
                 raise ValidationError("source must be a non-empty string")
-            return 200, {}, self.store.archive_turn(query["user_id"], segments[2], source=source)
+            return 200, {}, self.store.archive_turn(user_id, segments[2], source=source, device_id=device_id)
         if segments[:3] == ["v1", "internal", "router"] and method == "POST":
             payload = self._json_body(body)
             owner = self._json_string(payload, "owner") if "owner" in payload else "router-1"
