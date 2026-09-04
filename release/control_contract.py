@@ -47,7 +47,9 @@ CHANGED_PRODUCT_PATHS_FROM_FAILED_CANDIDATE = [
     "tests/test_extended_contract.py",
     "tests/test_generated_multimodal.py",
     "tests/test_r1_repairs.py",
+    "tests/test_reliability_contract.py",
     "tests/test_scheduled_final.py",
+    "tests/test_store_contract.py",
 ]
 ARCHIVE_NAME = "candidate-source-feature-groups-r2-rev33.tar"
 PREDECESSOR = {
