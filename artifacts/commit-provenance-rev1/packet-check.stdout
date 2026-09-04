@@ -1,0 +1,11 @@
+{
+  "candidate_id": "recorder-next-feature-groups-r1-rev20-90ff26b7cc4cf821",
+  "candidate_sha256": "90ff26b7cc4cf821b01630dc86d017ee92894955b226943f8f4bff8d96ba02c7",
+  "commands_executed": 0,
+  "freeze_vector_path": "freeze-vector.json",
+  "generation": "feature-groups-r1-rev20",
+  "read_only": true,
+  "receipt_root": "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/feature-groups-r1-rev20/fixture/receipts",
+  "schema": "recorder-next-activation-packet-check/v2",
+  "status": "PASS"
+}

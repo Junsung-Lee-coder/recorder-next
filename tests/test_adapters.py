@@ -1,4 +1,5 @@
 import io
+import hashlib
 import json
 import unittest
 import urllib.error
@@ -104,7 +105,7 @@ class HermesAdapterContractTests(unittest.TestCase):
             request={
                 "submission_id": "sub-2",
                 "marker": "marker-2",
-                "request": {"input": "normalized from durable ingress", "parts": [{"kind": "attachment"}]},
+                "request": {"input": "normalized from durable ingress", "parts": [{"kind": "text", "text": "normalized from durable ingress"}]},
                 "route": {"project_id": "abc"},
             },
             submission_id="sub-2",
@@ -117,8 +118,16 @@ class HermesAdapterContractTests(unittest.TestCase):
 
     def test_http_submit_projects_each_attachment_type_as_safe_reference(self):
         class ProbeGateway(HttpHermesGateway):
-            def __init__(self):
-                super().__init__("http://127.0.0.1:9")
+            def __init__(self, mime):
+                attachment_sha256 = hashlib.sha256(b"x" * 42).hexdigest()
+                super().__init__(
+                    "http://127.0.0.1:9",
+                    attachment_resolver=lambda _reference: {
+                        "body": b"x" * 42,
+                        "sha256": attachment_sha256,
+                        "mime": mime,
+                    },
+                )
                 self.seen = None
 
             def _request(self, method, path, payload=None, *, extra_headers=None):
@@ -132,9 +141,10 @@ class HermesAdapterContractTests(unittest.TestCase):
             "data_csv": ("text/csv; charset=utf-8", "csv-1"),
             "generic_binary": ("application/octet-stream", "binary-1"),
         }
+        attachment_sha256 = hashlib.sha256(b"x" * 42).hexdigest()
         for name, (mime, part_id) in cases.items():
             with self.subTest(attachment=name):
-                gateway = ProbeGateway()
+                gateway = ProbeGateway(mime)
                 gateway.submit(
                     session_key="project:attachments:default",
                     request={
@@ -148,7 +158,7 @@ class HermesAdapterContractTests(unittest.TestCase):
                                 "mime": mime,
                                 "declared_bytes": 42,
                                 "total_bytes": 42,
-                                "whole_stream_sha256": "a" * 64,
+                                "whole_stream_sha256": attachment_sha256,
                                 "status": "COMPLETE",
                                 "source_path": "/private/spool/never-send",
                             }
@@ -165,7 +175,7 @@ class HermesAdapterContractTests(unittest.TestCase):
                 self.assertEqual(reference["part_id"], part_id)
                 self.assertEqual(reference["mime"], mime)
                 self.assertEqual(reference["byte_length"], 42)
-                self.assertEqual(reference["sha256"], "a" * 64)
+                self.assertEqual(reference["sha256"], attachment_sha256)
                 self.assertTrue(reference["reference"].startswith("recorder://"))
                 serialized = json.dumps(payload, ensure_ascii=False)
                 self.assertNotIn("source_path", serialized)

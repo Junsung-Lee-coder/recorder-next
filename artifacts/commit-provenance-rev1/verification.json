@@ -1,0 +1,294 @@
+{
+  "artifacts": {
+    "evidence_dir": "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/commit-provenance-rev1",
+    "freeze_sidecar": {
+      "path": "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/feature-groups-r1-rev20.freeze-vector.sha256",
+      "sha256": "1a4f6958075adb350529ffd3425e3ecccb70af7127c751575c6c965825d38b32",
+      "size": 109
+    },
+    "freeze_vector": {
+      "path": "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/feature-groups-r1-rev20/freeze-vector.json",
+      "sha256": "b66c6e18440a581e439de142f20c403cf81348f3a50a827d6413dce65383eb8d",
+      "size": 14549
+    },
+    "manifest": {
+      "path": "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/feature-groups-r1-rev20/candidate-manifest.json",
+      "sha256": "1d07de23aec8028b95adeef1f151980e831790fabc366a258354a331e1a43f05",
+      "size": 32955
+    },
+    "source_archive": {
+      "path": "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/candidate-source-feature-groups-r1-rev20.tar",
+      "sha256": "75d428859ff2d00ef91165cff4280861977f1cb0973c1f3eef10b27bd613a8f3",
+      "size": 1024000
+    }
+  },
+  "baseline_commit": "f29c8bfa9c46a45b07cfbca22c1dfd714380390f",
+  "bounded_repair_scope": "record candidate commit/tree and preserve frozen product bytes",
+  "branch": "recorder-next/t_80b77d6b-implement-and-freeze-recorder-next-serve",
+  "candidate_id": "recorder-next-feature-groups-r1-rev20-90ff26b7cc4cf821",
+  "candidate_sha256": "90ff26b7cc4cf821b01630dc86d017ee92894955b226943f8f4bff8d96ba02c7",
+  "checks": {
+    "deterministic_source_build": {
+      "archive_sha256": "75d428859ff2d00ef91165cff4280861977f1cb0973c1f3eef10b27bd613a8f3",
+      "candidate_id": "recorder-next-feature-groups-r1-rev20-90ff26b7cc4cf821",
+      "candidate_manifest_mismatches": [],
+      "candidate_sha256": "90ff26b7cc4cf821b01630dc86d017ee92894955b226943f8f4bff8d96ba02c7",
+      "pass": true,
+      "product_file_count": 50,
+      "product_sha256": "def267f5fa28891a481da41ecf12d314ba4c09066e8fcade389b124116e99fba",
+      "returncode": 0,
+      "status": "PASS"
+    },
+    "frozen_control_suite": {
+      "argv": [
+        "/usr/bin/python3",
+        "-B",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "control",
+        "-p",
+        "test_*.py",
+        "-q"
+      ],
+      "cwd": "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/feature-groups-r1-rev20",
+      "duration_seconds": 15.241,
+      "log_sha256": "5f95c8de84d6aef18b49b3505659eadae5fbbfd3db4ba35d370048d14e8a9cae",
+      "returncode": 0,
+      "status": "PASS",
+      "stderr_bytes": 99,
+      "stderr_sha256": "b761593051aec9ace270076ad08431f700c9adb0e88c2bb94c74a6c3c5e72617",
+      "stdout_bytes": 0,
+      "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "test_count": 14,
+      "timed_out": false
+    },
+    "frozen_custody_readback": {
+      "generation_after_sha256": "2bf5e4e65adfb66489277ee98b2a71cc4f8b683d385489fa3be75c97b5a79b40",
+      "generation_before_sha256": "2bf5e4e65adfb66489277ee98b2a71cc4f8b683d385489fa3be75c97b5a79b40",
+      "generation_unchanged": true,
+      "product_bytes_changed": false,
+      "source_product_after_count": 50,
+      "source_product_before_count": 50,
+      "source_product_unchanged": true,
+      "status": "PASS"
+    },
+    "frozen_product_suite": {
+      "argv": [
+        "/usr/bin/python3",
+        "-B",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "candidate/tests",
+        "-p",
+        "test_*.py",
+        "-q"
+      ],
+      "cwd": "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/feature-groups-r1-rev20",
+      "duration_seconds": 9.342,
+      "log_sha256": "36a15f201050f98b438dfc33db7111440f37a872c05f477afea2eb1db90c6ef8",
+      "returncode": 0,
+      "status": "PASS",
+      "stderr_bytes": 99,
+      "stderr_sha256": "744b452946935b7fe927603871b68058f7bd389be59652d707cfcd24e88393a9",
+      "stdout_bytes": 0,
+      "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "test_count": 109,
+      "timed_out": false
+    },
+    "package_installed_health": {
+      "health": {
+        "body_bytes": 313,
+        "body_sha256": "bae8dd3ec9da3e1bcc263aa8614f55165f36cf9a8735216b0c4ebee0c48bbab6",
+        "json_keys": [
+          "api_version",
+          "product_identity",
+          "status",
+          "worker"
+        ],
+        "pass": true,
+        "port_bind": "127.0.0.1",
+        "process_cleanly_stopped": true,
+        "process_returncode": -15,
+        "product_identity": "recorder-next-server-product-items-1-through-8",
+        "status_code": 200,
+        "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "url": "http://127.0.0.1:40263/v1/health"
+      },
+      "import": {
+        "imported_from": "/tmp/recorder-next-commit-gates-ufked92a/venv/lib/python3.11/site-packages/recorder_next/__init__.py",
+        "pass": true,
+        "returncode": 0
+      },
+      "install": {
+        "pass": true,
+        "returncode": 0
+      },
+      "package_payload_files": 17,
+      "package_payload_match": true,
+      "package_payload_mismatches": [],
+      "pass": true,
+      "status": "PASS",
+      "venv": {
+        "pass": true,
+        "returncode": 0
+      },
+      "wheel": {
+        "build_pass": true,
+        "count": 1,
+        "files": [
+          {
+            "name": "recorder_next-1.0.0-py3-none-any.whl",
+            "sha256": "43be73da1f2bab4be456dcd6552a7f7726edd88532dab82129c50f5084834a9d",
+            "size": 100695
+          }
+        ],
+        "path": "/tmp/recorder-next-commit-gates-ufked92a/wheel/recorder_next-1.0.0-py3-none-any.whl",
+        "sha256": "43be73da1f2bab4be456dcd6552a7f7726edd88532dab82129c50f5084834a9d",
+        "size": 100695
+      }
+    },
+    "projection_equivalence": {
+      "archive_all_mode_0444": true,
+      "archive_all_mtime_zero": true,
+      "archive_file_count": 50,
+      "archive_manifest_mismatches": [],
+      "archive_sha256": "75d428859ff2d00ef91165cff4280861977f1cb0973c1f3eef10b27bd613a8f3",
+      "candidate_id": "recorder-next-feature-groups-r1-rev20-90ff26b7cc4cf821",
+      "candidate_sha256": "90ff26b7cc4cf821b01630dc86d017ee92894955b226943f8f4bff8d96ba02c7",
+      "expected_archive_sha256": "75d428859ff2d00ef91165cff4280861977f1cb0973c1f3eef10b27bd613a8f3",
+      "expected_product_sha256": "def267f5fa28891a481da41ecf12d314ba4c09066e8fcade389b124116e99fba",
+      "frozen_candidate_file_count": 50,
+      "frozen_candidate_manifest_mismatches": [],
+      "manifest_file_count": 50,
+      "pass": true,
+      "product_sha256": "def267f5fa28891a481da41ecf12d314ba4c09066e8fcade389b124116e99fba",
+      "source_bytes_unchanged_after_gates": true,
+      "source_file_count": 50,
+      "source_manifest_mismatches": [],
+      "status": "PASS"
+    },
+    "read_only_verifiers": {
+      "reports": {
+        "candidate-verifier": {
+          "expected_status": "PASS",
+          "identity_match": true,
+          "json_valid": true,
+          "pass": true,
+          "returncode": 0,
+          "status_field": "PASS"
+        },
+        "packet-check": {
+          "expected_status": "PASS",
+          "identity_match": true,
+          "json_valid": true,
+          "pass": true,
+          "returncode": 0,
+          "status_field": "PASS"
+        },
+        "preflight": {
+          "expected_status": "PASS",
+          "identity_match": true,
+          "json_valid": true,
+          "pass": true,
+          "returncode": 0,
+          "status_field": "PASS"
+        },
+        "stage-verifier": {
+          "expected_status": "PASS",
+          "identity_match": true,
+          "json_valid": true,
+          "pass": true,
+          "returncode": 0,
+          "status_field": "PASS"
+        }
+      },
+      "status": "PASS"
+    },
+    "source_compileall": {
+      "argv": [
+        "/home/rumi/.local/bin/python3.11",
+        "-B",
+        "-m",
+        "compileall",
+        "-q",
+        "recorder_next",
+        "tests"
+      ],
+      "cwd": "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b",
+      "duration_seconds": 0.657,
+      "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "returncode": 0,
+      "status": "PASS",
+      "stderr_bytes": 0,
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stdout_bytes": 0,
+      "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "timed_out": false
+    },
+    "source_help": {
+      "argv": [
+        "/home/rumi/.local/bin/python3.11",
+        "-B",
+        "-m",
+        "recorder_next",
+        "--help"
+      ],
+      "cwd": "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b",
+      "duration_seconds": 0.546,
+      "log_sha256": "3a8b7aa5c51a1f3f3050e931df885906985a073acbc046d7df3f8d57bfd13ca9",
+      "returncode": 0,
+      "status": "PASS",
+      "stderr_bytes": 0,
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stdout_bytes": 314,
+      "stdout_sha256": "3a8b7aa5c51a1f3f3050e931df885906985a073acbc046d7df3f8d57bfd13ca9",
+      "timed_out": false
+    },
+    "source_suite": {
+      "argv": [
+        "/home/rumi/.local/bin/python3.11",
+        "-B",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "tests",
+        "-q"
+      ],
+      "cwd": "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b",
+      "duration_seconds": 337.375,
+      "log_sha256": "ac35e1033333148e5ab55d58828d79ce37cbad89cff3c197530e075ba284dee1",
+      "returncode": 0,
+      "skipped": 3,
+      "status": "PASS",
+      "stderr_bytes": 113,
+      "stderr_sha256": "6805da9ecbf54835065843bd512bcc853039c0280ffa1285fee5afbd15bed807",
+      "stdout_bytes": 0,
+      "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "test_count": 162,
+      "timed_out": false
+    }
+  },
+  "evidence_hash_excludes": [
+    "this report's future hash",
+    "git commit and tree fields added by the provenance handoff"
+  ],
+  "failed_predicates": [],
+  "failure_class": null,
+  "invalidated_seams": [],
+  "live_authorized": false,
+  "live_mutation": false,
+  "product_bytes_changed": false,
+  "product_identity": "recorder-next-server-product-items-1-through-8",
+  "product_sha256": "def267f5fa28891a481da41ecf12d314ba4c09066e8fcade389b124116e99fba",
+  "recommended_owner": "orchestrator",
+  "schema": "recorder-next-commit-provenance/v1",
+  "status": "PASS",
+  "task_id": "t_c6c3c049",
+  "workspace": "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b"
+}

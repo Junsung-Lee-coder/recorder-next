@@ -245,8 +245,21 @@ CREATE TABLE IF NOT EXISTS tts_artifacts (
     origin_device_id TEXT NOT NULL,
     delivery_target_device_id TEXT,
     payload_sha256 TEXT,
+    byte_size INTEGER,
     storage_path TEXT,
     source_text TEXT,
+    content_type TEXT NOT NULL DEFAULT 'audio/mpeg',
+    provider_name TEXT,
+    provider_metadata_json TEXT,
+    hermes_profile TEXT,
+    endpoint_contract TEXT,
+    input_sha256 TEXT,
+    attempt_identity TEXT,
+    completed_at TEXT,
+    expires_at TEXT,
+    relay_state TEXT NOT NULL DEFAULT 'PENDING' CHECK(relay_state IN ('PENDING','RELAY_RECEIVED','PLAYED','EXPIRED')),
+    playback_ack_at TEXT,
+    retention_outcome TEXT,
     status TEXT NOT NULL CHECK(status IN ('PENDING','READY','DELIVERY_PENDING','PLAYED','FAILED_GENERATION','EXPIRED')),
     mode TEXT NOT NULL DEFAULT 'file',
     delivery_seq INTEGER NOT NULL,
@@ -329,6 +342,16 @@ CREATE TABLE IF NOT EXISTS asr_attempts (
     outcome TEXT NOT NULL,
     detail TEXT,
     transcript TEXT,
+    mode TEXT,
+    provider_name TEXT,
+    hermes_profile TEXT,
+    endpoint_contract TEXT,
+    input_sha256 TEXT,
+    output_sha256 TEXT,
+    content_type TEXT,
+    byte_size INTEGER,
+    attempt_identity TEXT,
+    completed_at TEXT,
     committed_at TEXT NOT NULL,
     FOREIGN KEY(turn_id) REFERENCES turns(turn_id) ON DELETE CASCADE
 );
@@ -342,4 +365,221 @@ CREATE TABLE IF NOT EXISTS audit_events (
     created_at TEXT NOT NULL
 );
 
-INSERT OR IGNORE INTO schema_meta(key, value) VALUES ('schema_version', '2');
+CREATE TABLE IF NOT EXISTS worker_jobs (
+    job_id TEXT PRIMARY KEY,
+    idempotency_key TEXT NOT NULL UNIQUE,
+    kind TEXT NOT NULL,
+    stage TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    payload_sha256 TEXT NOT NULL,
+    chain_generation TEXT,
+    chain_fingerprint TEXT,
+    chain_json TEXT,
+    overall_deadline_at TEXT,
+    status TEXT NOT NULL DEFAULT 'PENDING' CHECK(status IN ('PENDING','CLAIMED','RETRY_WAIT','SUCCEEDED','FAILED_PERMANENT')),
+    owner TEXT,
+    lease_expires_at TEXT,
+    next_attempt_at TEXT NOT NULL,
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    max_attempts INTEGER NOT NULL,
+    last_error_kind TEXT,
+    effect_receipt_json TEXT,
+    effect_receipt_sha256 TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    completed_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_worker_jobs_due ON worker_jobs(status, next_attempt_at, created_at);
+
+CREATE TABLE IF NOT EXISTS worker_attempts (
+    attempt_id TEXT PRIMARY KEY,
+    job_id TEXT NOT NULL,
+    attempt_number INTEGER NOT NULL,
+    owner TEXT NOT NULL,
+    stage TEXT NOT NULL,
+    started_at TEXT NOT NULL,
+    finished_at TEXT,
+    outcome TEXT NOT NULL DEFAULT 'RUNNING' CHECK(outcome IN ('RUNNING','SUCCEEDED','RETRY_WAIT','FAILED_PERMANENT','RECLAIMED')),
+    error_kind TEXT,
+    effect_receipt_sha256 TEXT,
+    UNIQUE(job_id, attempt_number),
+    FOREIGN KEY(job_id) REFERENCES worker_jobs(job_id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS update_channels (
+    channel TEXT PRIMARY KEY,
+    current_generation INTEGER NOT NULL,
+    current_manifest_sha256 TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS update_manifests (
+    channel TEXT NOT NULL,
+    generation INTEGER NOT NULL,
+    platform TEXT NOT NULL,
+    version TEXT NOT NULL,
+    version_code INTEGER NOT NULL,
+    artifact_name TEXT NOT NULL,
+    artifact_relpath TEXT NOT NULL,
+    artifact_sha256 TEXT NOT NULL,
+    signer_digest TEXT NOT NULL,
+    size INTEGER NOT NULL,
+    changelog TEXT NOT NULL,
+    min_server_version TEXT NOT NULL,
+    authorization_policy TEXT NOT NULL,
+    etag TEXT NOT NULL,
+    manifest_json TEXT NOT NULL,
+    manifest_sha256 TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY(channel, generation),
+    UNIQUE(channel, version_code)
+);
+CREATE INDEX IF NOT EXISTS idx_update_manifests_current ON update_manifests(channel, generation DESC);
+
+CREATE TABLE IF NOT EXISTS eavesdrop_sessions (
+    session_id TEXT PRIMARY KEY,
+    idempotency_key TEXT UNIQUE,
+    user_id TEXT NOT NULL,
+    phone_device_id TEXT NOT NULL,
+    watch_device_id TEXT,
+    project_id TEXT,
+    state TEXT NOT NULL CHECK(state IN ('CREATED','ACTIVE','PAUSED','STOPPING','STOPPED','EXPIRED','FAILED')),
+    response_enabled INTEGER NOT NULL DEFAULT 1,
+    tts_enabled INTEGER NOT NULL DEFAULT 0,
+    hermes_enabled INTEGER NOT NULL DEFAULT 0,
+    accumulated_transcript TEXT NOT NULL DEFAULT '',
+    next_sequence INTEGER NOT NULL DEFAULT 0,
+    expires_at TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    stopped_at TEXT,
+    failure_kind TEXT,
+    FOREIGN KEY(project_id) REFERENCES projects(stable_project_id) ON DELETE SET NULL
+);
+CREATE INDEX IF NOT EXISTS idx_eavesdrop_sessions_expiry ON eavesdrop_sessions(state, expires_at);
+
+CREATE TABLE IF NOT EXISTS eavesdrop_segments (
+    session_id TEXT NOT NULL,
+    sequence INTEGER NOT NULL,
+    client_segment_id TEXT NOT NULL,
+    audio_sha256 TEXT NOT NULL,
+    byte_length INTEGER NOT NULL,
+    storage_path TEXT NOT NULL,
+    transcript TEXT,
+    status TEXT NOT NULL DEFAULT 'ACCEPTED' CHECK(status IN ('ACCEPTED','FAILED')),
+    created_at TEXT NOT NULL,
+    PRIMARY KEY(session_id, sequence),
+    UNIQUE(session_id, client_segment_id),
+    FOREIGN KEY(session_id) REFERENCES eavesdrop_sessions(session_id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS eavesdrop_replies (
+    reply_id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    segment_sequence INTEGER NOT NULL,
+    text_hash TEXT NOT NULL,
+    reply_text TEXT NOT NULL,
+    tts_requested INTEGER NOT NULL DEFAULT 0,
+    hermes_requested INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    UNIQUE(session_id, segment_sequence),
+    FOREIGN KEY(session_id) REFERENCES eavesdrop_sessions(session_id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS diagnostics_consents (
+    user_id TEXT NOT NULL,
+    device_id TEXT NOT NULL,
+    event_id TEXT PRIMARY KEY,
+    enabled INTEGER NOT NULL,
+    created_at TEXT NOT NULL,
+    expires_at TEXT,
+    revoked_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_diagnostics_consents_owner ON diagnostics_consents(user_id, device_id, enabled, created_at);
+
+CREATE TABLE IF NOT EXISTS diagnostic_events (
+    event_id TEXT PRIMARY KEY,
+    idempotency_key TEXT NOT NULL UNIQUE,
+    user_id TEXT NOT NULL,
+    device_id TEXT NOT NULL,
+    category TEXT NOT NULL,
+    stage TEXT NOT NULL,
+    metadata_json TEXT NOT NULL,
+    occurred_at TEXT NOT NULL,
+    retention_deadline TEXT NOT NULL,
+    deleted_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_diagnostic_events_owner ON diagnostic_events(user_id, device_id, occurred_at);
+
+CREATE TABLE IF NOT EXISTS diagnostic_bundles (
+    bundle_id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    device_id TEXT NOT NULL,
+    opt_in_event_id TEXT NOT NULL,
+    compressed_size INTEGER NOT NULL,
+    expanded_size INTEGER NOT NULL,
+    payload_sha256 TEXT NOT NULL,
+    storage_path TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    retention_deadline TEXT NOT NULL,
+    deleted_at TEXT,
+    UNIQUE(user_id, device_id, payload_sha256),
+    FOREIGN KEY(opt_in_event_id) REFERENCES diagnostics_consents(event_id) ON DELETE RESTRICT
+);
+CREATE INDEX IF NOT EXISTS idx_diagnostic_bundles_owner ON diagnostic_bundles(user_id, device_id, created_at);
+
+CREATE TABLE IF NOT EXISTS eavesdrop_decisions (
+    decision_id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL REFERENCES eavesdrop_sessions(session_id) ON DELETE CASCADE,
+    segment_sequence INTEGER NOT NULL,
+    decision TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    project_id TEXT,
+    gateway_session_key TEXT,
+    hermes_submission_id TEXT,
+    policy_version TEXT NOT NULL DEFAULT 'eavesdrop-router-v1',
+    covered_start_sequence INTEGER NOT NULL DEFAULT 0,
+    covered_end_sequence INTEGER NOT NULL DEFAULT 0,
+    dedupe_key TEXT NOT NULL DEFAULT '',
+    result_state TEXT NOT NULL DEFAULT 'PENDING',
+    effect_receipt_json TEXT,
+    created_at TEXT NOT NULL,
+    UNIQUE(session_id, segment_sequence)
+);
+
+CREATE INDEX IF NOT EXISTS idx_eavesdrop_decisions_session ON eavesdrop_decisions(session_id, segment_sequence);
+
+CREATE TABLE IF NOT EXISTS diagnostic_tombstones (
+    tombstone_id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    device_id TEXT NOT NULL,
+    entity_type TEXT NOT NULL CHECK(entity_type IN ('event','bundle')),
+    entity_id TEXT NOT NULL,
+    deleted_at TEXT NOT NULL,
+    UNIQUE(entity_type, entity_id)
+);
+
+CREATE TABLE IF NOT EXISTS storage_cleanup_receipts (
+    receipt_id TEXT PRIMARY KEY,
+    operation TEXT NOT NULL,
+    storage_path TEXT NOT NULL,
+    expected_sha256 TEXT NOT NULL,
+    expected_size INTEGER NOT NULL,
+    user_id TEXT,
+    device_id TEXT,
+    entity_type TEXT,
+    entity_id TEXT,
+    status TEXT NOT NULL DEFAULT 'PENDING' CHECK(status IN ('PENDING','COMPLETE','BLOCKED')),
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    completed_at TEXT,
+    UNIQUE(operation, storage_path, expected_sha256, expected_size)
+);
+CREATE INDEX IF NOT EXISTS idx_storage_cleanup_receipts_pending
+    ON storage_cleanup_receipts(status, updated_at);
+CREATE INDEX IF NOT EXISTS idx_storage_cleanup_receipts_owner
+    ON storage_cleanup_receipts(user_id, device_id, status);
+
+INSERT OR IGNORE INTO schema_meta(key, value) VALUES ('schema_version', '4');

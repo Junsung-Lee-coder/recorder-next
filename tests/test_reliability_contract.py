@@ -32,7 +32,7 @@ def setup_text_flow(tmp, *, user="u", turn_id="018f5a2e-7b6e-7abc-8d11-123456789
     store.accept_turn(turn_id)
     project = store.create_project(user, project_number=project_number, name="Fixture")
     store.commit_route(turn_id, RouterDecision("route-1", project["stable_project_id"], project["default_session_key"], project["record_version"], "전달", "fixture"))
-    route_event = store.pending_outbox("device-1")[0]
+    route_event = store.pending_outbox("device-1", user_id="u")[0]
     store.ack_event(turn_id, route_event["event_id"], device_id="device-1", event_version=1, payload_sha256=route_event["payload_sha256"])
     with store._read() as conn:
         submission_id = conn.execute("SELECT hermes_submission_id FROM session_ingress WHERE turn_id=?", (turn_id,)).fetchone()[0]

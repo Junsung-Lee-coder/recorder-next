@@ -12,16 +12,19 @@ import threading
 import uuid
 from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping
+from urllib.parse import quote
 
 from .canonical import canonical_json, hermes_content_hash, normalize_hermes_text, sha256_bytes, sha256_json
 from .errors import (
     ChunkConflict,
+    CleanupIncompleteError,
     ConflictError,
     LeaseConflict,
     MissingParts,
     NotFoundError,
     NotReadyError,
     QuotaExceeded,
+    RecorderError,
     TurnIdConflict,
     UnauthorizedError,
     ValidationError,
@@ -80,6 +83,10 @@ class RecorderStore:
         max_parts: int = 20,
         max_user_storage_bytes: int | None = None,
         min_free_bytes: int = 0,
+        diagnostics_max_compressed_bytes: int = 2 * 1024 * 1024,
+        diagnostics_max_expanded_bytes: int = 16 * 1024 * 1024,
+        diagnostics_retention_seconds: int = 7 * 86400,
+        tts_artifact_ttl_seconds: int = 86400,
     ):
         self.db_path = Path(db_path)
         self.storage_root = Path(storage_root)
@@ -92,11 +99,18 @@ class RecorderStore:
         self.max_parts = max_parts
         self.max_user_storage_bytes = max_user_storage_bytes
         self.min_free_bytes = max(0, min_free_bytes)
+        self.diagnostics_max_compressed_bytes = diagnostics_max_compressed_bytes
+        self.diagnostics_max_expanded_bytes = diagnostics_max_expanded_bytes
+        self.diagnostics_retention_seconds = diagnostics_retention_seconds
+        self.tts_artifact_ttl_seconds = tts_artifact_ttl_seconds
         self._clock = clock
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.storage_root.mkdir(parents=True, exist_ok=True)
         self._write_lock = threading.RLock()
         self._initialize()
+        from .features import FeatureGroups
+
+        self._features = FeatureGroups(self)
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path, timeout=30, isolation_level=None, check_same_thread=False)
@@ -114,12 +128,21 @@ class RecorderStore:
             conn.executescript(schema)
             version_row = conn.execute("SELECT value FROM schema_meta WHERE key='schema_version'").fetchone()
             version = int(version_row["value"]) if version_row is not None else 1
-            if version > 2:
+            if version > 4:
                 raise RuntimeError(f"unsupported Recorder schema version {version}")
             if version < 2:
                 self._apply_scheduled_migration(conn)
                 conn.execute("UPDATE schema_meta SET value='2' WHERE key='schema_version'")
-            conn.execute("INSERT OR IGNORE INTO schema_meta(key, value) VALUES ('schema_version', '2')")
+                version = 2
+            if version < 3:
+                self._apply_feature_migration(conn)
+                conn.execute("UPDATE schema_meta SET value='3' WHERE key='schema_version'")
+                version = 3
+            if version < 4:
+                self._apply_eavesdrop_migration(conn)
+                conn.execute("UPDATE schema_meta SET value='4' WHERE key='schema_version'")
+                version = 4
+            conn.execute("INSERT OR IGNORE INTO schema_meta(key, value) VALUES ('schema_version', '4')")
         finally:
             conn.close()
 
@@ -199,6 +222,42 @@ class RecorderStore:
             """
         )
 
+    @staticmethod
+    def _apply_feature_migration(conn: sqlite3.Connection) -> None:
+        migration = Path(__file__).with_name("migrations") / "003_feature_groups.sql"
+        # Keep the checked-in SQL readable while making startup migration
+        # idempotent for a partially upgraded snapshot.
+        lines = migration.read_text(encoding="utf-8").splitlines()
+        statements: list[str] = []
+        for line in lines:
+            match = re.match(r"\s*ALTER TABLE ([A-Za-z_][A-Za-z0-9_]*) ADD COLUMN ([A-Za-z_][A-Za-z0-9_]*) ", line, re.IGNORECASE)
+            if match:
+                table, column = match.group(1), match.group(2)
+                columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+                if column in columns:
+                    continue
+                conn.execute(line)
+            else:
+                statements.append(line)
+        conn.executescript("\n".join(statements))
+
+    @staticmethod
+    def _apply_eavesdrop_migration(conn: sqlite3.Connection) -> None:
+        migration = Path(__file__).with_name("migrations") / "004_eavesdrop_decisions.sql"
+        statements: list[str] = []
+        for line in migration.read_text(encoding="utf-8").splitlines():
+            match = re.match(r"\s*ALTER TABLE ([A-Za-z_][A-Za-z0-9_]*) ADD COLUMN ([A-Za-z_][A-Za-z0-9_]*) ", line, re.IGNORECASE)
+            if match:
+                table, column = match.group(1), match.group(2)
+                columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+                if column in columns:
+                    continue
+                conn.execute(line)
+                continue
+            statements.append(line)
+        conn.executescript("\n".join(statements))
+
+
     def _now(self) -> str:
         if self._clock is None:
             return utc_now()
@@ -241,21 +300,155 @@ class RecorderStore:
         return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
     def _safe_write(self, path: Path, payload: bytes) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_name(path.name + ".tmp-" + uuid.uuid4().hex)
-        with tmp.open("wb") as handle:
-            handle.write(payload)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(tmp, path)
+        from .features import FeatureGroups
+
+        root = FeatureGroups._lexical_absolute(self.storage_root)
+        path = FeatureGroups._lexical_absolute(path)
+        FeatureGroups._mkdir_managed_path(root, path.parent)
+        relative = path.relative_to(root)
+        if not relative.parts:
+            raise UnauthorizedError("managed storage root cannot be written")
+        directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+        root_descriptor = os.open(root, directory_flags)
+        directory_descriptor = root_descriptor
+        temporary_name = "." + path.name + ".tmp-" + uuid.uuid4().hex
+        temporary_descriptor: int | None = None
+        temporary_present = False
         try:
-            directory_fd = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-        except OSError:
-            return
-        try:
-            os.fsync(directory_fd)
+            for component in relative.parts[:-1]:
+                next_descriptor = os.open(component, directory_flags, dir_fd=directory_descriptor)
+                if directory_descriptor != root_descriptor:
+                    os.close(directory_descriptor)
+                directory_descriptor = next_descriptor
+            temporary_descriptor = os.open(
+                temporary_name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0),
+                0o600,
+                dir_fd=directory_descriptor,
+            )
+            temporary_present = True
+            with os.fdopen(temporary_descriptor, "wb", closefd=False) as handle:
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.close(temporary_descriptor)
+            temporary_descriptor = None
+            os.replace(temporary_name, relative.parts[-1], src_dir_fd=directory_descriptor, dst_dir_fd=directory_descriptor)
+            temporary_present = False
+            os.fsync(directory_descriptor)
         finally:
-            os.close(directory_fd)
+            if temporary_descriptor is not None:
+                os.close(temporary_descriptor)
+            if temporary_present:
+                try:
+                    os.unlink(temporary_name, dir_fd=directory_descriptor)
+                except FileNotFoundError:
+                    pass
+            if directory_descriptor != root_descriptor:
+                os.close(directory_descriptor)
+            os.close(root_descriptor)
+
+    def _safe_unlink(self, path: Path) -> None:
+        from .features import FeatureGroups
+
+        FeatureGroups._unlink_managed_file(self.storage_root, path)
+
+    def _canonical_storage_path(self, path: str | os.PathLike[str]) -> Path:
+        root = Path(os.path.abspath(os.fspath(self.storage_root)))
+        candidate = Path(os.path.abspath(os.fspath(path)))
+        try:
+            candidate.relative_to(root)
+        except ValueError as exc:
+            raise UnauthorizedError("cleanup path escapes the storage root") from exc
+        return candidate
+
+    def _cleanup_receipt_id(self, operation: str, path: Path, expected_sha256: str, expected_size: int) -> str:
+        if not isinstance(operation, str) or not re.fullmatch(r"[a-z][a-z0-9_.-]{0,63}", operation):
+            raise ValidationError("cleanup operation is invalid")
+        if not isinstance(expected_sha256, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", expected_sha256):
+            raise ValidationError("cleanup receipt hash is invalid")
+        if not isinstance(expected_size, int) or isinstance(expected_size, bool) or expected_size < 0:
+            raise ValidationError("cleanup receipt size is invalid")
+        return str(uuid.uuid5(uuid.NAMESPACE_URL, f"recorder-next:cleanup:{operation}:{path}:{expected_sha256.lower()}:{expected_size}"))
+
+    def _prepare_cleanup_receipt_tx(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        operation: str,
+        path: str | os.PathLike[str],
+        expected_sha256: str,
+        expected_size: int,
+        user_id: str | None = None,
+        device_id: str | None = None,
+        entity_type: str | None = None,
+        entity_id: str | None = None,
+        now: str | None = None,
+    ) -> str:
+        canonical_path = self._canonical_storage_path(path)
+        receipt_id = self._cleanup_receipt_id(operation, canonical_path, expected_sha256, expected_size)
+        timestamp = now or self._now()
+        conn.execute(
+            """
+            INSERT INTO storage_cleanup_receipts(
+                receipt_id, operation, storage_path, expected_sha256, expected_size,
+                user_id, device_id, entity_type, entity_id, status, attempt_count,
+                last_error, created_at, updated_at, completed_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', 0, NULL, ?, ?, NULL)
+            ON CONFLICT(receipt_id) DO UPDATE SET
+                operation=excluded.operation,
+                storage_path=excluded.storage_path,
+                expected_sha256=excluded.expected_sha256,
+                expected_size=excluded.expected_size,
+                user_id=excluded.user_id,
+                device_id=excluded.device_id,
+                entity_type=excluded.entity_type,
+                entity_id=excluded.entity_id,
+                status='PENDING',
+                attempt_count=0,
+                last_error=NULL,
+                updated_at=excluded.updated_at,
+                completed_at=NULL
+            """,
+            (
+                receipt_id,
+                operation,
+                str(canonical_path),
+                expected_sha256.lower(),
+                expected_size,
+                user_id,
+                device_id,
+                entity_type,
+                entity_id,
+                timestamp,
+                timestamp,
+            ),
+        )
+        return receipt_id
+
+    def _prepare_cleanup_receipt(self, **kwargs: Any) -> str:
+        with self._tx() as conn:
+            return self._prepare_cleanup_receipt_tx(conn, **kwargs)
+
+    @staticmethod
+    def _complete_cleanup_receipt_tx(conn: sqlite3.Connection, receipt_id: str, *, now: str | None = None) -> None:
+        timestamp = now or utc_now()
+        conn.execute(
+            "UPDATE storage_cleanup_receipts SET status='COMPLETE', last_error=NULL, updated_at=?, completed_at=? WHERE receipt_id=?",
+            (timestamp, timestamp, receipt_id),
+        )
+
+    def _complete_cleanup_receipt(self, receipt_id: str, *, now: str | None = None) -> None:
+        with self._tx() as conn:
+            self._complete_cleanup_receipt_tx(conn, receipt_id, now=now)
+
+    def recover_cleanup_receipts(
+        self,
+        *,
+        receipt_ids: list[str] | None = None,
+        now: str | None = None,
+    ) -> dict[str, int]:
+        return self._features.recover_cleanup_receipts(receipt_ids=receipt_ids, now=now)
 
     def _validate_turn_id(self, value: Any) -> str:
         if not isinstance(value, str) or not UUIDISH.fullmatch(value):
@@ -340,7 +533,7 @@ class RecorderStore:
         turn["tts_artifacts"] = [
             _row(artifact)
             for artifact in conn.execute(
-                "SELECT artifact_id, event_id, event_kind, artifact_version, output_kind, origin_device_id, delivery_target_device_id, payload_sha256, status, mode, delivery_seq, created_at, updated_at, played_at FROM tts_artifacts WHERE turn_id = ? ORDER BY delivery_seq",
+                "SELECT artifact_id, event_id, event_kind, artifact_version, output_kind, origin_device_id, delivery_target_device_id, payload_sha256, byte_size, content_type, provider_name, expires_at, relay_state, playback_ack_at, retention_outcome, status, mode, delivery_seq, created_at, updated_at, played_at FROM tts_artifacts WHERE turn_id=? ORDER BY delivery_seq",
                 (turn_id,),
             ).fetchall()
         ]
@@ -367,11 +560,13 @@ class RecorderStore:
         ]
         return turn
 
-    def get_turn(self, turn_id: str) -> dict[str, Any]:
+    def get_turn(self, turn_id: str, *, user_id: str | None = None, device_id: str | None = None) -> dict[str, Any]:
         with self._read() as conn:
+            turn = self._turn_row(conn, turn_id)
+            self._assert_turn_owner_tx(conn, turn, user_id, device_id)
             return self._turn_payload(conn, turn_id)
 
-    def create_turn(self, manifest: Mapping[str, Any]) -> dict[str, Any]:
+    def create_turn(self, manifest: Mapping[str, Any], *, require_registered_device: bool = False) -> dict[str, Any]:
         manifest = dict(manifest)
         parts = manifest.get("parts")
         if not isinstance(parts, list):
@@ -409,6 +604,8 @@ class RecorderStore:
             raise QuotaExceeded("configured minimum free disk space is not available")
         now = utc_now()
         with self._tx() as conn:
+            if require_registered_device:
+                self._assert_device(conn, manifest["user_id"], manifest["origin_device_id"])
             existing = conn.execute("SELECT * FROM turns WHERE turn_id = ?", (turn_id,)).fetchone()
             if existing is not None:
                 if existing["initial_fingerprint"] != fingerprint:
@@ -476,8 +673,10 @@ class RecorderStore:
                 raise NotFoundError("device is not registered")
             return _row(row) or {}
 
-    def revoke_device(self, user_id: str, device_id: str) -> None:
+    def revoke_device(self, user_id: str, device_id: str, *, actor_device_id: str | None = None) -> None:
         with self._tx() as conn:
+            if actor_device_id is not None:
+                self._assert_device(conn, user_id, actor_device_id)
             updated = conn.execute(
                 "UPDATE devices SET status='revoked', revoked_at=? WHERE user_id=? AND device_id=? AND status='active'",
                 (utc_now(), user_id, device_id),
@@ -492,6 +691,44 @@ class RecorderStore:
         if row is None or row["status"] != "active":
             raise UnauthorizedError("device is not registered or has been revoked")
 
+    def assert_active_device(self, user_id: str, device_id: str) -> None:
+        """Validate a public owner proof without exposing device state."""
+
+        if not isinstance(user_id, str) or not user_id or not isinstance(device_id, str) or not device_id:
+            raise UnauthorizedError("a registered user and device are required")
+        with self._read() as conn:
+            self._assert_device(conn, user_id, device_id)
+
+    def _assert_turn_owner_tx(
+        self,
+        conn: sqlite3.Connection,
+        turn: sqlite3.Row,
+        user_id: str | None,
+        device_id: str | None,
+    ) -> None:
+        if user_id is None and device_id is None:
+            return
+        if not isinstance(user_id, str) or not user_id or not isinstance(device_id, str) or not device_id:
+            raise UnauthorizedError("a registered user and device are required")
+        if turn["user_id"] != user_id or turn["origin_device_id"] != device_id:
+            raise UnauthorizedError("turn is not owned by the authenticated origin device")
+        self._assert_device(conn, user_id, device_id)
+
+    def _assert_resource_owner_tx(
+        self,
+        conn: sqlite3.Connection,
+        resource_user_id: str,
+        user_id: str | None,
+        device_id: str | None,
+    ) -> None:
+        if user_id is None:
+            return
+        if not isinstance(user_id, str) or not user_id or not isinstance(device_id, str) or not device_id:
+            raise UnauthorizedError("a registered user and device are required")
+        if resource_user_id != user_id:
+            raise UnauthorizedError("resource is owned by another user")
+        self._assert_device(conn, user_id, device_id)
+
     def put_chunk(
         self,
         turn_id: str,
@@ -500,6 +737,8 @@ class RecorderStore:
         payload: bytes,
         *,
         expected_sha256: str | None = None,
+        user_id: str | None = None,
+        device_id: str | None = None,
     ) -> dict[str, Any]:
         if not isinstance(sequence, int) or sequence < 0:
             raise ValidationError("sequence must be a non-negative integer")
@@ -509,65 +748,88 @@ class RecorderStore:
         if expected_sha256 is not None and expected_sha256 != digest:
             raise ConflictError("chunk sha256 does not match payload")
         now = utc_now()
-        path: Path | None = None
-        with self._tx() as conn:
+        with self._read() as conn:
             turn = self._turn_row(conn, turn_id)
+            self._assert_turn_owner_tx(conn, turn, user_id, device_id)
             part = conn.execute(
-                "SELECT * FROM turn_parts WHERE turn_id = ? AND part_id = ?", (turn_id, part_id)
+                "SELECT part_id FROM turn_parts WHERE turn_id = ? AND part_id = ?", (turn_id, part_id)
             ).fetchone()
             if part is None:
                 raise NotFoundError("part not found")
-            existing = conn.execute(
-                "SELECT * FROM turn_chunks WHERE turn_id=? AND part_id=? AND sequence=?",
-                (turn_id, part_id, sequence),
-            ).fetchone()
-            if existing is not None:
-                if existing["sha256"] == digest and existing["byte_length"] == len(payload):
-                    return {"duplicate": True, **(_row(existing) or {})}
-                raise ChunkConflict("same chunk sequence has a different hash")
-            previous_bytes = conn.execute(
-                "SELECT COALESCE(SUM(byte_length), 0) FROM turn_chunks WHERE turn_id=? AND part_id=?",
-                (turn_id, part_id),
-            ).fetchone()[0]
-            kind = part["kind"]
-            per_part_limit = self.max_text_bytes if kind == "text" else self.max_audio_bytes if kind == "audio" else self.max_attachment_bytes
-            if int(previous_bytes) + len(payload) > per_part_limit:
-                raise QuotaExceeded("part exceeds configured size limit")
-            turn_bytes = conn.execute(
-                "SELECT COALESCE(SUM(byte_length), 0) FROM turn_chunks WHERE turn_id=?",
-                (turn_id,),
-            ).fetchone()[0]
-            if int(turn_bytes) + len(payload) > self.max_turn_bytes:
-                raise QuotaExceeded("turn exceeds configured byte limit")
-            if part["declared_bytes"] is not None and int(previous_bytes) + len(payload) > int(part["declared_bytes"]):
-                raise ConflictError("chunk payload exceeds declared part size")
-            if self.max_user_storage_bytes is not None:
-                user_bytes = conn.execute(
-                    "SELECT COALESCE(SUM(c.byte_length), 0) FROM turn_chunks c JOIN turns t ON t.turn_id=c.turn_id WHERE t.user_id=? AND t.archived_at IS NULL",
-                    (turn["user_id"],),
-                ).fetchone()[0]
-                if int(user_bytes) + len(payload) > self.max_user_storage_bytes:
-                    raise QuotaExceeded("user storage quota would be exceeded")
             path = self._part_dir(turn["user_id"], turn_id, part_id) / f"{sequence:08d}.chunk"
-            self._safe_write(path, payload)
-            try:
+        receipt_id = self._prepare_cleanup_receipt(
+            operation="turn_chunk_rollback",
+            path=path,
+            expected_sha256=digest,
+            expected_size=len(payload),
+            user_id=turn["user_id"],
+            device_id=turn["origin_device_id"],
+            entity_type="turn_chunk",
+            entity_id=f"{turn_id}:{part_id}:{sequence}",
+            now=now,
+        )
+        try:
+            with self._tx() as conn:
+                turn = self._turn_row(conn, turn_id)
+                self._assert_turn_owner_tx(conn, turn, user_id, device_id)
+                part = conn.execute(
+                    "SELECT * FROM turn_parts WHERE turn_id = ? AND part_id = ?", (turn_id, part_id)
+                ).fetchone()
+                if part is None:
+                    raise NotFoundError("part not found")
+                existing = conn.execute(
+                    "SELECT * FROM turn_chunks WHERE turn_id=? AND part_id=? AND sequence=?",
+                    (turn_id, part_id, sequence),
+                ).fetchone()
+                if existing is not None:
+                    if existing["sha256"] == digest and existing["byte_length"] == len(payload):
+                        self._complete_cleanup_receipt_tx(conn, receipt_id, now=now)
+                        return {"duplicate": True, **(_row(existing) or {})}
+                    raise ChunkConflict("same chunk sequence has a different hash")
+                previous_bytes = conn.execute(
+                    "SELECT COALESCE(SUM(byte_length), 0) FROM turn_chunks WHERE turn_id=? AND part_id=?",
+                    (turn_id, part_id),
+                ).fetchone()[0]
+                kind = part["kind"]
+                per_part_limit = self.max_text_bytes if kind == "text" else self.max_audio_bytes if kind == "audio" else self.max_attachment_bytes
+                if int(previous_bytes) + len(payload) > per_part_limit:
+                    raise QuotaExceeded("part exceeds configured size limit")
+                turn_bytes = conn.execute(
+                    "SELECT COALESCE(SUM(byte_length), 0) FROM turn_chunks WHERE turn_id=?",
+                    (turn_id,),
+                ).fetchone()[0]
+                if int(turn_bytes) + len(payload) > self.max_turn_bytes:
+                    raise QuotaExceeded("turn exceeds configured byte limit")
+                if part["declared_bytes"] is not None and int(previous_bytes) + len(payload) > int(part["declared_bytes"]):
+                    raise ConflictError("chunk payload exceeds declared part size")
+                if self.max_user_storage_bytes is not None:
+                    user_bytes = conn.execute(
+                        "SELECT COALESCE(SUM(c.byte_length), 0) FROM turn_chunks c JOIN turns t ON t.turn_id=c.turn_id WHERE t.user_id=? AND t.archived_at IS NULL",
+                        (turn["user_id"],),
+                    ).fetchone()[0]
+                    if int(user_bytes) + len(payload) > self.max_user_storage_bytes:
+                        raise QuotaExceeded("user storage quota would be exceeded")
+                path = self._part_dir(turn["user_id"], turn_id, part_id) / f"{sequence:08d}.chunk"
+                self._safe_write(path, payload)
                 conn.execute(
                     "INSERT INTO turn_chunks(turn_id, part_id, sequence, byte_length, sha256, storage_path, received_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
                     (turn_id, part_id, sequence, len(payload), digest, str(path), now),
                 )
-            except Exception:
-                with contextlib.suppress(FileNotFoundError):
-                    path.unlink()
-                raise
-            return {
-                "duplicate": False,
-                "turn_id": turn_id,
-                "part_id": part_id,
-                "sequence": sequence,
-                "byte_length": len(payload),
-                "sha256": digest,
-                "storage_path": str(path),
-            }
+                self._complete_cleanup_receipt_tx(conn, receipt_id, now=now)
+                return {
+                    "duplicate": False,
+                    "turn_id": turn_id,
+                    "part_id": part_id,
+                    "sequence": sequence,
+                    "byte_length": len(payload),
+                    "sha256": digest,
+                    "storage_path": str(path),
+                }
+        except Exception as exc:
+            cleanup = self.recover_cleanup_receipts(receipt_ids=[receipt_id], now=now)
+            if cleanup["pending"] or cleanup["blocked"]:
+                raise CleanupIncompleteError("chunk rollback cleanup is incomplete") from exc
+            raise
 
     def _validate_total_chunks(self, value: Any, *, kind: str | None = None) -> int:
         if not isinstance(value, int) or isinstance(value, bool):
@@ -588,8 +850,18 @@ class RecorderStore:
             raise ValidationError(f"total_chunks exceeds configured maximum of {maximum}")
         return value
 
-    def missing_sequences(self, turn_id: str, part_id: str, total_chunks: int | None = None) -> list[int]:
+    def missing_sequences(
+        self,
+        turn_id: str,
+        part_id: str,
+        total_chunks: int | None = None,
+        *,
+        user_id: str | None = None,
+        device_id: str | None = None,
+    ) -> list[int]:
         with self._read() as conn:
+            turn = self._turn_row(conn, turn_id)
+            self._assert_turn_owner_tx(conn, turn, user_id, device_id)
             part = conn.execute(
                 "SELECT total_chunks, kind FROM turn_parts WHERE turn_id=? AND part_id=?", (turn_id, part_id)
             ).fetchone()
@@ -615,6 +887,8 @@ class RecorderStore:
         offset: int = 0,
         limit: int = DEFAULT_MISSING_PAGE_SIZE,
         encoding: str = "list",
+        user_id: str | None = None,
+        device_id: str | None = None,
     ) -> dict[str, Any]:
         if not isinstance(offset, int) or isinstance(offset, bool) or offset < 0:
             raise ValidationError("missing offset must be a non-negative integer")
@@ -623,6 +897,8 @@ class RecorderStore:
         if encoding not in {"list", "ranges"}:
             raise ValidationError("missing encoding must be list or ranges")
         with self._read() as conn:
+            turn = self._turn_row(conn, turn_id)
+            self._assert_turn_owner_tx(conn, turn, user_id, device_id)
             part = conn.execute(
                 "SELECT total_chunks, kind FROM turn_parts WHERE turn_id=? AND part_id=?", (turn_id, part_id)
             ).fetchone()
@@ -709,6 +985,8 @@ class RecorderStore:
         total_bytes: int,
         whole_stream_sha256: str,
         duration_ms: int | None = None,
+        user_id: str | None = None,
+        device_id: str | None = None,
     ) -> dict[str, Any]:
         total_chunks = self._validate_total_chunks(total_chunks)
         if not isinstance(total_bytes, int) or isinstance(total_bytes, bool) or total_bytes < 0:
@@ -719,6 +997,7 @@ class RecorderStore:
             raise ValidationError("duration_ms must be a non-negative integer or null")
         with self._tx() as conn:
             turn = self._turn_row(conn, turn_id)
+            self._assert_turn_owner_tx(conn, turn, user_id, device_id)
             part = conn.execute(
                 "SELECT * FROM turn_parts WHERE turn_id=? AND part_id=?", (turn_id, part_id)
             ).fetchone()
@@ -771,16 +1050,32 @@ class RecorderStore:
                 ).fetchone()
             ) or {}
 
-    def read_part(self, turn_id: str, part_id: str) -> bytes:
+    def read_part(
+        self,
+        turn_id: str,
+        part_id: str,
+        *,
+        user_id: str | None = None,
+        device_id: str | None = None,
+    ) -> bytes:
         with self._read() as conn:
+            turn = self._turn_row(conn, turn_id)
+            self._assert_turn_owner_tx(conn, turn, user_id, device_id)
             part = conn.execute(
-                "SELECT source_path FROM turn_parts WHERE turn_id=? AND part_id=?", (turn_id, part_id)
+                "SELECT * FROM turn_parts WHERE turn_id=? AND part_id=?", (turn_id, part_id)
             ).fetchone()
             if part is None:
                 raise NotFoundError("part not found")
-            if not part["source_path"] or not Path(part["source_path"]).exists():
+            if part["status"] != "COMPLETE" or not part["source_path"]:
                 raise NotReadyError("part source is not assembled")
-            return Path(part["source_path"]).read_bytes()
+            from .features import FeatureGroups
+
+            return FeatureGroups._read_managed_bytes(
+                self.storage_root,
+                Path(part["source_path"]),
+                expected_size=part["total_bytes"],
+                expected_sha256=part["whole_stream_sha256"],
+            )
 
     def _all_parts_complete(self, conn: sqlite3.Connection, turn_id: str) -> bool:
         row = conn.execute(
@@ -789,10 +1084,18 @@ class RecorderStore:
         ).fetchone()
         return bool(row["total"] and row["total"] == row["complete"])
 
-    def accept_turn(self, turn_id: str) -> dict[str, Any]:
-        now = utc_now()
+    def accept_turn(
+        self,
+        turn_id: str,
+        *,
+        now: str | None = None,
+        user_id: str | None = None,
+        device_id: str | None = None,
+    ) -> dict[str, Any]:
+        now = now or utc_now()
         with self._tx() as conn:
             turn = self._turn_row(conn, turn_id)
+            self._assert_turn_owner_tx(conn, turn, user_id, device_id)
             if turn["state"] != "RECEIVING":
                 return self._turn_payload(conn, turn_id)
             if not self._all_parts_complete(conn, turn_id):
@@ -823,6 +1126,7 @@ class RecorderStore:
                 outcome="success",
                 error_kind=None,
                 create_outbox=False,
+                created_at=now,
             )
             conn.execute(
                 "INSERT INTO router_queue(turn_id, user_id, accepted_seq, state, updated_at) VALUES (?, ?, ?, 'QUEUED', ?)",
@@ -906,11 +1210,14 @@ class RecorderStore:
         turn = self._turn_row(conn, turn_id)
         artifact_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"recorder-next:tts:{turn_id}:{event_kind}:{artifact_version}"))
         now = created_at or utc_now()
+        expires_at = None
+        if self.tts_artifact_ttl_seconds > 0:
+            expires_at = (dt.datetime.fromisoformat(now.replace("Z", "+00:00")) + dt.timedelta(seconds=self.tts_artifact_ttl_seconds)).isoformat(timespec="milliseconds")
         target = delivery_target_device_id or turn["delivery_target_device_id"] or turn["origin_device_id"]
         seq = self._next_delivery_seq_tx(conn, target)
         conn.execute(
-            "INSERT INTO tts_artifacts(artifact_id, turn_id, event_id, event_kind, artifact_version, output_kind, origin_device_id, delivery_target_device_id, source_text, status, delivery_seq, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', ?, ?, ?)",
-            (artifact_id, turn_id, event_id, event_kind, artifact_version, output_kind, turn["origin_device_id"], target, source_text, seq, now, now),
+            "INSERT INTO tts_artifacts(artifact_id, turn_id, event_id, event_kind, artifact_version, output_kind, origin_device_id, delivery_target_device_id, source_text, content_type, expires_at, relay_state, status, delivery_seq, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'audio/mpeg', ?, 'PENDING', 'PENDING', ?, ?, ?)",
+            (artifact_id, turn_id, event_id, event_kind, artifact_version, output_kind, turn["origin_device_id"], target, source_text, expires_at, seq, now, now),
         )
         return _row(conn.execute("SELECT * FROM tts_artifacts WHERE artifact_id=?", (artifact_id,)).fetchone()) or {}
 
@@ -928,6 +1235,11 @@ class RecorderStore:
                     item["text"] = self.read_part(turn_id, item["part_id"]).decode("utf-8")
                 except UnicodeDecodeError:
                     item["text"] = ""
+            elif item["status"] == "COMPLETE" and item.get("whole_stream_sha256"):
+                item["reference"] = (
+                    f"recorder://v1/turns/{quote(turn_id, safe='')}/parts/"
+                    f"{quote(item['part_id'], safe='')}?sha256={item['whole_stream_sha256']}"
+                )
             parts.append(item)
         text_values = [item["text"] for item in parts if item.get("kind") == "text" and item.get("text") is not None]
         input_text = turn["transcript"] or "\n".join(text_values)
@@ -997,6 +1309,18 @@ class RecorderStore:
             turn = self._turn_row(conn, turn_id)
             existing = conn.execute("SELECT * FROM route_receipts WHERE turn_id=?", (turn_id,)).fetchone()
             if existing is not None:
+                if any(
+                    existing[key] != value
+                    for key, value in {
+                        "route_decision_id": decision.route_decision_id,
+                        "project_id": decision.project_id,
+                        "session_key": decision.session_key,
+                        "project_record_version": decision.project_record_version,
+                        "routed_text": decision.routed_text,
+                        "decision_reason_code": decision.decision_reason_code,
+                    }.items()
+                ):
+                    raise ConflictError("route receipt is immutable")
                 return self._turn_payload(conn, turn_id)
             self._assert_router_lease_tx(conn, turn_id, owner, now)
             if turn["state"] not in {"ACCEPTED", "ROUTING", "RETRY_WAIT"}:
@@ -1360,6 +1684,7 @@ class RecorderStore:
         turn_id: str,
         event_id: str,
         *,
+        user_id: str | None = None,
         device_id: str,
         event_version: int,
         payload_sha256: str,
@@ -1368,6 +1693,7 @@ class RecorderStore:
         now = now or utc_now()
         with self._tx() as conn:
             turn = self._turn_row(conn, turn_id)
+            self._assert_resource_owner_tx(conn, turn["user_id"], user_id, device_id)
             self._assert_device(conn, turn["user_id"], device_id)
             event = conn.execute("SELECT * FROM events WHERE event_id=? AND turn_id=?", (event_id, turn_id)).fetchone()
             if event is None:
@@ -1404,17 +1730,26 @@ class RecorderStore:
                     conn.execute("UPDATE outbox SET payload_json='{}' WHERE event_id=?", (event_id,))
             return self._turn_payload(conn, turn_id)
 
-    def pending_outbox(self, device_id: str, *, limit: int = 50) -> list[dict[str, Any]]:
+    def pending_outbox(
+        self,
+        device_id: str,
+        *,
+        user_id: str | None = None,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        if not isinstance(user_id, str) or not user_id:
+            raise UnauthorizedError("outbox reads require an authenticated user and device")
         with self._read() as conn:
+            self._assert_device(conn, user_id, device_id)
             rows = conn.execute(
-                "SELECT * FROM outbox WHERE required_device_id=? AND state='PENDING' ORDER BY turn_event_seq, created_at LIMIT ?",
-                (device_id, limit * 4),
+                "SELECT o.* FROM outbox o JOIN turns t ON t.turn_id=o.turn_id WHERE o.required_device_id=? AND t.user_id=? AND o.state='PENDING' ORDER BY o.turn_event_seq, o.created_at LIMIT ?",
+                (device_id, user_id, limit * 4),
             ).fetchall()
             result: list[dict[str, Any]] = []
             for row in rows:
                 blocked = conn.execute(
-                    "SELECT 1 FROM outbox WHERE required_device_id=? AND turn_id=? AND turn_event_seq < ? AND state='PENDING' LIMIT 1",
-                    (device_id, row["turn_id"], row["turn_event_seq"]),
+                    "SELECT 1 FROM outbox o JOIN turns t ON t.turn_id=o.turn_id WHERE o.required_device_id=? AND o.turn_id=? AND t.user_id=? AND o.turn_event_seq < ? AND o.state='PENDING' LIMIT 1",
+                    (device_id, row["turn_id"], user_id, row["turn_event_seq"]),
                 ).fetchone()
                 if blocked:
                     continue
@@ -1425,20 +1760,28 @@ class RecorderStore:
                     break
             return result
 
-    def get_event(self, event_id: str) -> dict[str, Any]:
+    def get_event(self, event_id: str, *, user_id: str | None = None, device_id: str | None = None) -> dict[str, Any]:
         with self._read() as conn:
-            row = conn.execute("SELECT * FROM events WHERE event_id=?", (event_id,)).fetchone()
+            row = conn.execute(
+                "SELECT e.*, t.user_id, t.origin_device_id FROM events e JOIN turns t ON t.turn_id=e.turn_id WHERE e.event_id=?",
+                (event_id,),
+            ).fetchone()
             if row is None:
                 raise NotFoundError("event not found")
+            self._assert_resource_owner_tx(conn, row["user_id"], user_id, device_id)
             result = _row(row) or {}
             result["payload"] = _loads(result.pop("payload_json"), {})
             return result
 
-    def get_artifact(self, artifact_id: str) -> dict[str, Any]:
+    def get_artifact(self, artifact_id: str, *, user_id: str | None = None, device_id: str | None = None) -> dict[str, Any]:
         with self._read() as conn:
-            row = conn.execute("SELECT * FROM tts_artifacts WHERE artifact_id=?", (artifact_id,)).fetchone()
+            row = conn.execute(
+                "SELECT a.*, t.user_id FROM tts_artifacts a JOIN turns t ON t.turn_id=a.turn_id WHERE a.artifact_id=?",
+                (artifact_id,),
+            ).fetchone()
             if row is None:
                 raise NotFoundError("TTS artifact not found")
+            self._assert_resource_owner_tx(conn, row["user_id"], user_id, device_id)
             return _row(row) or {}
 
     def _read_tts(
@@ -1446,6 +1789,7 @@ class RecorderStore:
         artifact_id: str,
         *,
         device_id: str,
+        user_id: str | None = None,
         allow_phone_bridge: bool,
         require_phone_bridge: bool = False,
     ) -> tuple[dict[str, Any], bytes]:
@@ -1456,6 +1800,7 @@ class RecorderStore:
             ).fetchone()
             if row is None:
                 raise NotFoundError("TTS artifact not found")
+            self._assert_resource_owner_tx(conn, row["user_id"], user_id, device_id)
             self._assert_device(conn, row["user_id"], device_id)
             bridge = None
             if allow_phone_bridge:
@@ -1469,42 +1814,116 @@ class RecorderStore:
             if target != device_id:
                 if not allow_phone_bridge or bridge is None or bridge["kind"] != "phone":
                     raise UnauthorizedError("TTS payload is bound to its delivery target or an authenticated Phone bridge")
-            if row["status"] not in {"READY", "DELIVERY_PENDING", "EXPIRED"} or not row["storage_path"]:
+            if row["status"] not in {"READY", "DELIVERY_PENDING"} or not row["storage_path"]:
                 raise NotReadyError("TTS artifact is not ready")
             path = Path(row["storage_path"])
-            if not path.exists():
-                raise NotReadyError("TTS spool is no longer available")
+            from .features import FeatureGroups
+
+            audio = FeatureGroups._read_managed_bytes(
+                self.storage_root,
+                path,
+                expected_size=row["byte_size"],
+                expected_sha256=row["payload_sha256"],
+            )
             metadata = _row(row) or {}
             metadata.pop("source_text", None)
             metadata.pop("user_id", None)
-            return metadata, path.read_bytes()
+            metadata.pop("storage_path", None)
+            raw_provider_metadata = metadata.pop("provider_metadata_json", None)
+            if raw_provider_metadata:
+                with contextlib.suppress(json.JSONDecodeError):
+                    metadata["provider_metadata"] = json.loads(raw_provider_metadata)
+            return metadata, audio
 
-    def read_tts(self, artifact_id: str, *, device_id: str) -> tuple[dict[str, Any], bytes]:
+    def read_tts(
+        self,
+        artifact_id: str,
+        *,
+        device_id: str,
+        user_id: str | None = None,
+    ) -> tuple[dict[str, Any], bytes]:
         """Read target audio or allow an active registered Phone to bridge it."""
-        return self._read_tts(artifact_id, device_id=device_id, allow_phone_bridge=True)
+        return self._read_tts(artifact_id, user_id=user_id, device_id=device_id, allow_phone_bridge=True)
 
-    def read_tts_for_bridge(self, artifact_id: str, *, bridge_device_id: str) -> tuple[dict[str, Any], bytes]:
+    def read_tts_for_bridge(
+        self,
+        artifact_id: str,
+        *,
+        bridge_device_id: str,
+        user_id: str | None = None,
+    ) -> tuple[dict[str, Any], bytes]:
         """Read target audio through the authenticated registered Phone bridge."""
-        return self._read_tts(artifact_id, device_id=bridge_device_id, allow_phone_bridge=True, require_phone_bridge=True)
+        return self._read_tts(
+            artifact_id,
+            user_id=user_id,
+            device_id=bridge_device_id,
+            allow_phone_bridge=True,
+            require_phone_bridge=True,
+        )
 
     def set_tts_result(self, artifact_id: str, result: TTSResult | Mapping[str, Any] | None, *, error: str | None = None) -> dict[str, Any]:
         if result is not None and not isinstance(result, TTSResult):
             result = TTSResult(**dict(result))
+        if result is not None:
+            if not isinstance(result.audio, bytes) or not result.audio:
+                raise ValidationError("TTS result must contain non-empty bytes")
+            if len(result.audio) > self.max_audio_bytes:
+                raise ValidationError("TTS result exceeds the configured audio limit")
+            if not isinstance(result.mode, str) or result.mode != "file":
+                raise ValidationError("TTS result mode must be file")
+            if not isinstance(result.content_type, str) or not re.fullmatch(r"audio/[A-Za-z0-9.+-]+", result.content_type):
+                raise ValidationError("TTS result content type must be an audio MIME type")
+            metadata = result.metadata if isinstance(result.metadata, Mapping) else {}
+            expected_hash = metadata.get("output_sha256")
+            if expected_hash is not None and expected_hash != sha256_bytes(result.audio):
+                raise ValidationError("TTS output hash does not match the audio bytes")
+            expected_size = metadata.get("byte_size")
+            if expected_size is not None and (not isinstance(expected_size, int) or isinstance(expected_size, bool) or expected_size != len(result.audio)):
+                raise ValidationError("TTS byte size does not match the audio bytes")
+            metadata_type = metadata.get("content_type")
+            if metadata_type is not None and metadata_type != result.content_type:
+                raise ValidationError("TTS content type receipt does not match the audio")
         path: Path | None = None
         with self._tx() as conn:
             artifact = conn.execute("SELECT * FROM tts_artifacts WHERE artifact_id=?", (artifact_id,)).fetchone()
             if artifact is None:
                 raise NotFoundError("TTS artifact not found")
-            if error is not None or result is None or not result.audio:
-                conn.execute("UPDATE tts_artifacts SET status='FAILED_GENERATION', updated_at=? WHERE artifact_id=?", (utc_now(), artifact_id))
+            if artifact["status"] in {"READY", "DELIVERY_PENDING", "PLAYED", "EXPIRED"}:
+                return _row(artifact) or {}
+            if error is not None or result is None:
+                now = utc_now()
+                safe_error = error if isinstance(error, str) and re.fullmatch(r"[a-z][a-z0-9_.-]{0,63}", error) else "generation_failed"
+                conn.execute("UPDATE tts_artifacts SET status='FAILED_GENERATION', relay_state='PENDING', retention_outcome='generation_failed', provider_metadata_json=?, updated_at=? WHERE artifact_id=?", (_json({"error_kind": safe_error}), now, artifact_id))
                 return _row(conn.execute("SELECT * FROM tts_artifacts WHERE artifact_id=?", (artifact_id,)).fetchone()) or {}
             digest = sha256_bytes(result.audio)
             turn = self._turn_row(conn, artifact["turn_id"])
+            source_text = artifact["source_text"]
+            if not isinstance(source_text, str) or not source_text:
+                raise ConflictError("TTS source text is unavailable")
+            input_hash = sha256_bytes(source_text.encode("utf-8"))
+            metadata = result.metadata if isinstance(result.metadata, Mapping) else {}
+            expected_input_hash = metadata.get("input_sha256")
+            if expected_input_hash is not None and expected_input_hash != input_hash:
+                raise ValidationError("TTS input hash does not match the artifact source")
             path = self._turn_dir(turn["user_id"], turn["turn_id"]) / "tts" / f"{artifact_id}.audio"
             self._safe_write(path, result.audio)
+            allowed_metadata = {}
+            allowed_keys = ("provider", "model", "voice", "language", "mode", "hermes_profile", "endpoint_contract", "input_sha256", "output_sha256", "attempt_identity", "chain_generation", "chain_fingerprint", "winner", "source", "fallback_count", "retry_count", "byte_size", "content_type")
+            for key in allowed_keys:
+                value = metadata.get(key)
+                if isinstance(value, str) and value and len(value) <= 256:
+                    allowed_metadata[key] = value
+                elif isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= 10_000_000:
+                    allowed_metadata[key] = value
+            allowed_metadata["input_sha256"] = input_hash
+            allowed_metadata["output_sha256"] = digest
+            allowed_metadata["byte_size"] = len(result.audio)
+            allowed_metadata["content_type"] = result.content_type
+            provider_name = allowed_metadata.get("provider")
+            now = utc_now()
             conn.execute(
-                "UPDATE tts_artifacts SET payload_sha256=?, storage_path=?, source_text=NULL, status='READY', mode=?, updated_at=? WHERE artifact_id=?",
-                (digest, str(path), result.mode, utc_now(), artifact_id),
+                "UPDATE tts_artifacts SET payload_sha256=?, byte_size=?, storage_path=?, source_text=NULL, content_type=?, provider_name=?, provider_metadata_json=?, hermes_profile=?, endpoint_contract=?, input_sha256=?, attempt_identity=?, relay_state='PENDING', retention_outcome=NULL, status='READY', mode=?, completed_at=?, updated_at=? WHERE artifact_id=?",
+                (digest, len(result.audio), str(path), result.content_type, provider_name, _json(allowed_metadata), allowed_metadata.get("hermes_profile"), allowed_metadata.get("endpoint_contract"), input_hash, allowed_metadata.get("attempt_identity"), result.mode, now, now, artifact_id),
             )
             return _row(conn.execute("SELECT * FROM tts_artifacts WHERE artifact_id=?", (artifact_id,)).fetchone()) or {}
 
@@ -1513,10 +1932,18 @@ class RecorderStore:
             row = conn.execute("SELECT * FROM tts_artifacts WHERE artifact_id=?", (artifact_id,)).fetchone()
             if row is None:
                 raise NotFoundError("TTS artifact not found")
-            conn.execute("UPDATE tts_artifacts SET source_text=NULL, status='EXPIRED', updated_at=? WHERE artifact_id=? AND status != 'PLAYED'", (utc_now(), artifact_id))
+            now = utc_now()
+            conn.execute("UPDATE tts_artifacts SET source_text=NULL, status='EXPIRED', relay_state='EXPIRED', retention_outcome='expired', updated_at=? WHERE artifact_id=? AND status != 'PLAYED'", (now, artifact_id))
             return _row(conn.execute("SELECT * FROM tts_artifacts WHERE artifact_id=?", (artifact_id,)).fetchone()) or {}
 
-    def relay_tts_received(self, artifact_id: str, *, device_id: str, payload_sha256: str) -> dict[str, Any]:
+    def relay_tts_received(
+        self,
+        artifact_id: str,
+        *,
+        device_id: str,
+        payload_sha256: str,
+        user_id: str | None = None,
+    ) -> dict[str, Any]:
         with self._tx() as conn:
             artifact = conn.execute(
                 "SELECT a.*, t.user_id FROM tts_artifacts a JOIN turns t ON t.turn_id=a.turn_id WHERE a.artifact_id=?",
@@ -1524,6 +1951,7 @@ class RecorderStore:
             ).fetchone()
             if artifact is None:
                 raise NotFoundError("TTS artifact not found")
+            self._assert_resource_owner_tx(conn, artifact["user_id"], user_id, device_id)
             self._assert_device(conn, artifact["user_id"], device_id)
             target = artifact["delivery_target_device_id"] or artifact["origin_device_id"]
             if target == device_id:
@@ -1533,13 +1961,21 @@ class RecorderStore:
             journal = conn.execute(
                 "SELECT state FROM playback_journal WHERE artifact_id=?", (artifact_id,)
             ).fetchone()
+            # Relay delivery is deliberately not playback completion, but a
+            # late relay receipt must remain idempotent after the target has
+            # already played the artifact (including after a fresh store
+            # connection).  Check the terminal journal before the READY gate.
             if artifact["status"] == "PLAYED" or (journal is not None and journal["state"] == "PLAYED"):
                 return _row(artifact) or {}
+            if artifact["status"] not in {"READY", "DELIVERY_PENDING"} or not artifact["payload_sha256"]:
+                raise NotReadyError("TTS artifact has no generated delivery receipt")
             conn.execute(
                 "INSERT OR REPLACE INTO playback_journal(artifact_id, device_id, payload_sha256, state, recorded_at) VALUES (?, ?, ?, 'RELAY_RECEIVED', ?)",
                 (artifact_id, device_id, payload_sha256, utc_now()),
             )
-            return _row(artifact) or {}
+            received_at = utc_now()
+            conn.execute("UPDATE tts_artifacts SET relay_state='RELAY_RECEIVED', status=CASE WHEN status='PENDING' THEN 'DELIVERY_PENDING' ELSE status END, updated_at=? WHERE artifact_id=?", (received_at, artifact_id))
+            return _row(conn.execute("SELECT * FROM tts_artifacts WHERE artifact_id=?", (artifact_id,)).fetchone()) or {}
 
     def ack_playback(
         self,
@@ -1549,6 +1985,7 @@ class RecorderStore:
         payload_sha256: str,
         turn_id: str | None = None,
         artifact_version: int | None = None,
+        user_id: str | None = None,
     ) -> dict[str, Any]:
         if not isinstance(turn_id, str) or not turn_id:
             raise ValidationError("turn_id is required for playback completion")
@@ -1564,6 +2001,7 @@ class RecorderStore:
             ).fetchone()
             if artifact is None:
                 raise NotFoundError("TTS artifact not found")
+            self._assert_resource_owner_tx(conn, artifact["user_id"], user_id, device_id)
             self._assert_device(conn, artifact["user_id"], device_id)
             if artifact["turn_id"] != turn_id:
                 raise UnauthorizedError("artifact does not belong to turn")
@@ -1588,12 +2026,13 @@ class RecorderStore:
                 "INSERT OR REPLACE INTO playback_journal(artifact_id, device_id, payload_sha256, state, recorded_at) VALUES (?, ?, ?, 'PLAYED', ?)",
                 (artifact_id, device_id, payload_sha256, utc_now()),
             )
-            conn.execute("UPDATE tts_artifacts SET status='PLAYED', played_at=?, updated_at=? WHERE artifact_id=?", (utc_now(), utc_now(), artifact_id))
+            played_at = utc_now()
+            conn.execute("UPDATE tts_artifacts SET status='PLAYED', relay_state='PLAYED', playback_ack_at=?, retention_outcome='deleted_after_playback', played_at=?, updated_at=? WHERE artifact_id=?", (played_at, played_at, played_at, artifact_id))
             path = Path(artifact["storage_path"]) if artifact["storage_path"] else None
             result = _row(conn.execute("SELECT * FROM tts_artifacts WHERE artifact_id=?", (artifact_id,)).fetchone()) or {}
         if path:
-            with contextlib.suppress(FileNotFoundError):
-                path.unlink()
+            with contextlib.suppress(FileNotFoundError, OSError, RecorderError):
+                self._safe_unlink(path)
         return result
 
     @staticmethod
@@ -1630,9 +2069,24 @@ class RecorderStore:
             result["parent_turn"] = self._turn_payload(conn, result["parent_turn_id"])
         return result
 
-    def get_schedule(self, schedule_id: str) -> dict[str, Any]:
+    def get_schedule(
+        self,
+        schedule_id: str,
+        *,
+        user_id: str | None = None,
+        device_id: str | None = None,
+    ) -> dict[str, Any]:
         schedule_id = self._schedule_identifier(schedule_id, "schedule_id")
         with self._read() as conn:
+            owner = conn.execute(
+                "SELECT s.user_id, s.origin_device_id FROM schedules s WHERE s.schedule_id=?",
+                (schedule_id,),
+            ).fetchone()
+            if owner is None:
+                raise NotFoundError("schedule not found")
+            self._assert_resource_owner_tx(conn, owner["user_id"], user_id, device_id)
+            if user_id is not None and owner["origin_device_id"] != device_id:
+                raise UnauthorizedError("schedule is not owned by the authenticated origin device")
             return self._schedule_payload(conn, schedule_id)
 
     def _commit_schedule_confirmation_tx(
@@ -2170,7 +2624,7 @@ class RecorderStore:
             )
 
     def set_asr_stage(self, turn_id: str, *, expected_generation: int, stage: str) -> int | None:
-        if stage not in {"realtime", "batch", "local"}:
+        if stage not in {"realtime", "batch", "local", "provider-chain"}:
             raise ValidationError("unsupported ASR stage")
         with self._tx() as conn:
             self._turn_row(conn, turn_id)
@@ -2195,9 +2649,21 @@ class RecorderStore:
             turn = self._turn_row(conn, turn_id)
             if turn["asr_generation"] != expected_generation or turn["asr_stage"] != stage:
                 return False
+            receipt = result.metadata if isinstance(result.metadata, Mapping) else {}
+            mode = receipt.get("mode") if isinstance(receipt.get("mode"), str) else None
+            provider_name = receipt.get("provider") if isinstance(receipt.get("provider"), str) else None
+            hermes_profile = receipt.get("hermes_profile") if isinstance(receipt.get("hermes_profile"), str) else None
+            endpoint_contract = receipt.get("endpoint_contract") if isinstance(receipt.get("endpoint_contract"), str) else None
+            input_sha = receipt.get("input_sha256") if isinstance(receipt.get("input_sha256"), str) else None
+            output_sha = receipt.get("output_sha256") if isinstance(receipt.get("output_sha256"), str) else (sha256_bytes(result.transcript.encode("utf-8")) if result.transcript else None)
+            content_type = receipt.get("content_type") if isinstance(receipt.get("content_type"), str) else None
+            byte_size = receipt.get("byte_size") if isinstance(receipt.get("byte_size"), int) else None
+            attempt_identity = receipt.get("attempt_identity") if isinstance(receipt.get("attempt_identity"), str) else str(uuid.uuid4())
+            completion = utc_now()
+            safe_detail = result.detail if isinstance(result.detail, str) and re.fullmatch(r"[a-z][a-z0-9_.-]{0,63}", result.detail) else None
             conn.execute(
-                "INSERT INTO asr_attempts(attempt_id, turn_id, generation, stage, outcome, detail, transcript, committed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (str(uuid.uuid4()), turn_id, expected_generation, stage, result.outcome, result.detail, result.transcript, utc_now()),
+                "INSERT INTO asr_attempts(attempt_id, turn_id, generation, stage, outcome, detail, transcript, mode, provider_name, hermes_profile, endpoint_contract, input_sha256, output_sha256, content_type, byte_size, attempt_identity, completed_at, committed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (str(uuid.uuid4()), turn_id, expected_generation, stage, result.outcome, safe_detail, None, mode, provider_name, hermes_profile, endpoint_contract, input_sha, output_sha, content_type, byte_size, attempt_identity, completion, completion),
             )
             if not authoritative:
                 return True
@@ -2220,10 +2686,10 @@ class RecorderStore:
             deletion_complete = True
             for path in paths:
                 try:
-                    path.unlink()
+                    self._safe_unlink(path)
                 except FileNotFoundError:
                     pass
-                except OSError:
+                except (OSError, RecorderError):
                     deletion_complete = False
             if deletion_complete:
                 with self._tx() as conn:
@@ -2240,10 +2706,10 @@ class RecorderStore:
         complete = True
         for path in paths:
             try:
-                path.unlink()
+                self._safe_unlink(path)
             except FileNotFoundError:
                 pass
-            except OSError:
+            except (OSError, RecorderError):
                 complete = False
         if complete:
             with self._tx() as conn:
@@ -2290,6 +2756,15 @@ class RecorderStore:
         for pending_turn_id in source_pending:
             if self.retry_source_deletion(pending_turn_id):
                 result["source_deletions_retried"] += 1
+        cleanup = self.recover_cleanup_receipts(now=now)
+        result.update(
+            {
+                "cleanup_receipts_attempted": cleanup["attempted"],
+                "cleanup_receipts_completed": cleanup["completed"],
+                "cleanup_receipts_pending": cleanup["pending"],
+                "cleanup_receipts_blocked": cleanup["blocked"],
+            }
+        )
         return result
 
     def release_session_ingress(self, submission_id: str, *, owner: str) -> bool:
@@ -2411,11 +2886,20 @@ class RecorderStore:
                 raise ConflictError("project archive compare-and-set failed")
             return self._project_payload(conn.execute("SELECT * FROM projects WHERE stable_project_id=?", (project_id,)).fetchone())
 
-    def archive_turn(self, user_id: str, turn_id: str, *, source: str) -> dict[str, Any]:
+    def archive_turn(
+        self,
+        user_id: str,
+        turn_id: str,
+        *,
+        source: str,
+        device_id: str | None = None,
+    ) -> dict[str, Any]:
         with self._tx() as conn:
             turn = self._turn_row(conn, turn_id)
             if turn["user_id"] != user_id:
                 raise UnauthorizedError("turn belongs to another user")
+            if device_id is not None:
+                self._assert_turn_owner_tx(conn, turn, user_id, device_id)
             now = utc_now()
             conn.execute("UPDATE turns SET archived_at=?, updated_at=? WHERE turn_id=?", (now, now, turn_id))
             conn.execute(
@@ -2424,7 +2908,131 @@ class RecorderStore:
             )
             return self._turn_payload(conn, turn_id)
 
+    # ---- Feature groups 1-8 facade ---------------------------------------
+
+    def enqueue_worker_job(self, **kwargs: Any) -> dict[str, Any]:
+        return self._features.enqueue_worker_job(**kwargs)
+
+    def get_worker_job(self, job_id: str) -> dict[str, Any]:
+        return self._features.get_worker_job(job_id)
+
+    def list_worker_jobs(self, **kwargs: Any) -> list[dict[str, Any]]:
+        return self._features.list_worker_jobs(**kwargs)
+
+    def worker_health(self, **kwargs: Any) -> dict[str, Any]:
+        return self._features.worker_health(**kwargs)
+
+    def claim_worker_job(self, owner: str, **kwargs: Any) -> dict[str, Any] | None:
+        return self._features.claim_worker_job(owner, **kwargs)
+
+    def renew_worker_lease(self, job_id: str, owner: str, **kwargs: Any) -> bool:
+        return self._features.renew_worker_lease(job_id, owner, **kwargs)
+
+    def complete_worker_job(self, job_id: str, owner: str, receipt: Mapping[str, Any], **kwargs: Any) -> dict[str, Any]:
+        return self._features.complete_worker_job(job_id, owner, receipt, **kwargs)
+
+    def fail_worker_job(self, job_id: str, owner: str, **kwargs: Any) -> dict[str, Any]:
+        return self._features.fail_worker_job(job_id, owner, **kwargs)
+
+    def recover_worker_jobs(self, **kwargs: Any) -> dict[str, int]:
+        return self._features.recover_worker_jobs(**kwargs)
+
+    def list_worker_attempts(self, job_id: str, **kwargs: Any) -> list[dict[str, Any]]:
+        return self._features.list_worker_attempts(job_id, **kwargs)
+
+    # Short aliases for callers that use the generic worker vocabulary.
+    enqueue_job = enqueue_worker_job
+    get_job = get_worker_job
+    list_jobs = list_worker_jobs
+    claim_job = claim_worker_job
+    complete_job = complete_worker_job
+    fail_job = fail_worker_job
+    recover_jobs = recover_worker_jobs
+
+    def publish_update_manifest(self, **kwargs: Any) -> dict[str, Any]:
+        return self._features.publish_update_manifest(**kwargs)
+
+    def get_update_manifest(self, channel: str, generation: int | None = None) -> dict[str, Any]:
+        return self._features.get_update_manifest(channel, generation)
+
+    def read_update_artifact(self, channel: str, generation: int, artifact_name: str, **kwargs: Any) -> dict[str, Any]:
+        return self._features.read_update_artifact(channel, generation, artifact_name, **kwargs)
+
+    def history_read_model(self, user_id: str, **kwargs: Any) -> dict[str, Any]:
+        return self._features.history_read_model(user_id, **kwargs)
+
+    read_history = history_read_model
+
+    def attachment_reference(self, turn_id: str, part_id: str) -> str:
+        return self._features.attachment_reference(turn_id, part_id)
+
+    def resolve_attachment_reference(self, reference: str) -> dict[str, Any]:
+        return self._features.resolve_attachment_reference(reference)
+
+    def start_eavesdrop(self, user_id: str, phone_device_id: str, **kwargs: Any) -> dict[str, Any]:
+        return self._features.start_eavesdrop(user_id, phone_device_id, **kwargs)
+
+    def get_eavesdrop_session(self, session_id: str, **kwargs: Any) -> dict[str, Any]:
+        return self._features.get_eavesdrop_session(session_id, **kwargs)
+
+    def activate_eavesdrop(self, session_id: str, user_id: str, phone_device_id: str, **kwargs: Any) -> dict[str, Any]:
+        return self._features.activate_eavesdrop(session_id, user_id, phone_device_id, **kwargs)
+
+    def pause_eavesdrop(self, session_id: str, user_id: str, phone_device_id: str, **kwargs: Any) -> dict[str, Any]:
+        return self._features.pause_eavesdrop(session_id, user_id, phone_device_id, **kwargs)
+
+    def resume_eavesdrop(self, session_id: str, user_id: str, phone_device_id: str, **kwargs: Any) -> dict[str, Any]:
+        return self._features.resume_eavesdrop(session_id, user_id, phone_device_id, **kwargs)
+
+    def begin_stop_eavesdrop(self, session_id: str, user_id: str, phone_device_id: str, **kwargs: Any) -> dict[str, Any]:
+        return self._features.begin_stop_eavesdrop(session_id, user_id, phone_device_id, **kwargs)
+
+    def stop_eavesdrop(self, session_id: str, user_id: str, phone_device_id: str, **kwargs: Any) -> dict[str, Any]:
+        return self._features.stop_eavesdrop(session_id, user_id, phone_device_id, **kwargs)
+
+    def append_eavesdrop_segment(self, session_id: str, user_id: str, phone_device_id: str, **kwargs: Any) -> dict[str, Any]:
+        return self._features.append_eavesdrop_segment(session_id, user_id, phone_device_id, **kwargs)
+
+    def route_eavesdrop_segment(self, session_id: str, user_id: str, phone_device_id: str, **kwargs: Any) -> dict[str, Any]:
+        return self._features.route_eavesdrop_segment(session_id, user_id, phone_device_id, **kwargs)
+
+    def list_eavesdrop_decisions(self, session_id: str, **kwargs: Any) -> list[dict[str, Any]]:
+        return self._features.list_eavesdrop_decisions(session_id, **kwargs)
+
+    def mark_eavesdrop_decision(self, session_id: str, segment_sequence: int, **kwargs: Any) -> dict[str, Any]:
+        return self._features.mark_eavesdrop_decision(session_id, segment_sequence, **kwargs)
+
+    def record_eavesdrop_reply(self, session_id: str, **kwargs: Any) -> dict[str, Any]:
+        return self._features.record_eavesdrop_reply(session_id, **kwargs)
+
+    def list_eavesdrop_replies(self, session_id: str, **kwargs: Any) -> list[dict[str, Any]]:
+        return self._features.list_eavesdrop_replies(session_id, **kwargs)
+
+    def recover_eavesdrop(self, **kwargs: Any) -> dict[str, int]:
+        return self._features.recover_eavesdrop(**kwargs)
+
+    def record_diagnostics_opt_in(self, user_id: str, device_id: str, **kwargs: Any) -> dict[str, Any]:
+        return self._features.record_diagnostics_opt_in(user_id, device_id, **kwargs)
+
+    def ingest_diagnostic_event(self, user_id: str, device_id: str, **kwargs: Any) -> dict[str, Any]:
+        return self._features.ingest_diagnostic_event(user_id, device_id, **kwargs)
+
+    def ingest_diagnostic_bundle(self, user_id: str, device_id: str, bundle_id: str, compressed: bytes, **kwargs: Any) -> dict[str, Any]:
+        return self._features.ingest_diagnostic_bundle(user_id, device_id, bundle_id, compressed, **kwargs)
+
+    def list_diagnostics(self, user_id: str, device_id: str, **kwargs: Any) -> dict[str, Any]:
+        return self._features.list_diagnostics(user_id, device_id, **kwargs)
+
+    def export_diagnostics(self, user_id: str, device_id: str) -> dict[str, Any]:
+        return self._features.export_diagnostics(user_id, device_id)
+
+    def delete_diagnostics(self, user_id: str, device_id: str, **kwargs: Any) -> dict[str, int]:
+        return self._features.delete_diagnostics(user_id, device_id, **kwargs)
+
+    def purge_diagnostics(self, **kwargs: Any) -> dict[str, int]:
+        return self._features.purge_diagnostics(**kwargs)
+
     def db_snapshot(self) -> dict[str, int]:
-        tables = ["turns", "turn_parts", "turn_chunks", "events", "outbox", "router_queue", "projects", "session_ingress", "hermes_results", "final_versions", "tts_artifacts", "asr_attempts", "schedules", "schedule_occurrences"]
+        tables = ["turns", "turn_parts", "turn_chunks", "events", "outbox", "router_queue", "projects", "session_ingress", "hermes_results", "final_versions", "tts_artifacts", "asr_attempts", "schedules", "schedule_occurrences", "worker_jobs", "worker_attempts", "update_channels", "update_manifests", "eavesdrop_sessions", "eavesdrop_segments", "eavesdrop_replies", "eavesdrop_decisions", "diagnostics_consents", "diagnostic_events", "diagnostic_bundles", "diagnostic_tombstones", "storage_cleanup_receipts"]
         with self._read() as conn:
             return {table: conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] for table in tables}

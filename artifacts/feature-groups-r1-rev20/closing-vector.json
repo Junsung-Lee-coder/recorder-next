@@ -1,0 +1,439 @@
+{
+  "entry_count": 72,
+  "phase": "CLOSING",
+  "rows": [
+    {
+      "mode": "0444",
+      "path": "candidate-manifest.json",
+      "sha256": "1d07de23aec8028b95adeef1f151980e831790fabc366a258354a331e1a43f05",
+      "size": 32955
+    },
+    {
+      "mode": "0444",
+      "path": "candidate/.gitignore",
+      "sha256": "477e4934340bf0614f635c8d49c7bdfbd8162522181ba1298f542a552ada7faa",
+      "size": 87
+    },
+    {
+      "mode": "0444",
+      "path": "candidate/README.md",
+      "sha256": "bf9c63f770d3f12d1e0c431d1a3788a24ef7c5c3c7ad105e42b5dda18009be34",
+      "size": 8188
+    },
+    {
+      "mode": "0444",
+      "path": "candidate/api/openapi.json",
+      "sha256": "81071d3eabaf017521d3b542d6f1bbd6048cdcac9e9c0abb7b12824da4cb0499",
+      "size": 15501
+    },
+    {
+      "mode": "0444",
+      "path": "candidate/config.example.toml",
+      "sha256": "615833bf1d1efea128345a19aee4ce892b27d4b020010b6009e2825f06dac568",
+      "size": 1345
+    },
+    {
+      "mode": "0444",
+      "path": "candidate/fixtures/deterministic.json",
+      "sha256": "6ad16c2388c70424b6aa965ac4b3ee3e8f0418452367aae5ba6b80c76e65556d",
+      "size": 774
+    },
+    {
+      "mode": "0444",
+      "path": "candidate/fixtures/generate_multimodal_fixtures.py",
+      "sha256": "97349e10c265546b6168a9b3c60d707cf4ac53ec129f761b772fb2525a8c5214",
+      "size": 8888
+    },
+    {
+      "mode": "0444",
+      "path": "candidate/fixtures/generated/data.csv",
+      "sha256": "2714a951f0bcfbf0180f0c63b4879fa9500fe7330d21dd7e32bb5531d58cf340",
+      "size": 24
+    },
+    {
+      "mode": "0444",
+      "path": "candidate/fixtures/generated/document.pdf",
+      "sha256": "d9b70d90a446261b0a16476cdf7789e2627d51cc5a705788e7658d3d78166e00",
+      "size": 612
+    },
+    {
+      "mode": "0444",
+      "path": "candidate/fixtures/generated/generic.bin",
+      "sha256": "0d41e776e8535fb2eb604bb99b57917b8096958511e93c48399c67c72561422e",
+      "size": 29
+    },
+    {
+      "mode": "0444",
+      "path": "candidate/fixtures/generated/image.png",
+      "sha256": "a30c5a0129e719554703f9eba9753d6c13e48ccc25ae2e409293948b54c3c9b2",
+      "size": 10662
+    },
+    {
+      "mode": "0444",
+      "path": "candidate/fixtures/generated/manifest.json",
+      "sha256": "63749132ae3afafdc7740060276524335e05aedeb32e2bff9f7073a7a6b88177",
+      "size": 3790
+    },
+    {
+      "mode": "0444",
+      "path": "candidate/fixtures/generated/text.txt",
+      "sha256": "d50b71e1f9aa6d98d485ec1426c412fd325dc634047b97097431f4433a11b5c9",
+      "size": 59
+    },
+    {
+      "mode": "0444",
+      "path": "candidate/fixtures/generated/voice_en.wav",
+      "sha256": "ebfcd54140b6b20a0f38dc592b5d4e51eb55a6e7d697c905585fe99024e87987",
+      "size": 110388
+    },
+    {
+      "mode": "0444",
+      "path": "candidate/fixtures/generated/voice_ko.wav",
+      "sha256": "ce54f2d8cdd9251b1add48176b247c2c9ab4386a956970f8fb1d8fee0cbe4a9f",
+      "size": 117928
+    },
+    {
+      "mode": "0444",
+      "path": "candidate/fixtures/scheduled-final-r5.json",
+      "sha256": "6cafd19c1489a7e9c600311875c2a117c9001faa9bb030f3ba379b96a9f1b20d",
+      "size": 1085
+    },
+    {
+      "mode": "0444",
+      "path": "candidate/migrations/001_initial.sql",
+      "sha256": "58232e880d5ba5e79526d0b0359cd87c3d8f9c78cf5082c78f307f09c2092afe",
+      "size": 9207
+    },
+    {
+      "mode": "0444",
+      "path": "candidate/migrations/002_scheduled_final.sql",
+      "sha256": "b58ce58dbe1b5ca49b3b3b47515d0b7170feb2c0264a9904aa17fb317fd00bba",
+      "size": 3003
+    },
+    {
+      "mode": "0444",
+      "path": "candidate/migrations/003_feature_groups.sql",
+      "sha256": "02d6ebf9e1a7e971d4cce805efbef43a80d195bd4d16c16b864cb1f794e31f5a",
+      "size": 8129
+    },
+    {
+      "mode": "0444",
+      "path": "candidate/migrations/004_eavesdrop_decisions.sql",
+      "sha256": "bb700c316eff6e982e12356db36525b4032a110dd8e4fd36d0a6c1554caf8292",
+      "size": 1410
+    },
+    {
+      "mode": "0444",
+      "path": "candidate/pyproject.toml",
+      "sha256": "5e1ca70ad3c64e41684968a7150235cad37775bc49dcc114820cf000d51a5964",
+      "size": 494
+    },
+    {
+      "mode": "0444",
+      "path": "candidate/recorder_next/__init__.py",
+      "sha256": "6729720ce5e1bc024ffa1d4af2fb9d99485263982db7937ee11cebb1fb17f62b",
+      "size": 406
+    },
+    {
+      "mode": "0444",
+      "path": "candidate/recorder_next/__main__.py",
+      "sha256": "6de783031f05e7c7449294ac0ea1359ebc40958a9f62eaca94dc1e2b0437447b",
+      "size": 1879
+    },
+    {
+      "mode": "0444",
+      "path": "candidate/recorder_next/adapters.py",
+      "sha256": "53f9cc2e30534bce8637c0867000c629ba001ab2108dd2294bd59c33da52089f",
+      "size": 62712
+    },
+    {
+      "mode": "0444",
+      "path": "candidate/recorder_next/canonical.py",
+      "sha256": "03059d6fd331146b92fa5bcdfa531dad7dbbbdce61eb18416db18b4ce811b8f3",
+      "size": 1684
+    },
+    {
+      "mode": "0444",
+      "path": "candidate/recorder_next/clock.py",
+      "sha256": "645b5925283e39af78d385413a6b43bf59fc861728495df4055d14819b561cf4",
+      "size": 1305
+    },
+    {
+      "mode": "0444",
+      "path": "candidate/recorder_next/config.py",
+      "sha256": "3bd88851561fd3228764451b775d2a83a336ec6b1ae1f1d8ad976f280ca26e1b",
+      "size": 46291
+    },
+    {
+      "mode": "0444",
+      "path": "candidate/recorder_next/errors.py",
+      "sha256": "523c89f2a46dcc668301691ad9338aca75a45460262338e7fccd094bdfc54c99",
+      "size": 1290
+    },
+    {
+      "mode": "0444",
+      "path": "candidate/recorder_next/features.py",
+      "sha256": "1730429c21c8773d5c56cc3eb167e2082b520743cb0ebf645d327fd3dec59805",
+      "size": 117795
+    },
+    {
+      "mode": "0444",
+      "path": "candidate/recorder_next/http.py",
+      "sha256": "3c2a3a2dde777870070daf857b7778ea9375dd2e834fd0a0525fa73afbbd66ab",
+      "size": 3691
+    },
+    {
+      "mode": "0444",
+      "path": "candidate/recorder_next/migrations/002_scheduled_final.sql",
+      "sha256": "a5faa37a8c11ddd6d8cc2a91f77beadaa973cf38209fef11d449cd022ec061a7",
+      "size": 2825
+    },
+    {
+      "mode": "0444",
+      "path": "candidate/recorder_next/migrations/003_feature_groups.sql",
+      "sha256": "87b480f8e7e83159c371b1dd31d837916d93574227a1941be3da02f1882ef9ad",
+      "size": 8128
+    },
+    {
+      "mode": "0444",
+      "path": "candidate/recorder_next/migrations/004_eavesdrop_decisions.sql",
+      "sha256": "bb700c316eff6e982e12356db36525b4032a110dd8e4fd36d0a6c1554caf8292",
+      "size": 1410
+    },
+    {
+      "mode": "0444",
+      "path": "candidate/recorder_next/models.py",
+      "sha256": "bce4a85af04caefc3f6691c917d2dffe0080858ac2bb30ff6d7a7b3f7f126e84",
+      "size": 1147
+    },
+    {
+      "mode": "0444",
+      "path": "candidate/recorder_next/openapi.py",
+      "sha256": "cba28482211180f8cab6b9fceeed92f80be7364caacbb5e1997d583b76688421",
+      "size": 10327
+    },
+    {
+      "mode": "0444",
+      "path": "candidate/recorder_next/schema.sql",
+      "sha256": "f89189b961db30758d9f6c0946070d603d2a290eadd43847a4affd3736845f1c",
+      "size": 19144
+    },
+    {
+      "mode": "0444",
+      "path": "candidate/recorder_next/service.py",
+      "sha256": "130a48db43b598aa53858f25de3129a96b6fe056df0b3867faad77ec76a6a74d",
+      "size": 72202
+    },
+    {
+      "mode": "0444",
+      "path": "candidate/recorder_next/store.py",
+      "sha256": "a8c5718b15e9bbb25e50899b451c1cabf8200a4fec6981ae579274ecd68715fb",
+      "size": 151209
+    },
+    {
+      "mode": "0444",
+      "path": "candidate/systemd/recorder-next.service",
+      "sha256": "f5b2353ec57d2ff8914b04c1993cb9b7e06337d7d218dedbba6989b9a80eace0",
+      "size": 543
+    },
+    {
+      "mode": "0444",
+      "path": "candidate/tests/test_adapters.py",
+      "sha256": "f1e025f943149b6568f9d6974b4005e82eab642187e2acd2e638c8322ca4df59",
+      "size": 7710
+    },
+    {
+      "mode": "0444",
+      "path": "candidate/tests/test_bearer_credential.py",
+      "sha256": "7e541dfe95798d3670fa8bea053b13afbfd9a9bfd84a19379feb639f3aa822b6",
+      "size": 6126
+    },
+    {
+      "mode": "0444",
+      "path": "candidate/tests/test_config.py",
+      "sha256": "16f0eab7c5340811c63e217f365b5e7a0e7dcb4d83d9cc36b15e674388e0366f",
+      "size": 560
+    },
+    {
+      "mode": "0444",
+      "path": "candidate/tests/test_core_contract.py",
+      "sha256": "f8d57439df1794edfe03eddf7d400f6080f008c7f8dbed9635fcdd2c4fee531d",
+      "size": 1794
+    },
+    {
+      "mode": "0444",
+      "path": "candidate/tests/test_extended_contract.py",
+      "sha256": "95117f55f34d82529059c39383418004fe2bebaa99c6c642d64010cc79e1081a",
+      "size": 20366
+    },
+    {
+      "mode": "0444",
+      "path": "candidate/tests/test_feature_groups.py",
+      "sha256": "1a00804e6fa18508d689dddb48d8205fdcc2b265cc78360d5ff7f5a1b8bf392f",
+      "size": 30083
+    },
+    {
+      "mode": "0444",
+      "path": "candidate/tests/test_generated_multimodal.py",
+      "sha256": "cab07b7f8eefbf83953ea52d8444359d773429f14387c7d215b9ce8310173a5f",
+      "size": 22430
+    },
+    {
+      "mode": "0444",
+      "path": "candidate/tests/test_limits.py",
+      "sha256": "7fccdb55ac0465ceb7bd00afe7e1a2604f7bd55c85f31182a47967c29e68da51",
+      "size": 2198
+    },
+    {
+      "mode": "0444",
+      "path": "candidate/tests/test_r1_repairs.py",
+      "sha256": "befbcdde607c9e9680b4627c307126b62066f41cff37bfb0894a9c833f56b889",
+      "size": 15266
+    },
+    {
+      "mode": "0444",
+      "path": "candidate/tests/test_reliability_contract.py",
+      "sha256": "2cd9d91033b65b22fc51cea56f8e556e42977b159b4fb4125c6a47bfa160cf16",
+      "size": 15971
+    },
+    {
+      "mode": "0444",
+      "path": "candidate/tests/test_scheduled_final.py",
+      "sha256": "1238d50a41da11c3661b682fffaee9448ee2a20e573d1607e969ab938d5bd683",
+      "size": 36877
+    },
+    {
+      "mode": "0444",
+      "path": "candidate/tests/test_store_contract.py",
+      "sha256": "20a1c01c3f62e7cef692816c9ab3f19da24584ac9b77c3d119af19c4e644ada0",
+      "size": 9739
+    },
+    {
+      "mode": "0444",
+      "path": "control/activation-packet.json",
+      "sha256": "2a6392a4907e1791c834d142b757c53bb993d4ffb8f941ac1e1ba189eb7b1a88",
+      "size": 28123
+    },
+    {
+      "mode": "0444",
+      "path": "control/activation_packet_check.py",
+      "sha256": "563acb2aada95ebe63e15963484a19bb9cd6f206f07c679288f790955604bec9",
+      "size": 1600
+    },
+    {
+      "mode": "0444",
+      "path": "control/build_candidate.py",
+      "sha256": "b3f14dc5bdef380c0bdac3b3e1c145060d8061422da1da7c5db9df2823522e6c",
+      "size": 28047
+    },
+    {
+      "mode": "0444",
+      "path": "control/control_contract.py",
+      "sha256": "4fbba4f4d6f36494bd2ff33838d01c7e909f3a55ce558e125418886a53b35ca6",
+      "size": 49688
+    },
+    {
+      "mode": "0444",
+      "path": "control/preflight_rev14.py",
+      "sha256": "5d489930a323e461f373c6efa9413cae9abd26fe743d37a39d33dfa0159242a5",
+      "size": 1105
+    },
+    {
+      "mode": "0444",
+      "path": "control/recorder-next.toml",
+      "sha256": "f12526861a56347bda9ad5911342f7a350fcf4e67ae28796868e0dbc1f28f73a",
+      "size": 777
+    },
+    {
+      "mode": "0444",
+      "path": "control/release_op.py",
+      "sha256": "e6ebc57cd81fff53dae88923eafb0f17b9f2fe554eceddc27315842031134a34",
+      "size": 88649
+    },
+    {
+      "mode": "0444",
+      "path": "control/test_activation_provenance_regressions.py",
+      "sha256": "651713c9a4d06892e5e289ba9a1236106a54f0d69968266dbf186cff9d6af445",
+      "size": 2386
+    },
+    {
+      "mode": "0444",
+      "path": "control/test_operator_matrix.py",
+      "sha256": "c2f9ac4b5d0b7c20dc6f35c3e93420dd5504773754f8e2ed5a8e5df31ab16a62",
+      "size": 19366
+    },
+    {
+      "mode": "0444",
+      "path": "control/test_rev17_repairs.py",
+      "sha256": "657df959690f2ad7471a7efc1c88123f6c37c0feb69377b967771b7514024111",
+      "size": 5436
+    },
+    {
+      "mode": "0444",
+      "path": "control/transaction-manifest.json",
+      "sha256": "e8a7dd69c2e3cbf79428e6ab77af5a89ab26712314c4ae64313005b3d203548c",
+      "size": 2525
+    },
+    {
+      "mode": "0444",
+      "path": "control/verify_candidate.py",
+      "sha256": "8a86074a9832844400cb662be5b803d81c0f33ff73c3deed309db596010de906",
+      "size": 1086
+    },
+    {
+      "mode": "0444",
+      "path": "evidence/candidate-verifier-final.json",
+      "sha256": "4d2578ff2f7a4f1880237c2b4b9fa3b3c88db5f3b6a392224470c180356ff2ec",
+      "size": 557
+    },
+    {
+      "mode": "0444",
+      "path": "evidence/control-suite.log",
+      "sha256": "c865577ec18490b9569afadb102fded1b9ac410744b7196caad070017b2156ae",
+      "size": 140
+    },
+    {
+      "mode": "0444",
+      "path": "evidence/operator-stage-verifier-final.json",
+      "sha256": "1b5e6beb536c05d5d3763d42e9a2b0269ec533d5a1b155ebda8609715b50076e",
+      "size": 812
+    },
+    {
+      "mode": "0444",
+      "path": "evidence/packet-check-final.json",
+      "sha256": "31203d414a0f3006048327906c12b1baf9e2deba311911603359cd78049dcf8d",
+      "size": 509
+    },
+    {
+      "mode": "0444",
+      "path": "evidence/preflight-final.json",
+      "sha256": "2c6edcbe6b57d891f4320a4d8a0f2286393f9b2c93be280aaeff5b693359a82f",
+      "size": 1068
+    },
+    {
+      "mode": "0444",
+      "path": "evidence/product-full-suite.log",
+      "sha256": "66830561f38817997b684a90eb344f856494c1429df0b54d5bfa940025602070",
+      "size": 236
+    },
+    {
+      "mode": "0444",
+      "path": "fixture/live/etc/recorder-next/recorder-next.toml",
+      "sha256": "e655b43bbbf7483c0c7ff1fb0b88c448a81862297883e7404a4cae27df06be38",
+      "size": 21
+    },
+    {
+      "mode": "0444",
+      "path": "fixture/receipts/operator.lock",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "size": 0
+    },
+    {
+      "mode": "0444",
+      "path": "producer-report.json",
+      "sha256": "cfe98b32484ab649393de9e1addb4ef8a784d89195a726080094f115aada0804",
+      "size": 2376
+    }
+  ],
+  "schema": "recorder-next-bookend-vector/v1"
+}

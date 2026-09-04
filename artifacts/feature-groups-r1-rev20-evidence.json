@@ -1,0 +1,60 @@
+{
+  "candidate": {
+    "generation": "feature-groups-r1-rev20",
+    "candidate_id": "recorder-next-feature-groups-r1-rev20-90ff26b7cc4cf821",
+    "candidate_sha256": "90ff26b7cc4cf821b01630dc86d017ee92894955b226943f8f4bff8d96ba02c7",
+    "product_sha256": "def267f5fa28891a481da41ecf12d314ba4c09066e8fcade389b124116e99fba",
+    "product_file_count": 50,
+    "source_archive": {
+      "path": "artifacts/candidate-source-feature-groups-r1-rev20.tar",
+      "sha256": "75d428859ff2d00ef91165cff4280861977f1cb0973c1f3eef10b27bd613a8f3",
+      "size": 1024000
+    },
+    "candidate_tree_mode": "0444",
+    "archive_members": 50,
+    "archive_mtime": 0,
+    "live_authorized": false,
+    "approved_for_live_change": false
+  },
+  "verification": {
+    "source_suite": {
+      "command": "python3.11 -B -m unittest discover -s tests -q",
+      "tests": 162,
+      "skipped": 3,
+      "status": "PASS",
+      "log": "artifacts/postfreeze-readback/source-full-suite.log"
+    },
+    "frozen_product_suite": {
+      "command": "python3.11 -B -m unittest discover -s tests -q",
+      "tests": 109,
+      "status": "PASS",
+      "log": "artifacts/feature-groups-r1-rev20/evidence/product-full-suite.log"
+    },
+    "frozen_control_suite": {
+      "command": "PYTHONPATH=control:candidate RECORDER_NEXT_BUILDER=control/build_candidate.py python3.11 -B -m unittest discover -s control -p test_*.py -q",
+      "tests": 14,
+      "status": "PASS",
+      "log": "artifacts/feature-groups-r1-rev20/evidence/control-suite.log"
+    },
+    "candidate_verifier": "PASS",
+    "preflight": "PASS",
+    "packet_check": "PASS",
+    "stage_verifier": "PASS",
+    "diff_check": "PASS",
+    "compileall": "PASS",
+    "installed_wheel": {
+      "python": "3.11.15",
+      "wheel_sha256": "c75612f6eb2a071b4f93531cc1c20ce682c4637f113a2c2f4a34b901ec3bdb5c",
+      "imported_from": "/tmp/recorder-next-venv/lib/python3.11/site-packages/recorder_next/__init__.py",
+      "entrypoint_health_status": 200,
+      "entrypoint_health": "ok",
+      "product_identity": "recorder-next-server-product-items-1-through-8"
+    }
+  },
+  "evidence_paths": {
+    "manifest": "artifacts/feature-groups-r1-rev20/candidate-manifest.json",
+    "freeze_vector": "artifacts/feature-groups-r1-rev20/freeze-vector.json",
+    "freeze_sidecar": "artifacts/feature-groups-r1-rev20.freeze-vector.sha256",
+    "postfreeze_readback": "artifacts/postfreeze-readback/summary.json"
+  }
+}

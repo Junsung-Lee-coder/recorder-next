@@ -146,13 +146,14 @@ def _upload_and_accept(test: unittest.TestCase, server, manifest: dict[str, obje
     midpoint = max(1, len(payload) // 2)
     chunks = [payload[:midpoint], payload[midpoint:]]
     order = [1, 0] if out_of_order else [0, 1]
+    owner_query = f"?user_id={manifest['user_id']}&device_id={manifest['origin_device_id']}"
     for sequence in order:
         result = _assert_status(
             test,
             _request(
                 server,
                 "PUT",
-                f"/v1/turns/{turn_id}/parts/{part_id}/chunks/{sequence}",
+                f"/v1/turns/{turn_id}/parts/{part_id}/chunks/{sequence}{owner_query}",
                 raw=chunks[sequence],
                 headers={"X-Chunk-SHA256": hashlib.sha256(chunks[sequence]).hexdigest()},
             ),
@@ -164,7 +165,7 @@ def _upload_and_accept(test: unittest.TestCase, server, manifest: dict[str, obje
         _request(
             server,
             "PUT",
-            f"/v1/turns/{turn_id}/parts/{part_id}/chunks/0",
+            f"/v1/turns/{turn_id}/parts/{part_id}/chunks/0{owner_query}",
             raw=chunks[0],
         ),
         200,
@@ -175,7 +176,7 @@ def _upload_and_accept(test: unittest.TestCase, server, manifest: dict[str, obje
         _request(
             server,
             "POST",
-            f"/v1/turns/{turn_id}/parts/{part_id}/finish",
+            f"/v1/turns/{turn_id}/parts/{part_id}/finish{owner_query}",
             {
                 "total_chunks": 2,
                 "total_bytes": len(payload),
@@ -185,7 +186,7 @@ def _upload_and_accept(test: unittest.TestCase, server, manifest: dict[str, obje
         200,
     )
     test.assertEqual(finished["status"], "COMPLETE")
-    accepted = _assert_status(test, _request(server, "POST", f"/v1/turns/{turn_id}/accept", {}), 200)
+    accepted = _assert_status(test, _request(server, "POST", f"/v1/turns/{turn_id}/accept", {"user_id": manifest["user_id"], "device_id": manifest["origin_device_id"]}), 200)
     test.assertEqual(accepted["state"], "ACCEPTED")
     return accepted
 
@@ -193,7 +194,7 @@ def _upload_and_accept(test: unittest.TestCase, server, manifest: dict[str, obje
 def _route_hermes_and_ack(test: unittest.TestCase, server, *, user: str, device: str, project_id: str, turn_id: str):
     routed = _assert_status(test, _request(server, "POST", "/v1/internal/router", {"user_id": user, "owner": "fixture-router"}), 200)
     test.assertEqual(routed["state"], "HERMES_PENDING")
-    route_items = _assert_status(test, _request(server, "GET", f"/v1/outbox?device_id={device}"), 200)["items"]
+    route_items = _assert_status(test, _request(server, "GET", f"/v1/outbox?user_id={user}&device_id={device}"), 200)["items"]
     route_event = next(item for item in route_items if item["event_kind"] == "ROUTED")
     _assert_status(
         test,
@@ -202,6 +203,7 @@ def _route_hermes_and_ack(test: unittest.TestCase, server, *, user: str, device:
             "POST",
             f"/v1/turns/{turn_id}/events/{route_event['event_id']}/ack",
             {
+                "user_id": user,
                 "device_id": device,
                 "event_version": route_event["event_version"],
                 "payload_sha256": route_event["payload_sha256"],
@@ -215,7 +217,7 @@ def _route_hermes_and_ack(test: unittest.TestCase, server, *, user: str, device:
         200,
     )
     test.assertEqual(final_ready["state"], "FINAL_READY")
-    final_items = _assert_status(test, _request(server, "GET", f"/v1/outbox?device_id={device}"), 200)["items"]
+    final_items = _assert_status(test, _request(server, "GET", f"/v1/outbox?user_id={user}&device_id={device}"), 200)["items"]
     final_event = next(item for item in final_items if item["event_kind"] == "FINAL")
     delivered = _assert_status(
         test,
@@ -224,6 +226,7 @@ def _route_hermes_and_ack(test: unittest.TestCase, server, *, user: str, device:
             "POST",
             f"/v1/turns/{turn_id}/events/{final_event['event_id']}/ack",
             {
+                "user_id": user,
                 "device_id": device,
                 "event_version": final_event["event_version"],
                 "payload_sha256": final_event["payload_sha256"],
@@ -234,7 +237,7 @@ def _route_hermes_and_ack(test: unittest.TestCase, server, *, user: str, device:
     test.assertEqual(delivered["state"], "DELIVERED")
     generated = _assert_status(test, _request(server, "POST", "/v1/internal/tts", {"limit": 50}), 200)
     for artifact in generated:
-        ready = _assert_status(test, _request(server, "GET", f"/v1/tts/{artifact['artifact_id']}?device_id={device}"), 200)
+        ready = _assert_status(test, _request(server, "GET", f"/v1/tts/{artifact['artifact_id']}?user_id={user}&device_id={device}"), 200)
         test.assertEqual(ready["status"], "READY")
         playback = _assert_status(
             test,
@@ -243,6 +246,7 @@ def _route_hermes_and_ack(test: unittest.TestCase, server, *, user: str, device:
                 "POST",
                 f"/v1/tts/{artifact['artifact_id']}/playback-ack",
                 {
+                    "user_id": user,
                     "device_id": device,
                     "turn_id": turn_id,
                     "artifact_version": artifact["artifact_version"],
@@ -319,7 +323,7 @@ class GeneratedSingleInputHTTPTests(unittest.TestCase):
         metadata = _fixture_metadata()
         audio = _fixture_bytes(metadata, "voice_ko")
         asr = {
-            "realtime": StaticASRProvider("realtime", AsrResult.no_speech()),
+            "realtime": StaticASRProvider("realtime", AsrResult.error("synthetic realtime unavailable")),
             "batch": StaticASRProvider("batch", AsrResult.error("synthetic batch unavailable")),
             "local": StaticASRProvider("local", AsrResult.valid(metadata["prompts"]["ko"])),
         }
@@ -328,30 +332,31 @@ class GeneratedSingleInputHTTPTests(unittest.TestCase):
             try:
                 turn_id = "018f5a2e-7b6e-7abc-8d11-123456789101"
                 manifest = _manifest_for(metadata, "voice_ko", turn_id, user=user, device=device)
+                owner_query = f"?user_id={user}&device_id={device}"
                 _assert_status(self, _request(server, "POST", "/v1/turns", manifest), 201)
                 part_id = manifest["parts"][0]["part_id"]
                 midpoint = len(audio) // 2
                 chunks = [audio[:midpoint], audio[midpoint:]]
-                first = _assert_status(self, _request(server, "PUT", f"/v1/turns/{turn_id}/parts/{part_id}/chunks/1", raw=chunks[1]), 200)
+                first = _assert_status(self, _request(server, "PUT", f"/v1/turns/{turn_id}/parts/{part_id}/chunks/1{owner_query}", raw=chunks[1]), 200)
                 self.assertFalse(first["duplicate"])
-                missing = _assert_status(self, _request(server, "GET", f"/v1/turns/{turn_id}/parts/{part_id}/missing?total_chunks=2"), 200)
+                missing = _assert_status(self, _request(server, "GET", f"/v1/turns/{turn_id}/parts/{part_id}/missing?total_chunks=2&user_id={user}&device_id={device}"), 200)
                 self.assertEqual(missing["missing"], [0])
-                duplicate = _assert_status(self, _request(server, "PUT", f"/v1/turns/{turn_id}/parts/{part_id}/chunks/1", raw=chunks[1]), 200)
+                duplicate = _assert_status(self, _request(server, "PUT", f"/v1/turns/{turn_id}/parts/{part_id}/chunks/1{owner_query}", raw=chunks[1]), 200)
                 self.assertTrue(duplicate["duplicate"])
-                conflict = _request(server, "PUT", f"/v1/turns/{turn_id}/parts/{part_id}/chunks/1", raw=b"conflicting-sequence")
+                conflict = _request(server, "PUT", f"/v1/turns/{turn_id}/parts/{part_id}/chunks/1{owner_query}", raw=b"conflicting-sequence")
                 self.assertEqual(conflict[0], 409)
-                _assert_status(self, _request(server, "PUT", f"/v1/turns/{turn_id}/parts/{part_id}/chunks/0", raw=chunks[0]), 200)
+                _assert_status(self, _request(server, "PUT", f"/v1/turns/{turn_id}/parts/{part_id}/chunks/0{owner_query}", raw=chunks[0]), 200)
                 _assert_status(
                     self,
                     _request(
                         server,
                         "POST",
-                        f"/v1/turns/{turn_id}/parts/{part_id}/finish",
+                        f"/v1/turns/{turn_id}/parts/{part_id}/finish{owner_query}",
                         {"total_chunks": 2, "total_bytes": len(audio), "whole_stream_sha256": hashlib.sha256(audio).hexdigest()},
                     ),
                     200,
                 )
-                accepted = _assert_status(self, _request(server, "POST", f"/v1/turns/{turn_id}/accept", {}), 200)
+                accepted = _assert_status(self, _request(server, "POST", f"/v1/turns/{turn_id}/accept", {"user_id": user, "device_id": device}), 200)
                 self.assertEqual(accepted["state"], "ACCEPTED")
                 reopened = RecorderStore(Path(tmp) / "recorder.sqlite3", storage_root=Path(tmp) / "data")
                 self.assertEqual(reopened.read_part(turn_id, part_id), audio)
@@ -387,7 +392,7 @@ class GeneratedSingleInputHTTPTests(unittest.TestCase):
                     request = gateway.calls[0]["request"]["request"]
                     self.assertEqual(request["manifest"]["parts"][0]["relationship"], metadata["files"][key].get("relationship"))
                     self.assertEqual(request["manifest"]["parts"][0]["declared_sha256"], metadata["files"][key]["sha256"])
-                    archived = _assert_status(self, _request(server, "POST", f"/v1/turns/{turn_id}/archive?user_id={user}", {"source": "generated-fixture-test"}), 200)
+                    archived = _assert_status(self, _request(server, "POST", f"/v1/turns/{turn_id}/archive?user_id={user}&device_id={device}", {"source": "generated-fixture-test"}), 200)
                     self.assertIsNotNone(archived["archived_at"])
                     self.assertEqual(store.read_part(turn_id, manifest["parts"][0]["part_id"]), payload)
                 finally:

@@ -278,9 +278,9 @@ class ScheduledFinalStoreTests(unittest.TestCase):
             self.assertEqual(scheduled["delivery_target_device_id"], "watch-1")
             self.assertEqual(event["required_device_id"], "watch-1")
             self.assertEqual(artifact["delivery_target_device_id"], "watch-1")
-            watch_outbox = store.pending_outbox("watch-1")
+            watch_outbox = store.pending_outbox("watch-1", user_id="schedule-user")
             self.assertIn(event["event_id"], [row["event_id"] for row in watch_outbox])
-            self.assertNotIn(event["event_id"], [row["event_id"] for row in store.pending_outbox("phone-1")])
+            self.assertNotIn(event["event_id"], [row["event_id"] for row in store.pending_outbox("phone-1", user_id="schedule-user")])
             self.assertEqual(store.get_schedule("schedule-phone-to-watch")["occurrences"][0]["delivery_target_device_id"], "watch-1")
 
     def test_explicit_target_stays_phone_across_latest_watch_turn(self):
@@ -602,14 +602,15 @@ class ScheduledFinalStoreTests(unittest.TestCase):
             service = RecorderService(store)
 
             for path in (
-                f"/v1/tts/{artifact['artifact_id']}?device_id=phone-1",
-                f"/v1/tts/{artifact['artifact_id']}/bridge-read?device_id=phone-1",
+                f"/v1/tts/{artifact['artifact_id']}?user_id=schedule-user&device_id=phone-1",
+                f"/v1/tts/{artifact['artifact_id']}/bridge-read?user_id=schedule-user&device_id=phone-1",
             ):
                 status, _, body = service.handle_http("GET", path, {}, b"")
                 self.assertEqual(status, 200)
                 self.assertEqual(hashlib.sha256(base64.b64decode(body["audio_base64"])).hexdigest(), ready["payload_sha256"])
 
             missing_version = {
+                "user_id": "schedule-user",
                 "device_id": "watch-1",
                 "turn_id": turn["turn_id"],
                 "payload_sha256": ready["payload_sha256"],
@@ -695,7 +696,7 @@ class ScheduledFinalHTTPAndMigrationTests(unittest.TestCase):
             )
             self.assertEqual(status, 201)
             self.assertEqual(body["schedule_id"], "schedule-1")
-            status, _, readback = service.handle_http("GET", "/v1/schedules/schedule-1", {}, b"")
+            status, _, readback = service.handle_http("GET", "/v1/schedules/schedule-1?user_id=schedule-user&device_id=watch-1", {}, b"")
             self.assertEqual(status, 200)
             self.assertEqual(readback["fire_at_utc"], "2026-08-26T00:00:10.000+00:00")
             clock.advance(seconds=10)
@@ -725,7 +726,7 @@ class ScheduledFinalHTTPAndMigrationTests(unittest.TestCase):
             conn.close()
             store = RecorderStore(db, storage_root=root / "data")
             with store._read() as conn:
-                self.assertEqual(conn.execute("SELECT value FROM schema_meta WHERE key='schema_version'").fetchone()[0], "2")
+                self.assertEqual(conn.execute("SELECT value FROM schema_meta WHERE key='schema_version'").fetchone()[0], "4")
                 columns = {row[1] for row in conn.execute("PRAGMA table_info(turns)")}
                 self.assertTrue(
                     {
@@ -752,7 +753,7 @@ class ScheduledFinalHTTPAndMigrationTests(unittest.TestCase):
         ack_schema = OPENAPI["components"]["schemas"]["PlaybackAck"]
         self.assertEqual(
             set(ack_schema["required"]),
-            {"device_id", "payload_sha256", "turn_id", "artifact_version"},
+            {"user_id", "device_id", "payload_sha256", "turn_id", "artifact_version"},
         )
         self.assertTrue(OPENAPI["paths"]["/v1/tts/{artifact_id}/playback-ack"]["post"]["requestBody"]["required"])
         migration = (Path(__file__).parents[1] / "migrations/002_scheduled_final.sql").read_text(encoding="utf-8").upper()

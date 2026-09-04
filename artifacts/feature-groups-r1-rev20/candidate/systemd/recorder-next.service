@@ -1,0 +1,21 @@
+[Unit]
+Description=Recorder Next standalone v1 server
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/recorder-next
+LoadCredential=recorder_api_key:/home/rumi/.hermes/profiles/default/recorder-worker-api-key.env
+ExecStart=/usr/bin/python3 -m recorder_next --config /etc/recorder-next/recorder-next.toml
+Restart=on-failure
+RestartSec=3
+User=recorder-next
+Group=recorder-next
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/recorder-next
+
+[Install]
+WantedBy=multi-user.target

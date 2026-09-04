@@ -1,0 +1,12 @@
+usage: __main__.py [-h] [--config CONFIG] [--db DB]
+                   [--storage-root STORAGE_ROOT] [--host HOST] [--port PORT]
+
+Recorder Next standalone server
+
+options:
+  -h, --help            show this help message and exit
+  --config CONFIG
+  --db DB
+  --storage-root STORAGE_ROOT
+  --host HOST
+  --port PORT

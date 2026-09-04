@@ -1,0 +1,697 @@
+{
+  "approved_for_live_change": false,
+  "candidate_archive": {
+    "path": "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/candidate-source-feature-groups-r1-rev20.tar",
+    "role": "candidate_archive",
+    "sha256": "75d428859ff2d00ef91165cff4280861977f1cb0973c1f3eef10b27bd613a8f3",
+    "size": 1024000
+  },
+  "candidate_file_count": 50,
+  "candidate_hash_algorithm": "sha256(\\\"recorder-next-r7-candidate/v3\\\"\\0generation\\0product_sha256\\0)",
+  "candidate_id": "recorder-next-feature-groups-r1-rev20-90ff26b7cc4cf821",
+  "candidate_members": [
+    {
+      "mode": "0444",
+      "path": ".gitignore",
+      "sha256": "477e4934340bf0614f635c8d49c7bdfbd8162522181ba1298f542a552ada7faa",
+      "size": 87
+    },
+    {
+      "mode": "0444",
+      "path": "README.md",
+      "sha256": "bf9c63f770d3f12d1e0c431d1a3788a24ef7c5c3c7ad105e42b5dda18009be34",
+      "size": 8188
+    },
+    {
+      "mode": "0444",
+      "path": "api/openapi.json",
+      "sha256": "81071d3eabaf017521d3b542d6f1bbd6048cdcac9e9c0abb7b12824da4cb0499",
+      "size": 15501
+    },
+    {
+      "mode": "0444",
+      "path": "config.example.toml",
+      "sha256": "615833bf1d1efea128345a19aee4ce892b27d4b020010b6009e2825f06dac568",
+      "size": 1345
+    },
+    {
+      "mode": "0444",
+      "path": "fixtures/deterministic.json",
+      "sha256": "6ad16c2388c70424b6aa965ac4b3ee3e8f0418452367aae5ba6b80c76e65556d",
+      "size": 774
+    },
+    {
+      "mode": "0444",
+      "path": "fixtures/generate_multimodal_fixtures.py",
+      "sha256": "97349e10c265546b6168a9b3c60d707cf4ac53ec129f761b772fb2525a8c5214",
+      "size": 8888
+    },
+    {
+      "mode": "0444",
+      "path": "fixtures/generated/data.csv",
+      "sha256": "2714a951f0bcfbf0180f0c63b4879fa9500fe7330d21dd7e32bb5531d58cf340",
+      "size": 24
+    },
+    {
+      "mode": "0444",
+      "path": "fixtures/generated/document.pdf",
+      "sha256": "d9b70d90a446261b0a16476cdf7789e2627d51cc5a705788e7658d3d78166e00",
+      "size": 612
+    },
+    {
+      "mode": "0444",
+      "path": "fixtures/generated/generic.bin",
+      "sha256": "0d41e776e8535fb2eb604bb99b57917b8096958511e93c48399c67c72561422e",
+      "size": 29
+    },
+    {
+      "mode": "0444",
+      "path": "fixtures/generated/image.png",
+      "sha256": "a30c5a0129e719554703f9eba9753d6c13e48ccc25ae2e409293948b54c3c9b2",
+      "size": 10662
+    },
+    {
+      "mode": "0444",
+      "path": "fixtures/generated/manifest.json",
+      "sha256": "63749132ae3afafdc7740060276524335e05aedeb32e2bff9f7073a7a6b88177",
+      "size": 3790
+    },
+    {
+      "mode": "0444",
+      "path": "fixtures/generated/text.txt",
+      "sha256": "d50b71e1f9aa6d98d485ec1426c412fd325dc634047b97097431f4433a11b5c9",
+      "size": 59
+    },
+    {
+      "mode": "0444",
+      "path": "fixtures/generated/voice_en.wav",
+      "sha256": "ebfcd54140b6b20a0f38dc592b5d4e51eb55a6e7d697c905585fe99024e87987",
+      "size": 110388
+    },
+    {
+      "mode": "0444",
+      "path": "fixtures/generated/voice_ko.wav",
+      "sha256": "ce54f2d8cdd9251b1add48176b247c2c9ab4386a956970f8fb1d8fee0cbe4a9f",
+      "size": 117928
+    },
+    {
+      "mode": "0444",
+      "path": "fixtures/scheduled-final-r5.json",
+      "sha256": "6cafd19c1489a7e9c600311875c2a117c9001faa9bb030f3ba379b96a9f1b20d",
+      "size": 1085
+    },
+    {
+      "mode": "0444",
+      "path": "migrations/001_initial.sql",
+      "sha256": "58232e880d5ba5e79526d0b0359cd87c3d8f9c78cf5082c78f307f09c2092afe",
+      "size": 9207
+    },
+    {
+      "mode": "0444",
+      "path": "migrations/002_scheduled_final.sql",
+      "sha256": "b58ce58dbe1b5ca49b3b3b47515d0b7170feb2c0264a9904aa17fb317fd00bba",
+      "size": 3003
+    },
+    {
+      "mode": "0444",
+      "path": "migrations/003_feature_groups.sql",
+      "sha256": "02d6ebf9e1a7e971d4cce805efbef43a80d195bd4d16c16b864cb1f794e31f5a",
+      "size": 8129
+    },
+    {
+      "mode": "0444",
+      "path": "migrations/004_eavesdrop_decisions.sql",
+      "sha256": "bb700c316eff6e982e12356db36525b4032a110dd8e4fd36d0a6c1554caf8292",
+      "size": 1410
+    },
+    {
+      "mode": "0444",
+      "path": "pyproject.toml",
+      "sha256": "5e1ca70ad3c64e41684968a7150235cad37775bc49dcc114820cf000d51a5964",
+      "size": 494
+    },
+    {
+      "mode": "0444",
+      "path": "recorder_next/__init__.py",
+      "sha256": "6729720ce5e1bc024ffa1d4af2fb9d99485263982db7937ee11cebb1fb17f62b",
+      "size": 406
+    },
+    {
+      "mode": "0444",
+      "path": "recorder_next/__main__.py",
+      "sha256": "6de783031f05e7c7449294ac0ea1359ebc40958a9f62eaca94dc1e2b0437447b",
+      "size": 1879
+    },
+    {
+      "mode": "0444",
+      "path": "recorder_next/adapters.py",
+      "sha256": "53f9cc2e30534bce8637c0867000c629ba001ab2108dd2294bd59c33da52089f",
+      "size": 62712
+    },
+    {
+      "mode": "0444",
+      "path": "recorder_next/canonical.py",
+      "sha256": "03059d6fd331146b92fa5bcdfa531dad7dbbbdce61eb18416db18b4ce811b8f3",
+      "size": 1684
+    },
+    {
+      "mode": "0444",
+      "path": "recorder_next/clock.py",
+      "sha256": "645b5925283e39af78d385413a6b43bf59fc861728495df4055d14819b561cf4",
+      "size": 1305
+    },
+    {
+      "mode": "0444",
+      "path": "recorder_next/config.py",
+      "sha256": "3bd88851561fd3228764451b775d2a83a336ec6b1ae1f1d8ad976f280ca26e1b",
+      "size": 46291
+    },
+    {
+      "mode": "0444",
+      "path": "recorder_next/errors.py",
+      "sha256": "523c89f2a46dcc668301691ad9338aca75a45460262338e7fccd094bdfc54c99",
+      "size": 1290
+    },
+    {
+      "mode": "0444",
+      "path": "recorder_next/features.py",
+      "sha256": "1730429c21c8773d5c56cc3eb167e2082b520743cb0ebf645d327fd3dec59805",
+      "size": 117795
+    },
+    {
+      "mode": "0444",
+      "path": "recorder_next/http.py",
+      "sha256": "3c2a3a2dde777870070daf857b7778ea9375dd2e834fd0a0525fa73afbbd66ab",
+      "size": 3691
+    },
+    {
+      "mode": "0444",
+      "path": "recorder_next/migrations/002_scheduled_final.sql",
+      "sha256": "a5faa37a8c11ddd6d8cc2a91f77beadaa973cf38209fef11d449cd022ec061a7",
+      "size": 2825
+    },
+    {
+      "mode": "0444",
+      "path": "recorder_next/migrations/003_feature_groups.sql",
+      "sha256": "87b480f8e7e83159c371b1dd31d837916d93574227a1941be3da02f1882ef9ad",
+      "size": 8128
+    },
+    {
+      "mode": "0444",
+      "path": "recorder_next/migrations/004_eavesdrop_decisions.sql",
+      "sha256": "bb700c316eff6e982e12356db36525b4032a110dd8e4fd36d0a6c1554caf8292",
+      "size": 1410
+    },
+    {
+      "mode": "0444",
+      "path": "recorder_next/models.py",
+      "sha256": "bce4a85af04caefc3f6691c917d2dffe0080858ac2bb30ff6d7a7b3f7f126e84",
+      "size": 1147
+    },
+    {
+      "mode": "0444",
+      "path": "recorder_next/openapi.py",
+      "sha256": "cba28482211180f8cab6b9fceeed92f80be7364caacbb5e1997d583b76688421",
+      "size": 10327
+    },
+    {
+      "mode": "0444",
+      "path": "recorder_next/schema.sql",
+      "sha256": "f89189b961db30758d9f6c0946070d603d2a290eadd43847a4affd3736845f1c",
+      "size": 19144
+    },
+    {
+      "mode": "0444",
+      "path": "recorder_next/service.py",
+      "sha256": "130a48db43b598aa53858f25de3129a96b6fe056df0b3867faad77ec76a6a74d",
+      "size": 72202
+    },
+    {
+      "mode": "0444",
+      "path": "recorder_next/store.py",
+      "sha256": "a8c5718b15e9bbb25e50899b451c1cabf8200a4fec6981ae579274ecd68715fb",
+      "size": 151209
+    },
+    {
+      "mode": "0444",
+      "path": "systemd/recorder-next.service",
+      "sha256": "f5b2353ec57d2ff8914b04c1993cb9b7e06337d7d218dedbba6989b9a80eace0",
+      "size": 543
+    },
+    {
+      "mode": "0444",
+      "path": "tests/test_adapters.py",
+      "sha256": "f1e025f943149b6568f9d6974b4005e82eab642187e2acd2e638c8322ca4df59",
+      "size": 7710
+    },
+    {
+      "mode": "0444",
+      "path": "tests/test_bearer_credential.py",
+      "sha256": "7e541dfe95798d3670fa8bea053b13afbfd9a9bfd84a19379feb639f3aa822b6",
+      "size": 6126
+    },
+    {
+      "mode": "0444",
+      "path": "tests/test_config.py",
+      "sha256": "16f0eab7c5340811c63e217f365b5e7a0e7dcb4d83d9cc36b15e674388e0366f",
+      "size": 560
+    },
+    {
+      "mode": "0444",
+      "path": "tests/test_core_contract.py",
+      "sha256": "f8d57439df1794edfe03eddf7d400f6080f008c7f8dbed9635fcdd2c4fee531d",
+      "size": 1794
+    },
+    {
+      "mode": "0444",
+      "path": "tests/test_extended_contract.py",
+      "sha256": "95117f55f34d82529059c39383418004fe2bebaa99c6c642d64010cc79e1081a",
+      "size": 20366
+    },
+    {
+      "mode": "0444",
+      "path": "tests/test_feature_groups.py",
+      "sha256": "1a00804e6fa18508d689dddb48d8205fdcc2b265cc78360d5ff7f5a1b8bf392f",
+      "size": 30083
+    },
+    {
+      "mode": "0444",
+      "path": "tests/test_generated_multimodal.py",
+      "sha256": "cab07b7f8eefbf83953ea52d8444359d773429f14387c7d215b9ce8310173a5f",
+      "size": 22430
+    },
+    {
+      "mode": "0444",
+      "path": "tests/test_limits.py",
+      "sha256": "7fccdb55ac0465ceb7bd00afe7e1a2604f7bd55c85f31182a47967c29e68da51",
+      "size": 2198
+    },
+    {
+      "mode": "0444",
+      "path": "tests/test_r1_repairs.py",
+      "sha256": "befbcdde607c9e9680b4627c307126b62066f41cff37bfb0894a9c833f56b889",
+      "size": 15266
+    },
+    {
+      "mode": "0444",
+      "path": "tests/test_reliability_contract.py",
+      "sha256": "2cd9d91033b65b22fc51cea56f8e556e42977b159b4fb4125c6a47bfa160cf16",
+      "size": 15971
+    },
+    {
+      "mode": "0444",
+      "path": "tests/test_scheduled_final.py",
+      "sha256": "1238d50a41da11c3661b682fffaee9448ee2a20e573d1607e969ab938d5bd683",
+      "size": 36877
+    },
+    {
+      "mode": "0444",
+      "path": "tests/test_store_contract.py",
+      "sha256": "20a1c01c3f62e7cef692816c9ab3f19da24584ac9b77c3d119af19c4e644ada0",
+      "size": 9739
+    }
+  ],
+  "candidate_only_not_applied": true,
+  "candidate_sha256": "90ff26b7cc4cf821b01630dc86d017ee92894955b226943f8f4bff8d96ba02c7",
+  "candidate_total_bytes": 974711,
+  "changed_product_paths_from_failed_candidate": [
+    "README.md",
+    "api/openapi.json",
+    "config.example.toml",
+    "migrations/003_feature_groups.sql",
+    "migrations/004_eavesdrop_decisions.sql",
+    "recorder_next/__init__.py",
+    "recorder_next/adapters.py",
+    "recorder_next/config.py",
+    "recorder_next/features.py",
+    "recorder_next/migrations/003_feature_groups.sql",
+    "recorder_next/migrations/004_eavesdrop_decisions.sql",
+    "recorder_next/openapi.py",
+    "recorder_next/schema.sql",
+    "recorder_next/service.py",
+    "recorder_next/store.py",
+    "tests/test_adapters.py",
+    "tests/test_extended_contract.py",
+    "tests/test_feature_groups.py",
+    "tests/test_generated_multimodal.py",
+    "tests/test_scheduled_final.py"
+  ],
+  "commands_executed": 0,
+  "control_roles": {
+    "candidate_builder": {
+      "mode": "0444",
+      "path": "control/build_candidate.py",
+      "sha256": "b3f14dc5bdef380c0bdac3b3e1c145060d8061422da1da7c5db9df2823522e6c",
+      "size": 28047
+    },
+    "candidate_verifier": {
+      "mode": "0444",
+      "path": "control/verify_candidate.py",
+      "sha256": "8a86074a9832844400cb662be5b803d81c0f33ff73c3deed309db596010de906",
+      "size": 1086
+    },
+    "config": {
+      "mode": "0444",
+      "path": "control/recorder-next.toml",
+      "sha256": "f12526861a56347bda9ad5911342f7a350fcf4e67ae28796868e0dbc1f28f73a",
+      "size": 777
+    },
+    "control_contract": {
+      "mode": "0444",
+      "path": "control/control_contract.py",
+      "sha256": "4fbba4f4d6f36494bd2ff33838d01c7e909f3a55ce558e125418886a53b35ca6",
+      "size": 49688
+    },
+    "operator": {
+      "mode": "0444",
+      "path": "control/release_op.py",
+      "sha256": "e6ebc57cd81fff53dae88923eafb0f17b9f2fe554eceddc27315842031134a34",
+      "size": 88649
+    },
+    "operator_matrix": {
+      "mode": "0444",
+      "path": "control/test_operator_matrix.py",
+      "sha256": "c2f9ac4b5d0b7c20dc6f35c3e93420dd5504773754f8e2ed5a8e5df31ab16a62",
+      "size": 19366
+    },
+    "packet_checker": {
+      "mode": "0444",
+      "path": "control/activation_packet_check.py",
+      "sha256": "563acb2aada95ebe63e15963484a19bb9cd6f206f07c679288f790955604bec9",
+      "size": 1600
+    },
+    "preflight": {
+      "mode": "0444",
+      "path": "control/preflight_rev14.py",
+      "sha256": "5d489930a323e461f373c6efa9413cae9abd26fe743d37a39d33dfa0159242a5",
+      "size": 1105
+    },
+    "provenance_tests": {
+      "mode": "0444",
+      "path": "control/test_activation_provenance_regressions.py",
+      "sha256": "651713c9a4d06892e5e289ba9a1236106a54f0d69968266dbf186cff9d6af445",
+      "size": 2386
+    },
+    "repair_tests": {
+      "mode": "0444",
+      "path": "control/test_rev17_repairs.py",
+      "sha256": "657df959690f2ad7471a7efc1c88123f6c37c0feb69377b967771b7514024111",
+      "size": 5436
+    }
+  },
+  "evidence": {
+    "evidence/candidate-verifier-final.json": {
+      "path": "evidence/candidate-verifier-final.json",
+      "sha256": "4d2578ff2f7a4f1880237c2b4b9fa3b3c88db5f3b6a392224470c180356ff2ec",
+      "size": 557
+    },
+    "evidence/control-suite.log": {
+      "path": "evidence/control-suite.log",
+      "sha256": "c865577ec18490b9569afadb102fded1b9ac410744b7196caad070017b2156ae",
+      "size": 140
+    },
+    "evidence/operator-stage-verifier-final.json": {
+      "path": "evidence/operator-stage-verifier-final.json",
+      "sha256": "1b5e6beb536c05d5d3763d42e9a2b0269ec533d5a1b155ebda8609715b50076e",
+      "size": 812
+    },
+    "evidence/packet-check-final.json": {
+      "path": "evidence/packet-check-final.json",
+      "sha256": "31203d414a0f3006048327906c12b1baf9e2deba311911603359cd78049dcf8d",
+      "size": 509
+    },
+    "evidence/preflight-final.json": {
+      "path": "evidence/preflight-final.json",
+      "sha256": "2c6edcbe6b57d891f4320a4d8a0f2286393f9b2c93be280aaeff5b693359a82f",
+      "size": 1068
+    },
+    "evidence/product-full-suite.log": {
+      "path": "evidence/product-full-suite.log",
+      "sha256": "66830561f38817997b684a90eb344f856494c1429df0b54d5bfa940025602070",
+      "size": 236
+    }
+  },
+  "freeze_vector": {
+    "entry_count": 74,
+    "excluded": [
+      "freeze-vector.json"
+    ],
+    "path": "freeze-vector.json",
+    "sha256": "766954961f6fc32503cdeab599a12335d1db7cadbfbd72f9495eed249cf82dc8",
+    "sidecar": "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/feature-groups-r1-rev20.freeze-vector.sha256"
+  },
+  "generation": "feature-groups-r1-rev20",
+  "live_authorized": false,
+  "mutation_counters": {
+    "app_device": 0,
+    "gateway": 0,
+    "installation": 0,
+    "live_service": 0,
+    "publication": 0,
+    "rollback": 0,
+    "secret_output": 0,
+    "systemd": 0
+  },
+  "packet": {
+    "path": "control/activation-packet.json",
+    "sha256": "2a6392a4907e1791c834d142b757c53bb993d4ffb8f941ac1e1ba189eb7b1a88",
+    "size": 28123
+  },
+  "predecessor": {
+    "archive_sha256": "9a70826230f91558dda1f22cea04deb36e41ca580147fabd21c0a970c5265fe3",
+    "candidate_id": "recorder-next-bearer-r7-rev18-affa9cfdbcd5c74c",
+    "candidate_sha256": "affa9cfdbcd5c74c298dc5dc39f66deab6a0f9430d65556fbc3e81f1881e19f9",
+    "declared_source_bundle_sha256": "9a70826230f91558dda1f22cea04deb36e41ca580147fabd21c0a970c5265fe3",
+    "disposition": "preserved_failed_predecessor",
+    "product_sha256": "5b317a65106498ae84591eecfd6000525339e702380da47dc7802ab22482e384"
+  },
+  "producer_report": {
+    "path": "producer-report.json",
+    "sha256": "cfe98b32484ab649393de9e1addb4ef8a784d89195a726080094f115aada0804",
+    "size": 2376
+  },
+  "product_bytes_changed_from_failed_candidate": true,
+  "product_identity": "recorder-next-server-product-items-1-through-8",
+  "product_sha256": "def267f5fa28891a481da41ecf12d314ba4c09066e8fcade389b124116e99fba",
+  "schema": "recorder-next-feature-r1-manifest/v5",
+  "source_archive": {
+    "path": "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/candidate-source-feature-groups-r1-rev20.tar",
+    "role": "candidate_archive",
+    "sha256": "75d428859ff2d00ef91165cff4280861977f1cb0973c1f3eef10b27bd613a8f3",
+    "size": 1024000
+  },
+  "status": "FROZEN",
+  "test_matrix": {
+    "discovered_count": 109,
+    "duplicate_count": 0,
+    "ids": [
+      "test_adapters.HermesAdapterContractTests.test_http_submit_projects_authoritative_assistant_message_id",
+      "test_adapters.HermesAdapterContractTests.test_http_submit_projects_each_attachment_type_as_safe_reference",
+      "test_adapters.HermesAdapterContractTests.test_http_submit_projects_inner_request_from_durable_ingress_envelope",
+      "test_adapters.HermesAdapterContractTests.test_http_submit_projects_only_input_marker_and_submission_identity",
+      "test_adapters.HermesAdapterContractTests.test_http_submit_rejects_empty_attachment_only_projection_before_upstream_call",
+      "test_bearer_credential.BearerCredentialTests.test_config_resolves_only_the_credential_path",
+      "test_bearer_credential.BearerCredentialTests.test_configured_hermes_fails_closed_without_a_credential_path",
+      "test_bearer_credential.BearerCredentialTests.test_invalid_credential_files_fail_closed_without_echoing_file_contents",
+      "test_bearer_credential.BearerCredentialTests.test_valid_credential_is_read_once_and_headers_preserve_session_key",
+      "test_config.ConfigContractTests.test_example_config_is_machine_loaded_without_live_mutation",
+      "test_core_contract.InitialFingerprintContractTests.test_same_initial_envelope_rejoins_but_immutable_change_conflicts",
+      "test_extended_contract.ASRArbitrationTests.test_fallback_generation_accepts_only_current_provider_and_deletes_audio_after_valid_transcript",
+      "test_extended_contract.ASRArbitrationTests.test_service_falls_from_realtime_and_batch_to_local",
+      "test_extended_contract.ASRArbitrationTests.test_valid_asr_keeps_source_flag_unset_when_physical_deletion_fails",
+      "test_extended_contract.CanonicalResultTests.test_nfc_and_crlf_normalize_but_whitespace_is_preserved",
+      "test_extended_contract.GraceAndArchiveTests.test_hermes_error_grace_recovers_with_late_success_and_duplicate_result_is_ignored",
+      "test_extended_contract.GraceAndArchiveTests.test_invalid_explicit_current_project_becomes_fixed_routing_error_without_routed_event",
+      "test_extended_contract.GraceAndArchiveTests.test_project_cas_and_archive_keep_data_but_hide_from_active_list",
+      "test_extended_contract.GraceAndArchiveTests.test_router_exception_becomes_durable_routing_error_and_releases_lease",
+      "test_extended_contract.GraceAndArchiveTests.test_service_auto_creates_project_when_no_current_project_exists",
+      "test_extended_contract.GraceAndArchiveTests.test_service_routes_submits_hermes_and_generates_only_first_final_tts",
+      "test_extended_contract.HTTPContractTests.test_device_registration_and_revoke_are_versioned_api_seams",
+      "test_extended_contract.HTTPContractTests.test_http_event_ack_requires_exact_origin_device_and_hash",
+      "test_extended_contract.HTTPContractTests.test_standalone_http_server_binds_only_ephemeral_loopback_for_smoke",
+      "test_extended_contract.HTTPContractTests.test_tts_download_is_origin_bound_and_hashes_payload",
+      "test_extended_contract.HTTPContractTests.test_versioned_api_accept_route_is_idempotent",
+      "test_extended_contract.HTTPContractTests.test_versioned_api_accepts_text_turn_and_exposes_health",
+      "test_feature_groups.AttachmentEavesdropDiagnosticsFeatureTests.test_attachment_resolver_rechecks_hash_and_rejects_symlink",
+      "test_feature_groups.AttachmentEavesdropDiagnosticsFeatureTests.test_configured_asr_chain_commits_once_and_replays_authoritative_result",
+      "test_feature_groups.AttachmentEavesdropDiagnosticsFeatureTests.test_diagnostics_latest_opt_out_revokes_older_consent",
+      "test_feature_groups.AttachmentEavesdropDiagnosticsFeatureTests.test_diagnostics_require_opt_in_redact_and_leave_tombstone_on_delete",
+      "test_feature_groups.AttachmentEavesdropDiagnosticsFeatureTests.test_eavesdrop_queues_fixed_project_hermes_once_and_delivers_reply",
+      "test_feature_groups.AttachmentEavesdropDiagnosticsFeatureTests.test_eavesdrop_states_segments_and_phone_mediated_provenance",
+      "test_feature_groups.AttachmentEavesdropDiagnosticsFeatureTests.test_eavesdrop_store_silent_bypasses_router_and_has_zero_external_effects",
+      "test_feature_groups.DurableWorkerFeatureTests.test_background_worker_runs_route_hermes_and_tts_stages",
+      "test_feature_groups.DurableWorkerFeatureTests.test_worker_completion_is_idempotent_and_binds_receipt_to_job",
+      "test_feature_groups.DurableWorkerFeatureTests.test_worker_job_has_idempotency_lease_receipt_and_restart_recovery",
+      "test_feature_groups.ProviderFeatureTests.test_asr_no_speech_is_authoritative_and_does_not_fallback",
+      "test_feature_groups.ProviderFeatureTests.test_asr_permanent_provider_failure_does_not_fallback",
+      "test_feature_groups.ProviderFeatureTests.test_configured_service_builds_named_asr_and_tts_chains",
+      "test_feature_groups.ProviderFeatureTests.test_configured_service_rejects_fixture_and_defaults_to_explicit_disabled_tts",
+      "test_feature_groups.ProviderFeatureTests.test_durable_worker_requires_a_receipt_before_success",
+      "test_feature_groups.ProviderFeatureTests.test_http_attachment_projection_validates_bytes_with_resolver",
+      "test_feature_groups.ProviderFeatureTests.test_http_provider_constructors_are_real_and_not_fixture_adapters",
+      "test_feature_groups.ProviderFeatureTests.test_named_provider_registry_freezes_order_and_redacts_credentials",
+      "test_feature_groups.ProviderFeatureTests.test_provider_chain_does_not_fallback_after_permanent_failure",
+      "test_feature_groups.ProviderFeatureTests.test_provider_failures_are_classified_without_exposing_secret",
+      "test_feature_groups.UpdateAndHistoryFeatureTests.test_history_is_project_scoped_cursor_bound_and_path_free",
+      "test_feature_groups.UpdateAndHistoryFeatureTests.test_update_manifest_is_immutable_and_serves_hash_bound_ranges",
+      "test_generated_multimodal.GeneratedFixtureInventoryTests.test_generated_fixture_manifest_is_deterministic_and_audio_is_real_speech",
+      "test_generated_multimodal.GeneratedFixtureInventoryTests.test_generated_image_and_documents_have_valid_signatures_and_content",
+      "test_generated_multimodal.GeneratedSingleInputHTTPTests.test_attachment_quota_is_rejected_before_bytes_are_stored",
+      "test_generated_multimodal.GeneratedSingleInputHTTPTests.test_each_supported_non_audio_fixture_is_a_separate_public_single_input_turn",
+      "test_generated_multimodal.GeneratedSingleInputHTTPTests.test_english_voice_fixture_is_supported_as_a_separate_public_voice_turn",
+      "test_generated_multimodal.GeneratedSingleInputHTTPTests.test_text_convenience_path_is_idempotent_and_rejects_changed_payload",
+      "test_generated_multimodal.GeneratedSingleInputHTTPTests.test_voice_public_flow_uses_real_audio_chunks_asr_hermes_final_and_tts",
+      "test_limits.LimitContractTests.test_audio_duration_limit_is_checked_when_declared",
+      "test_limits.LimitContractTests.test_audio_limit_is_separate_from_attachment_limit",
+      "test_r1_repairs.RecorderR1RepairTests.test_default_audio_contract_accepts_7200_missing_query_with_bounded_page",
+      "test_r1_repairs.RecorderR1RepairTests.test_empty_regular_manifest_is_rejected_without_a_zombie_turn",
+      "test_r1_repairs.RecorderR1RepairTests.test_finish_http_rejects_non_native_integer_values_without_mutation",
+      "test_r1_repairs.RecorderR1RepairTests.test_late_non_origin_relay_preserves_played_journal_after_reopen",
+      "test_r1_repairs.RecorderR1RepairTests.test_missing_ranges_reconstruct_lossless_7200_chunks_and_paginate",
+      "test_r1_repairs.RecorderR1RepairTests.test_missing_ranges_reject_oversized_total_chunks_with_bounded_4xx",
+      "test_r1_repairs.RecorderR1RepairTests.test_non_integer_audio_duration_is_rejected_before_persistence",
+      "test_r1_repairs.RecorderR1RepairTests.test_non_integer_descriptor_numbers_are_rejected_before_persistence",
+      "test_r1_repairs.RecorderR1RepairTests.test_text_convenience_path_rejects_every_non_string_json_value",
+      "test_reliability_contract.GraceAndCASRegressionTests.test_acknowledging_old_hermes_error_does_not_regress_recovered_success",
+      "test_reliability_contract.GraceAndCASRegressionTests.test_delivered_hermes_body_is_purged_but_reference_hashes_remain",
+      "test_reliability_contract.GraceAndCASRegressionTests.test_expired_tts_retains_spool_until_origin_playback_ack",
+      "test_reliability_contract.GraceAndCASRegressionTests.test_hermes_transport_exception_releases_lease_and_reaches_bounded_grace_error",
+      "test_reliability_contract.GraceAndCASRegressionTests.test_late_result_can_rebuild_cumulative_payload_from_hermes_reference",
+      "test_reliability_contract.GraceAndCASRegressionTests.test_recording_lease_defers_tts_generation_until_recording_finishes",
+      "test_reliability_contract.GraceAndCASRegressionTests.test_relay_receipt_requires_registered_non_origin_device",
+      "test_reliability_contract.GraceAndCASRegressionTests.test_repeated_hermes_error_commit_is_idempotent",
+      "test_reliability_contract.GraceAndCASRegressionTests.test_result_after_grace_expiry_is_ignored",
+      "test_reliability_contract.GraceAndCASRegressionTests.test_revoked_origin_device_cannot_complete_playback",
+      "test_reliability_contract.GraceAndCASRegressionTests.test_route_rejects_stale_project_record_version",
+      "test_reliability_contract.RecoveryAndConcurrencyTests.test_concurrent_claim_has_one_winner",
+      "test_reliability_contract.RecoveryAndConcurrencyTests.test_restart_recovery_expires_elapsed_late_result_grace",
+      "test_reliability_contract.RecoveryAndConcurrencyTests.test_restart_recovery_requeues_expired_router_and_ingress_leases",
+      "test_scheduled_final.ScheduledFinalHTTPAndMigrationTests.test_openapi_exposes_scheduled_protocol_and_migration_is_additive",
+      "test_scheduled_final.ScheduledFinalHTTPAndMigrationTests.test_r4_database_upgrades_additively_to_scheduled_schema",
+      "test_scheduled_final.ScheduledFinalHTTPAndMigrationTests.test_trusted_adapter_http_and_readback_surfaces",
+      "test_scheduled_final.ScheduledFinalStoreTests.test_concurrent_workers_and_expired_lease_are_lossless",
+      "test_scheduled_final.ScheduledFinalStoreTests.test_expired_claim_can_be_taken_over_without_duplicate_identity",
+      "test_scheduled_final.ScheduledFinalStoreTests.test_expired_generated_tts_cannot_be_acknowledged_as_played",
+      "test_scheduled_final.ScheduledFinalStoreTests.test_expiry_creates_distinct_server_turn_final_v1_and_targeted_tts",
+      "test_scheduled_final.ScheduledFinalStoreTests.test_explicit_schedule_target_wins_over_latest_phone_origin_for_scheduled_delivery",
+      "test_scheduled_final.ScheduledFinalStoreTests.test_explicit_target_snapshot_is_atomic_between_claim_and_server_turn_creation",
+      "test_scheduled_final.ScheduledFinalStoreTests.test_explicit_target_stays_phone_across_latest_watch_turn",
+      "test_scheduled_final.ScheduledFinalStoreTests.test_explicit_target_stays_watch_in_inverse_latest_phone_sequence",
+      "test_scheduled_final.ScheduledFinalStoreTests.test_http_bridge_read_and_playback_ack_require_exact_wire_contract",
+      "test_scheduled_final.ScheduledFinalStoreTests.test_playback_ack_requires_generated_artifact_exact_hash_turn_and_version",
+      "test_scheduled_final.ScheduledFinalStoreTests.test_preclaimed_scheduled_uuid_is_rejected_without_scheduled_side_effects",
+      "test_scheduled_final.ScheduledFinalStoreTests.test_recording_lease_defers_scheduled_tts_and_release_replays",
+      "test_scheduled_final.ScheduledFinalStoreTests.test_registered_phone_bridge_reads_watch_tts_but_cannot_complete_playback",
+      "test_scheduled_final.ScheduledFinalStoreTests.test_schedule_create_is_atomic_and_idempotent",
+      "test_scheduled_final.ScheduledFinalStoreTests.test_schedule_failure_rolls_back_without_false_confirmation",
+      "test_scheduled_final.ScheduledFinalStoreTests.test_scheduled_occurrence_replay_returns_original_delivery_without_duplicates",
+      "test_scheduled_final.ScheduledFinalStoreTests.test_text_ack_is_not_tts_playback_and_only_target_can_finish",
+      "test_scheduled_final.ScheduledFinalStoreTests.test_tts_generation_failure_keeps_the_scheduled_artifact_retryable",
+      "test_store_contract.TTSRetentionTests.test_playback_ack_is_origin_bound_and_deletes_only_after_ack",
+      "test_store_contract.UploadAndAcceptanceTests.test_admission_rejects_over_limit_before_turn_bytes_are_stored",
+      "test_store_contract.UploadAndAcceptanceTests.test_disk_free_admission_is_checked_before_acceptance",
+      "test_store_contract.UploadAndAcceptanceTests.test_expired_router_lease_can_be_taken_over_but_cannot_commit_as_old_owner",
+      "test_store_contract.UploadAndAcceptanceTests.test_missing_chunk_cannot_be_accepted_and_finish_is_idempotent",
+      "test_store_contract.UploadAndAcceptanceTests.test_router_lease_cas_transaction_and_ordered_final_outbox",
+      "test_store_contract.UploadAndAcceptanceTests.test_storage_component_rejects_path_traversal_in_part_identifiers"
+    ],
+    "schema": "recorder-next-test-matrix/v2",
+    "sorted_test_id_sha256": "3285d98108d3e3ce514ce890d7594bda6e64d8483b2a8e9eb560f0c9d5bf9e1b",
+    "status": "PASS",
+    "status_code": 0,
+    "test_source_file_count": 12,
+    "test_source_rows": [
+      {
+        "mode": "0444",
+        "path": "tests/test_adapters.py",
+        "sha256": "f1e025f943149b6568f9d6974b4005e82eab642187e2acd2e638c8322ca4df59",
+        "size": 7710
+      },
+      {
+        "mode": "0444",
+        "path": "tests/test_bearer_credential.py",
+        "sha256": "7e541dfe95798d3670fa8bea053b13afbfd9a9bfd84a19379feb639f3aa822b6",
+        "size": 6126
+      },
+      {
+        "mode": "0444",
+        "path": "tests/test_config.py",
+        "sha256": "16f0eab7c5340811c63e217f365b5e7a0e7dcb4d83d9cc36b15e674388e0366f",
+        "size": 560
+      },
+      {
+        "mode": "0444",
+        "path": "tests/test_core_contract.py",
+        "sha256": "f8d57439df1794edfe03eddf7d400f6080f008c7f8dbed9635fcdd2c4fee531d",
+        "size": 1794
+      },
+      {
+        "mode": "0444",
+        "path": "tests/test_extended_contract.py",
+        "sha256": "95117f55f34d82529059c39383418004fe2bebaa99c6c642d64010cc79e1081a",
+        "size": 20366
+      },
+      {
+        "mode": "0444",
+        "path": "tests/test_feature_groups.py",
+        "sha256": "1a00804e6fa18508d689dddb48d8205fdcc2b265cc78360d5ff7f5a1b8bf392f",
+        "size": 30083
+      },
+      {
+        "mode": "0444",
+        "path": "tests/test_generated_multimodal.py",
+        "sha256": "cab07b7f8eefbf83953ea52d8444359d773429f14387c7d215b9ce8310173a5f",
+        "size": 22430
+      },
+      {
+        "mode": "0444",
+        "path": "tests/test_limits.py",
+        "sha256": "7fccdb55ac0465ceb7bd00afe7e1a2604f7bd55c85f31182a47967c29e68da51",
+        "size": 2198
+      },
+      {
+        "mode": "0444",
+        "path": "tests/test_r1_repairs.py",
+        "sha256": "befbcdde607c9e9680b4627c307126b62066f41cff37bfb0894a9c833f56b889",
+        "size": 15266
+      },
+      {
+        "mode": "0444",
+        "path": "tests/test_reliability_contract.py",
+        "sha256": "2cd9d91033b65b22fc51cea56f8e556e42977b159b4fb4125c6a47bfa160cf16",
+        "size": 15971
+      },
+      {
+        "mode": "0444",
+        "path": "tests/test_scheduled_final.py",
+        "sha256": "1238d50a41da11c3661b682fffaee9448ee2a20e573d1607e969ab938d5bd683",
+        "size": 36877
+      },
+      {
+        "mode": "0444",
+        "path": "tests/test_store_contract.py",
+        "sha256": "20a1c01c3f62e7cef692816c9ab3f19da24584ac9b77c3d119af19c4e644ada0",
+        "size": 9739
+      }
+    ],
+    "test_source_sha256": "e48716dca5e8c4f21c633085cbc68db53373b8916f2adbe0bafc270d905e9282",
+    "unique_count": 109
+  },
+  "transaction": {
+    "operator_sha256": "e6ebc57cd81fff53dae88923eafb0f17b9f2fe554eceddc27315842031134a34",
+    "path": "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/feature-groups-r1-rev20/control/transaction-manifest.json",
+    "receipts": {
+      "apply": "apply-feature-groups-r1-rev20.json",
+      "journal": "transaction-feature-groups-r1-rev20.json",
+      "lock": "operator.lock",
+      "rollback": "rollback-feature-groups-r1-rev20.json"
+    },
+    "roots": {
+      "live": "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/feature-groups-r1-rev20/fixture/live",
+      "receipts": "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/feature-groups-r1-rev20/fixture/receipts",
+      "stage": "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/feature-groups-r1-rev20",
+      "state": "/home/rumi/Projects/recorder-next/.worktrees/t_80b77d6b/artifacts/feature-groups-r1-rev20/fixture/state"
+    },
+    "sha256": "e8a7dd69c2e3cbf79428e6ab77af5a89ab26712314c4ae64313005b3d203548c"
+  }
+}

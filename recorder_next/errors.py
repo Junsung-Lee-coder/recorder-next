@@ -26,6 +26,11 @@ class ConflictError(RecorderError):
     status = 409
 
 
+class RangeNotSatisfiable(RecorderError):
+    code = "RANGE_NOT_SATISFIABLE"
+    status = 416
+
+
 class TurnIdConflict(ConflictError):
     code = "TURN_ID_CONFLICT"
 
@@ -55,6 +60,13 @@ class ProviderError(RecorderError):
 
 class NotReadyError(RecorderError):
     code = "NOT_READY"
+    status = 409
+
+
+class CleanupIncompleteError(ConflictError):
+    """A managed file operation remains pending physical cleanup."""
+
+    code = "CLEANUP_INCOMPLETE"
     status = 409
 
 
