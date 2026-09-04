@@ -17,6 +17,7 @@ from urllib.parse import quote
 from .canonical import canonical_json, hermes_content_hash, normalize_hermes_text, sha256_bytes, sha256_json
 from .errors import (
     ChunkConflict,
+    CleanupIncompleteError,
     ConflictError,
     LeaseConflict,
     MissingParts,
@@ -140,6 +141,7 @@ class RecorderStore:
             if version < 4:
                 self._apply_eavesdrop_migration(conn)
                 conn.execute("UPDATE schema_meta SET value='4' WHERE key='schema_version'")
+                version = 4
             conn.execute("INSERT OR IGNORE INTO schema_meta(key, value) VALUES ('schema_version', '4')")
         finally:
             conn.close()
@@ -255,6 +257,7 @@ class RecorderStore:
             statements.append(line)
         conn.executescript("\n".join(statements))
 
+
     def _now(self) -> str:
         if self._clock is None:
             return utc_now()
@@ -349,6 +352,103 @@ class RecorderStore:
         from .features import FeatureGroups
 
         FeatureGroups._unlink_managed_file(self.storage_root, path)
+
+    def _canonical_storage_path(self, path: str | os.PathLike[str]) -> Path:
+        root = Path(os.path.abspath(os.fspath(self.storage_root)))
+        candidate = Path(os.path.abspath(os.fspath(path)))
+        try:
+            candidate.relative_to(root)
+        except ValueError as exc:
+            raise UnauthorizedError("cleanup path escapes the storage root") from exc
+        return candidate
+
+    def _cleanup_receipt_id(self, operation: str, path: Path, expected_sha256: str, expected_size: int) -> str:
+        if not isinstance(operation, str) or not re.fullmatch(r"[a-z][a-z0-9_.-]{0,63}", operation):
+            raise ValidationError("cleanup operation is invalid")
+        if not isinstance(expected_sha256, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", expected_sha256):
+            raise ValidationError("cleanup receipt hash is invalid")
+        if not isinstance(expected_size, int) or isinstance(expected_size, bool) or expected_size < 0:
+            raise ValidationError("cleanup receipt size is invalid")
+        return str(uuid.uuid5(uuid.NAMESPACE_URL, f"recorder-next:cleanup:{operation}:{path}:{expected_sha256.lower()}:{expected_size}"))
+
+    def _prepare_cleanup_receipt_tx(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        operation: str,
+        path: str | os.PathLike[str],
+        expected_sha256: str,
+        expected_size: int,
+        user_id: str | None = None,
+        device_id: str | None = None,
+        entity_type: str | None = None,
+        entity_id: str | None = None,
+        now: str | None = None,
+    ) -> str:
+        canonical_path = self._canonical_storage_path(path)
+        receipt_id = self._cleanup_receipt_id(operation, canonical_path, expected_sha256, expected_size)
+        timestamp = now or self._now()
+        conn.execute(
+            """
+            INSERT INTO storage_cleanup_receipts(
+                receipt_id, operation, storage_path, expected_sha256, expected_size,
+                user_id, device_id, entity_type, entity_id, status, attempt_count,
+                last_error, created_at, updated_at, completed_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', 0, NULL, ?, ?, NULL)
+            ON CONFLICT(receipt_id) DO UPDATE SET
+                operation=excluded.operation,
+                storage_path=excluded.storage_path,
+                expected_sha256=excluded.expected_sha256,
+                expected_size=excluded.expected_size,
+                user_id=excluded.user_id,
+                device_id=excluded.device_id,
+                entity_type=excluded.entity_type,
+                entity_id=excluded.entity_id,
+                status='PENDING',
+                attempt_count=0,
+                last_error=NULL,
+                updated_at=excluded.updated_at,
+                completed_at=NULL
+            """,
+            (
+                receipt_id,
+                operation,
+                str(canonical_path),
+                expected_sha256.lower(),
+                expected_size,
+                user_id,
+                device_id,
+                entity_type,
+                entity_id,
+                timestamp,
+                timestamp,
+            ),
+        )
+        return receipt_id
+
+    def _prepare_cleanup_receipt(self, **kwargs: Any) -> str:
+        with self._tx() as conn:
+            return self._prepare_cleanup_receipt_tx(conn, **kwargs)
+
+    @staticmethod
+    def _complete_cleanup_receipt_tx(conn: sqlite3.Connection, receipt_id: str, *, now: str | None = None) -> None:
+        timestamp = now or utc_now()
+        conn.execute(
+            "UPDATE storage_cleanup_receipts SET status='COMPLETE', last_error=NULL, updated_at=?, completed_at=? WHERE receipt_id=?",
+            (timestamp, timestamp, receipt_id),
+        )
+
+    def _complete_cleanup_receipt(self, receipt_id: str, *, now: str | None = None) -> None:
+        with self._tx() as conn:
+            self._complete_cleanup_receipt_tx(conn, receipt_id, now=now)
+
+    def recover_cleanup_receipts(
+        self,
+        *,
+        receipt_ids: list[str] | None = None,
+        now: str | None = None,
+    ) -> dict[str, int]:
+        return self._features.recover_cleanup_receipts(receipt_ids=receipt_ids, now=now)
 
     def _validate_turn_id(self, value: Any) -> str:
         if not isinstance(value, str) or not UUIDISH.fullmatch(value):
@@ -648,66 +748,88 @@ class RecorderStore:
         if expected_sha256 is not None and expected_sha256 != digest:
             raise ConflictError("chunk sha256 does not match payload")
         now = utc_now()
-        path: Path | None = None
-        with self._tx() as conn:
+        with self._read() as conn:
             turn = self._turn_row(conn, turn_id)
             self._assert_turn_owner_tx(conn, turn, user_id, device_id)
             part = conn.execute(
-                "SELECT * FROM turn_parts WHERE turn_id = ? AND part_id = ?", (turn_id, part_id)
+                "SELECT part_id FROM turn_parts WHERE turn_id = ? AND part_id = ?", (turn_id, part_id)
             ).fetchone()
             if part is None:
                 raise NotFoundError("part not found")
-            existing = conn.execute(
-                "SELECT * FROM turn_chunks WHERE turn_id=? AND part_id=? AND sequence=?",
-                (turn_id, part_id, sequence),
-            ).fetchone()
-            if existing is not None:
-                if existing["sha256"] == digest and existing["byte_length"] == len(payload):
-                    return {"duplicate": True, **(_row(existing) or {})}
-                raise ChunkConflict("same chunk sequence has a different hash")
-            previous_bytes = conn.execute(
-                "SELECT COALESCE(SUM(byte_length), 0) FROM turn_chunks WHERE turn_id=? AND part_id=?",
-                (turn_id, part_id),
-            ).fetchone()[0]
-            kind = part["kind"]
-            per_part_limit = self.max_text_bytes if kind == "text" else self.max_audio_bytes if kind == "audio" else self.max_attachment_bytes
-            if int(previous_bytes) + len(payload) > per_part_limit:
-                raise QuotaExceeded("part exceeds configured size limit")
-            turn_bytes = conn.execute(
-                "SELECT COALESCE(SUM(byte_length), 0) FROM turn_chunks WHERE turn_id=?",
-                (turn_id,),
-            ).fetchone()[0]
-            if int(turn_bytes) + len(payload) > self.max_turn_bytes:
-                raise QuotaExceeded("turn exceeds configured byte limit")
-            if part["declared_bytes"] is not None and int(previous_bytes) + len(payload) > int(part["declared_bytes"]):
-                raise ConflictError("chunk payload exceeds declared part size")
-            if self.max_user_storage_bytes is not None:
-                user_bytes = conn.execute(
-                    "SELECT COALESCE(SUM(c.byte_length), 0) FROM turn_chunks c JOIN turns t ON t.turn_id=c.turn_id WHERE t.user_id=? AND t.archived_at IS NULL",
-                    (turn["user_id"],),
-                ).fetchone()[0]
-                if int(user_bytes) + len(payload) > self.max_user_storage_bytes:
-                    raise QuotaExceeded("user storage quota would be exceeded")
             path = self._part_dir(turn["user_id"], turn_id, part_id) / f"{sequence:08d}.chunk"
-            self._safe_write(path, payload)
-            try:
+        receipt_id = self._prepare_cleanup_receipt(
+            operation="turn_chunk_rollback",
+            path=path,
+            expected_sha256=digest,
+            expected_size=len(payload),
+            user_id=turn["user_id"],
+            device_id=turn["origin_device_id"],
+            entity_type="turn_chunk",
+            entity_id=f"{turn_id}:{part_id}:{sequence}",
+            now=now,
+        )
+        try:
+            with self._tx() as conn:
+                turn = self._turn_row(conn, turn_id)
+                self._assert_turn_owner_tx(conn, turn, user_id, device_id)
+                part = conn.execute(
+                    "SELECT * FROM turn_parts WHERE turn_id = ? AND part_id = ?", (turn_id, part_id)
+                ).fetchone()
+                if part is None:
+                    raise NotFoundError("part not found")
+                existing = conn.execute(
+                    "SELECT * FROM turn_chunks WHERE turn_id=? AND part_id=? AND sequence=?",
+                    (turn_id, part_id, sequence),
+                ).fetchone()
+                if existing is not None:
+                    if existing["sha256"] == digest and existing["byte_length"] == len(payload):
+                        self._complete_cleanup_receipt_tx(conn, receipt_id, now=now)
+                        return {"duplicate": True, **(_row(existing) or {})}
+                    raise ChunkConflict("same chunk sequence has a different hash")
+                previous_bytes = conn.execute(
+                    "SELECT COALESCE(SUM(byte_length), 0) FROM turn_chunks WHERE turn_id=? AND part_id=?",
+                    (turn_id, part_id),
+                ).fetchone()[0]
+                kind = part["kind"]
+                per_part_limit = self.max_text_bytes if kind == "text" else self.max_audio_bytes if kind == "audio" else self.max_attachment_bytes
+                if int(previous_bytes) + len(payload) > per_part_limit:
+                    raise QuotaExceeded("part exceeds configured size limit")
+                turn_bytes = conn.execute(
+                    "SELECT COALESCE(SUM(byte_length), 0) FROM turn_chunks WHERE turn_id=?",
+                    (turn_id,),
+                ).fetchone()[0]
+                if int(turn_bytes) + len(payload) > self.max_turn_bytes:
+                    raise QuotaExceeded("turn exceeds configured byte limit")
+                if part["declared_bytes"] is not None and int(previous_bytes) + len(payload) > int(part["declared_bytes"]):
+                    raise ConflictError("chunk payload exceeds declared part size")
+                if self.max_user_storage_bytes is not None:
+                    user_bytes = conn.execute(
+                        "SELECT COALESCE(SUM(c.byte_length), 0) FROM turn_chunks c JOIN turns t ON t.turn_id=c.turn_id WHERE t.user_id=? AND t.archived_at IS NULL",
+                        (turn["user_id"],),
+                    ).fetchone()[0]
+                    if int(user_bytes) + len(payload) > self.max_user_storage_bytes:
+                        raise QuotaExceeded("user storage quota would be exceeded")
+                path = self._part_dir(turn["user_id"], turn_id, part_id) / f"{sequence:08d}.chunk"
+                self._safe_write(path, payload)
                 conn.execute(
                     "INSERT INTO turn_chunks(turn_id, part_id, sequence, byte_length, sha256, storage_path, received_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
                     (turn_id, part_id, sequence, len(payload), digest, str(path), now),
                 )
-            except Exception:
-                with contextlib.suppress(FileNotFoundError, OSError, RecorderError):
-                    self._safe_unlink(path)
-                raise
-            return {
-                "duplicate": False,
-                "turn_id": turn_id,
-                "part_id": part_id,
-                "sequence": sequence,
-                "byte_length": len(payload),
-                "sha256": digest,
-                "storage_path": str(path),
-            }
+                self._complete_cleanup_receipt_tx(conn, receipt_id, now=now)
+                return {
+                    "duplicate": False,
+                    "turn_id": turn_id,
+                    "part_id": part_id,
+                    "sequence": sequence,
+                    "byte_length": len(payload),
+                    "sha256": digest,
+                    "storage_path": str(path),
+                }
+        except Exception as exc:
+            cleanup = self.recover_cleanup_receipts(receipt_ids=[receipt_id], now=now)
+            if cleanup["pending"] or cleanup["blocked"]:
+                raise CleanupIncompleteError("chunk rollback cleanup is incomplete") from exc
+            raise
 
     def _validate_total_chunks(self, value: Any, *, kind: str | None = None) -> int:
         if not isinstance(value, int) or isinstance(value, bool):
@@ -2634,6 +2756,15 @@ class RecorderStore:
         for pending_turn_id in source_pending:
             if self.retry_source_deletion(pending_turn_id):
                 result["source_deletions_retried"] += 1
+        cleanup = self.recover_cleanup_receipts(now=now)
+        result.update(
+            {
+                "cleanup_receipts_attempted": cleanup["attempted"],
+                "cleanup_receipts_completed": cleanup["completed"],
+                "cleanup_receipts_pending": cleanup["pending"],
+                "cleanup_receipts_blocked": cleanup["blocked"],
+            }
+        )
         return result
 
     def release_session_ingress(self, submission_id: str, *, owner: str) -> bool:
@@ -2902,6 +3033,6 @@ class RecorderStore:
         return self._features.purge_diagnostics(**kwargs)
 
     def db_snapshot(self) -> dict[str, int]:
-        tables = ["turns", "turn_parts", "turn_chunks", "events", "outbox", "router_queue", "projects", "session_ingress", "hermes_results", "final_versions", "tts_artifacts", "asr_attempts", "schedules", "schedule_occurrences", "worker_jobs", "worker_attempts", "update_channels", "update_manifests", "eavesdrop_sessions", "eavesdrop_segments", "eavesdrop_replies", "eavesdrop_decisions", "diagnostics_consents", "diagnostic_events", "diagnostic_bundles", "diagnostic_tombstones"]
+        tables = ["turns", "turn_parts", "turn_chunks", "events", "outbox", "router_queue", "projects", "session_ingress", "hermes_results", "final_versions", "tts_artifacts", "asr_attempts", "schedules", "schedule_occurrences", "worker_jobs", "worker_attempts", "update_channels", "update_manifests", "eavesdrop_sessions", "eavesdrop_segments", "eavesdrop_replies", "eavesdrop_decisions", "diagnostics_consents", "diagnostic_events", "diagnostic_bundles", "diagnostic_tombstones", "storage_cleanup_receipts"]
         with self._read() as conn:
             return {table: conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] for table in tables}

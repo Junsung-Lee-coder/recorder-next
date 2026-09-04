@@ -63,5 +63,12 @@ class NotReadyError(RecorderError):
     status = 409
 
 
+class CleanupIncompleteError(ConflictError):
+    """A managed file operation remains pending physical cleanup."""
+
+    code = "CLEANUP_INCOMPLETE"
+    status = 409
+
+
 class QuotaExceeded(ConflictError):
     code = "QUOTA_EXCEEDED"

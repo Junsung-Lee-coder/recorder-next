@@ -3,14 +3,16 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import sqlite3
 import tempfile
 import unittest
 import zlib
 from pathlib import Path
+from unittest.mock import patch
 
 from recorder_next.adapters import AsrResult, ChainFailure, CredentialError, HttpASRProvider, HttpHermesGateway, HttpTTSProvider, MemoryHermesGateway, ProviderChain, ProviderFailure, ProviderTarget, StaticASRProvider, StaticTTSProvider
 from recorder_next.config import ProviderConfig, RecorderConfig
-from recorder_next.errors import ConflictError, UnauthorizedError
+from recorder_next.errors import CleanupIncompleteError, ConflictError, UnauthorizedError
 from recorder_next.features import DurableProcessingWorker
 from recorder_next.models import HermesResult
 from recorder_next.service import RecorderService, create_configured_service
@@ -533,6 +535,121 @@ class AttachmentEavesdropDiagnosticsFeatureTests(unittest.TestCase):
             store.record_diagnostics_opt_in("feature-user", "feature-phone", event_id="opt-out-new", enabled=False, now="2026-09-03T00:00:01Z")
             with self.assertRaises(UnauthorizedError):
                 store.ingest_diagnostic_event("feature-user", "feature-phone", event_id="diag-revoked", idempotency_key="diag-revoked", payload={"category": "voice", "stage": "upload"}, now="2026-09-03T00:00:02Z")
+
+    def test_failed_chunk_insert_keeps_cleanup_receipt_until_restart_retry(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = RecorderStore(root / "db.sqlite3", storage_root=root / "data")
+            turn_id = "018f5a2e-7b6e-7abc-8d11-1234567890ad"
+            store.create_turn({
+                "schema_version": 1,
+                "user_id": "feature-user",
+                "turn_id": turn_id,
+                "origin_device_id": "feature-phone",
+                "client_created_at": "2026-09-03T00:00:00Z",
+                "parts": [{"part_id": "part-1", "kind": "text", "mime": "text/plain", "declared_bytes": 2}],
+            })
+            with sqlite3.connect(store.db_path) as conn:
+                conn.execute("CREATE TRIGGER abort_chunk BEFORE INSERT ON turn_chunks BEGIN SELECT RAISE(ABORT, 'qa-abort'); END")
+            part_id = "part-1"
+            path = store._part_dir("feature-user", turn_id, part_id) / "00000001.chunk"
+            with patch.object(Path, "unlink", side_effect=PermissionError("injected cleanup failure")):
+                with self.assertRaises(CleanupIncompleteError):
+                    store.put_chunk(turn_id, part_id, 1, b"x")
+            self.assertTrue(path.exists())
+            with store._read() as conn:
+                receipt = conn.execute("SELECT operation, status, attempt_count FROM storage_cleanup_receipts WHERE storage_path=?", (str(path),)).fetchone()
+                self.assertEqual(dict(receipt), {"operation": "turn_chunk_rollback", "status": "PENDING", "attempt_count": 1})
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM turn_chunks WHERE turn_id=? AND sequence=1", (turn_id,)).fetchone()[0], 0)
+            reopened = RecorderStore(root / "db.sqlite3", storage_root=root / "data")
+            recovered = reopened.recover(now="2026-09-04T00:00:01+00:00")
+            self.assertEqual(recovered["cleanup_receipts_completed"], 1)
+            self.assertFalse(path.exists())
+
+    def test_failed_diagnostic_ingest_and_update_rollback_are_receipted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = RecorderStore(root / "db.sqlite3", storage_root=root / "data")
+            store.register_device("cleanup-user", "cleanup-phone", "phone")
+            opt_in = store.record_diagnostics_opt_in("cleanup-user", "cleanup-phone", event_id="cleanup-opt-in")
+            with sqlite3.connect(store.db_path) as conn:
+                conn.execute("CREATE TRIGGER abort_bundle BEFORE INSERT ON diagnostic_bundles BEGIN SELECT RAISE(ABORT, 'qa-abort'); END")
+                conn.execute("CREATE TRIGGER abort_update BEFORE INSERT ON update_manifests BEGIN SELECT RAISE(ABORT, 'qa-abort'); END")
+            bundle_path = root / "data" / "diagnostics" / hashlib.sha256(b"cleanup-user").hexdigest() / "bundle-cleanup.z"
+            update_path = root / "data" / "updates" / "qa" / "1" / "cleanup.apk"
+            compressed = zlib.compress(b'{"category":"cleanup","status":"ok"}')
+            with patch.object(Path, "unlink", side_effect=PermissionError("injected cleanup failure")):
+                with self.assertRaises(CleanupIncompleteError):
+                    store.ingest_diagnostic_bundle("cleanup-user", "cleanup-phone", "bundle-cleanup", compressed, opt_in_event_id=opt_in["event_id"])
+                with self.assertRaises(CleanupIncompleteError):
+                    store.publish_update_manifest(
+                        channel="qa",
+                        generation=1,
+                        platform="phone",
+                        version="1.0.0",
+                        version_code=1,
+                        artifact_name="cleanup.apk",
+                        signer_digest="a" * 64,
+                        changelog="cleanup",
+                        min_server_version="1",
+                        authorization_policy="qa",
+                        artifact_bytes=b"synthetic-apk",
+                        expected_generation=0,
+                    )
+            self.assertTrue(bundle_path.exists())
+            self.assertTrue(update_path.exists())
+            with store._read() as conn:
+                rows = conn.execute("SELECT operation, status FROM storage_cleanup_receipts WHERE status='PENDING' ORDER BY operation").fetchall()
+                self.assertEqual([tuple(row) for row in rows], [("diagnostic_bundle_ingest_rollback", "PENDING"), ("update_manifest_rollback", "PENDING")])
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM diagnostic_bundles").fetchone()[0], 0)
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM update_manifests").fetchone()[0], 0)
+            reopened = RecorderStore(root / "db.sqlite3", storage_root=root / "data")
+            recovered = reopened.recover(now="2026-09-04T00:00:02+00:00")
+            self.assertEqual(recovered["cleanup_receipts_completed"], 2)
+            self.assertFalse(bundle_path.exists())
+            self.assertFalse(update_path.exists())
+
+    def test_diagnostics_delete_fails_closed_and_recovery_removes_bundle(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = RecorderStore(root / "db.sqlite3", storage_root=root / "data")
+            store.register_device("delete-user", "delete-phone", "phone")
+            opt_in = store.record_diagnostics_opt_in("delete-user", "delete-phone", event_id="delete-opt-in")
+            compressed = zlib.compress(b'{"category":"delete","status":"ok"}')
+            store.ingest_diagnostic_bundle("delete-user", "delete-phone", "bundle-delete", compressed, opt_in_event_id=opt_in["event_id"])
+            with store._read() as conn:
+                path = Path(conn.execute("SELECT storage_path FROM diagnostic_bundles WHERE bundle_id='bundle-delete'").fetchone()[0])
+            with patch.object(Path, "unlink", side_effect=PermissionError("injected cleanup failure")):
+                with self.assertRaises(CleanupIncompleteError):
+                    store.delete_diagnostics("delete-user", "delete-phone")
+            self.assertTrue(path.exists())
+            self.assertEqual(store.list_diagnostics("delete-user", "delete-phone")["items"], [])
+            with store._read() as conn:
+                self.assertEqual(conn.execute("SELECT status FROM storage_cleanup_receipts WHERE operation='diagnostic_delete'").fetchone()[0], "PENDING")
+            recovered = store.recover(now="2026-09-04T00:00:03+00:00")
+            self.assertEqual(recovered["cleanup_receipts_completed"], 1)
+            self.assertFalse(path.exists())
+
+    def test_diagnostics_purge_fails_closed_and_retry_is_idempotent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = RecorderStore(root / "db.sqlite3", storage_root=root / "data", diagnostics_retention_seconds=1)
+            store.register_device("purge-user", "purge-phone", "phone")
+            opt_in = store.record_diagnostics_opt_in("purge-user", "purge-phone", event_id="purge-opt-in", now="2026-09-04T00:00:00Z")
+            compressed = zlib.compress(b'{"category":"purge","status":"ok"}')
+            store.ingest_diagnostic_bundle("purge-user", "purge-phone", "bundle-purge", compressed, opt_in_event_id=opt_in["event_id"], now="2026-09-04T00:00:00Z")
+            with store._read() as conn:
+                path = Path(conn.execute("SELECT storage_path FROM diagnostic_bundles WHERE bundle_id='bundle-purge'").fetchone()[0])
+            with patch.object(Path, "unlink", side_effect=PermissionError("injected cleanup failure")):
+                with self.assertRaises(CleanupIncompleteError):
+                    store.purge_diagnostics(now="2026-09-04T00:00:02Z")
+            self.assertTrue(path.exists())
+            with store._read() as conn:
+                self.assertEqual(conn.execute("SELECT status FROM storage_cleanup_receipts WHERE operation='diagnostic_purge'").fetchone()[0], "PENDING")
+            result = store.recover(now="2026-09-04T00:00:03Z")
+            self.assertEqual(result["cleanup_receipts_completed"], 1)
+            self.assertFalse(path.exists())
+            self.assertEqual(store.purge_diagnostics(now="2026-09-04T00:00:04Z"), {"events": 0, "bundles": 0})
 
 
 if __name__ == "__main__":

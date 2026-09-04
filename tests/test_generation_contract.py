@@ -13,7 +13,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).parents[1]
 BUILDER = ROOT / "release" / "build_candidate.py"
-FAILED_PRODUCT_SHA = "def267f5fa28891a481da41ecf12d314ba4c09066e8fcade389b124116e99fba"
+FAILED_PRODUCT_SHA = "b01b345f39d6e40e7ca5bd720de86a80fda7caf603cfcefb59c3ffdf1e3560c8"
 
 
 def digest(path: Path) -> str:
@@ -46,17 +46,11 @@ class FrozenGenerationTests(unittest.TestCase):
             self.assertEqual(
                 manifest["changed_product_paths_from_failed_candidate"],
                 [
-                    "api/openapi.json",
-                    "recorder_next/adapters.py",
+                    "recorder_next/errors.py",
                     "recorder_next/features.py",
-                    "recorder_next/http.py",
-                    "recorder_next/openapi.py",
-                    "recorder_next/service.py",
+                    "recorder_next/schema.sql",
                     "recorder_next/store.py",
-                    "tests/test_extended_contract.py",
-                    "tests/test_generated_multimodal.py",
-                    "tests/test_r1_repairs.py",
-                    "tests/test_scheduled_final.py",
+                    "tests/test_feature_groups.py",
                 ],
             )
             self.assertEqual(manifest["approved_for_live_change"], False)

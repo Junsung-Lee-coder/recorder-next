@@ -24,7 +24,7 @@ from typing import Any, Callable, Mapping
 from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 from .canonical import canonical_json, normalize_hermes_text, sha256_bytes, sha256_json
-from .errors import ConflictError, LeaseConflict, NotFoundError, NotReadyError, RangeNotSatisfiable, RecorderError, UnauthorizedError, ValidationError
+from .errors import CleanupIncompleteError, ConflictError, LeaseConflict, NotFoundError, NotReadyError, RangeNotSatisfiable, RecorderError, UnauthorizedError, ValidationError
 
 
 DIGEST_RE = re.compile(r"^[0-9a-fA-F]{64}$")
@@ -376,6 +376,172 @@ class FeatureGroups:
             if directory_descriptor != root_descriptor:
                 os.close(directory_descriptor)
             os.close(root_descriptor)
+
+    @classmethod
+    def _managed_file_state(cls, root: Path, path: Path) -> tuple[str, str | None]:
+        """Inspect a managed path without following symlink components."""
+
+        root = cls._lexical_absolute(root)
+        path = cls._lexical_absolute(path, reject_parent=True)
+        try:
+            relative = path.relative_to(root)
+        except ValueError:
+            return "blocked", "cleanup path escapes the storage root"
+        if not relative.parts:
+            return "blocked", "cleanup path names the storage root"
+        current = root
+        for index, component in enumerate(relative.parts):
+            current = current / component
+            try:
+                info = os.lstat(current)
+            except FileNotFoundError:
+                return "missing", None
+            except OSError as exc:
+                return "error", f"{type(exc).__name__}: {str(exc)[:160]}"
+            if stat.S_ISLNK(info.st_mode):
+                return "blocked", "cleanup path contains a symlink"
+            if index < len(relative.parts) - 1 and not stat.S_ISDIR(info.st_mode):
+                return "blocked", "cleanup path contains a non-directory component"
+            if index == len(relative.parts) - 1 and not stat.S_ISREG(info.st_mode):
+                return "blocked", "cleanup target is not a regular file"
+        return "present", None
+
+    def _cleanup_reference_state(self, receipt: Mapping[str, Any]) -> str:
+        """Return whether a rollback receipt now owns a durable row."""
+
+        if not str(receipt["operation"]).endswith("_rollback"):
+            return "unowned"
+        target = self._lexical_absolute(Path(receipt["storage_path"]), reject_parent=True)
+        expected_digest = str(receipt["expected_sha256"]).lower()
+        expected_size = int(receipt["expected_size"])
+        references: list[tuple[str, str, str, int | None]] = []
+
+        def canonical_reference(value: Any, *, relative: bool = False) -> Path | None:
+            try:
+                raw = self.store.storage_root / str(value) if relative else Path(str(value))
+                return self._lexical_absolute(raw, reject_parent=True)
+            except (TypeError, UnauthorizedError, ValueError):
+                return None
+
+        with self.store._read() as conn:
+            for row in conn.execute("SELECT storage_path, sha256, byte_length FROM turn_chunks").fetchall():
+                if canonical_reference(row["storage_path"]) == target:
+                    references.append((str(row["storage_path"]), str(row["sha256"]), "turn_chunk", row["byte_length"]))
+            for row in conn.execute("SELECT storage_path, payload_sha256, compressed_size FROM diagnostic_bundles").fetchall():
+                if canonical_reference(row["storage_path"]) == target:
+                    references.append((str(row["storage_path"]), str(row["payload_sha256"]), "diagnostic_bundle", row["compressed_size"]))
+            for row in conn.execute("SELECT artifact_relpath, artifact_sha256, size FROM update_manifests").fetchall():
+                candidate = canonical_reference(row["artifact_relpath"], relative=True)
+                if candidate is not None and candidate == target:
+                    references.append((str(candidate), str(row["artifact_sha256"]), "update_manifest", row["size"]))
+            for row in conn.execute("SELECT source_path, whole_stream_sha256, total_bytes FROM turn_parts WHERE source_path IS NOT NULL").fetchall():
+                if canonical_reference(row["source_path"]) == target:
+                    references.append((str(row["source_path"]), str(row["whole_stream_sha256"]), "turn_part", row["total_bytes"]))
+            for row in conn.execute("SELECT storage_path, payload_sha256, byte_size FROM tts_artifacts WHERE storage_path IS NOT NULL").fetchall():
+                if canonical_reference(row["storage_path"]) == target:
+                    references.append((str(row["storage_path"]), str(row["payload_sha256"]), "tts_artifact", row["byte_size"]))
+            for row in conn.execute("SELECT storage_path, audio_sha256, byte_length FROM eavesdrop_segments").fetchall():
+                if canonical_reference(row["storage_path"]) == target:
+                    references.append((str(row["storage_path"]), str(row["audio_sha256"]), "eavesdrop_segment", row["byte_length"]))
+        for _path, digest, _kind, size in references:
+            if digest.lower() == expected_digest and size is not None and int(size) == expected_size:
+                return "owned"
+            return "conflict"
+        return "unowned"
+
+    @staticmethod
+    def _cleanup_error(exc: BaseException) -> str:
+        detail = str(exc).replace("\n", " ")[:160]
+        return f"{type(exc).__name__}: {detail}" if detail else type(exc).__name__
+
+    def _mark_cleanup_receipt_attempt(self, receipt_id: str, *, status: str, error: str, now: str) -> None:
+        with self.store._tx() as conn:
+            conn.execute(
+                "UPDATE storage_cleanup_receipts SET status=?, attempt_count=attempt_count+1, last_error=?, updated_at=?, completed_at=NULL WHERE receipt_id=? AND status IN ('PENDING', 'BLOCKED')",
+                (status, error, now, receipt_id),
+            )
+
+    def recover_cleanup_receipts(
+        self,
+        *,
+        receipt_ids: list[str] | None = None,
+        now: str | None = None,
+    ) -> dict[str, int]:
+        timestamp = self._time(now, self.store)
+        if receipt_ids is not None and not receipt_ids:
+            return {"attempted": 0, "completed": 0, "pending": 0, "blocked": 0}
+        with self.store._read() as conn:
+            if receipt_ids is None:
+                rows = conn.execute("SELECT * FROM storage_cleanup_receipts WHERE status IN ('PENDING', 'BLOCKED') ORDER BY created_at, receipt_id").fetchall()
+            else:
+                placeholders = ",".join("?" for _ in receipt_ids)
+                rows = conn.execute(
+                    f"SELECT * FROM storage_cleanup_receipts WHERE status IN ('PENDING', 'BLOCKED') AND receipt_id IN ({placeholders}) ORDER BY created_at, receipt_id",
+                    tuple(receipt_ids),
+                ).fetchall()
+        attempted = completed = blocked = 0
+        for row in rows:
+            attempted += 1
+            reference_state = self._cleanup_reference_state(row)
+            if reference_state == "owned":
+                self.store._complete_cleanup_receipt(row["receipt_id"], now=timestamp)
+                completed += 1
+                continue
+            if reference_state == "conflict":
+                self._mark_cleanup_receipt_attempt(row["receipt_id"], status="BLOCKED", error="cleanup target is referenced by a different durable artifact", now=timestamp)
+                blocked += 1
+                continue
+            path = Path(row["storage_path"])
+            state, detail = self._managed_file_state(self.store.storage_root, path)
+            if state == "missing":
+                self.store._complete_cleanup_receipt(row["receipt_id"], now=timestamp)
+                completed += 1
+                continue
+            if state == "blocked":
+                self._mark_cleanup_receipt_attempt(row["receipt_id"], status="BLOCKED", error=detail or "cleanup target is unsafe", now=timestamp)
+                blocked += 1
+                continue
+            if state == "error":
+                self._mark_cleanup_receipt_attempt(row["receipt_id"], status="PENDING", error=detail or "cleanup target cannot be inspected", now=timestamp)
+                continue
+            try:
+                self._read_managed_bytes(
+                    self.store.storage_root,
+                    path,
+                    expected_size=int(row["expected_size"]),
+                    expected_sha256=str(row["expected_sha256"]),
+                )
+            except ConflictError as exc:
+                self._mark_cleanup_receipt_attempt(row["receipt_id"], status="BLOCKED", error=self._cleanup_error(exc), now=timestamp)
+                blocked += 1
+                continue
+            except (OSError, RecorderError) as exc:
+                self._mark_cleanup_receipt_attempt(row["receipt_id"], status="PENDING", error=self._cleanup_error(exc), now=timestamp)
+                continue
+            try:
+                self._unlink_managed_file(self.store.storage_root, path)
+            except FileNotFoundError:
+                self.store._complete_cleanup_receipt(row["receipt_id"], now=timestamp)
+                completed += 1
+            except (OSError, RecorderError) as exc:
+                self._mark_cleanup_receipt_attempt(row["receipt_id"], status="PENDING", error=self._cleanup_error(exc), now=timestamp)
+            else:
+                self.store._complete_cleanup_receipt(row["receipt_id"], now=timestamp)
+                completed += 1
+        with self.store._read() as conn:
+            if receipt_ids is None:
+                pending_row = conn.execute("SELECT COUNT(*) AS count FROM storage_cleanup_receipts WHERE status='PENDING'").fetchone()
+                blocked_row = conn.execute("SELECT COUNT(*) AS count FROM storage_cleanup_receipts WHERE status='BLOCKED'").fetchone()
+            else:
+                placeholders = ",".join("?" for _ in receipt_ids)
+                pending_row = conn.execute(f"SELECT COUNT(*) AS count FROM storage_cleanup_receipts WHERE status='PENDING' AND receipt_id IN ({placeholders})", tuple(receipt_ids)).fetchone()
+                blocked_row = conn.execute(f"SELECT COUNT(*) AS count FROM storage_cleanup_receipts WHERE status='BLOCKED' AND receipt_id IN ({placeholders})", tuple(receipt_ids)).fetchone()
+        return {
+            "attempted": attempted,
+            "completed": completed,
+            "pending": int(pending_row["count"]),
+            "blocked": int(blocked_row["count"]),
+        }
 
     # ---- Group 1: durable autonomous processing worker --------------------
 
@@ -843,7 +1009,17 @@ class FeatureGroups:
             existing_bytes = self._read_managed_bytes(self.store.storage_root, target)
             if sha256_bytes(existing_bytes) != digest:
                 raise ConflictError("update artifact path already contains different bytes")
-        wrote_target = False
+        receipt_id = None
+        if not target_existed:
+            receipt_id = self.store._prepare_cleanup_receipt(
+                operation="update_manifest_rollback",
+                path=target,
+                expected_sha256=digest,
+                expected_size=len(content),
+                entity_type="update_manifest",
+                entity_id=f"{channel}:{generation}",
+                now=timestamp,
+            )
         try:
             with self.store._tx() as conn:
                 existing = conn.execute("SELECT * FROM update_manifests WHERE channel=? AND generation=?", (channel, generation)).fetchone()
@@ -867,7 +1043,6 @@ class FeatureGroups:
                     raise ConflictError("update version_code is already used in this channel")
                 if not target_existed:
                     self.store._safe_write(target, content)
-                    wrote_target = True
                 conn.execute(
                     "INSERT INTO update_manifests(channel, generation, platform, version, version_code, artifact_name, artifact_relpath, artifact_sha256, signer_digest, size, changelog, min_server_version, authorization_policy, etag, manifest_json, manifest_sha256, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (channel, generation, platform, version, version_code, artifact_name, relpath.as_posix(), digest, signer_digest, len(content), changelog, min_server_version, authorization_policy, requested_etag, json.dumps(manifest, ensure_ascii=False, sort_keys=True, separators=(",", ":")), manifest_sha, timestamp),
@@ -876,13 +1051,14 @@ class FeatureGroups:
                     "INSERT INTO update_channels(channel, current_generation, current_manifest_sha256, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT(channel) DO UPDATE SET current_generation=excluded.current_generation, current_manifest_sha256=excluded.current_manifest_sha256, updated_at=excluded.updated_at",
                     (channel, generation, manifest_sha, timestamp),
                 )
+                if receipt_id is not None:
+                    self.store._complete_cleanup_receipt_tx(conn, receipt_id, now=timestamp)
                 return self._update_payload(conn.execute("SELECT * FROM update_manifests WHERE channel=? AND generation=?", (channel, generation)).fetchone(), current_generation=generation)
-        except Exception:
-            if wrote_target:
-                try:
-                    self._unlink_managed_file(self.store.storage_root, target)
-                except (OSError, RecorderError):
-                    pass
+        except Exception as exc:
+            if receipt_id is not None:
+                cleanup = self.store.recover_cleanup_receipts(receipt_ids=[receipt_id], now=timestamp)
+                if cleanup["pending"] or cleanup["blocked"]:
+                    raise CleanupIncompleteError("update artifact rollback cleanup is incomplete") from exc
             raise
 
     def get_update_manifest(self, channel: str, generation: int | None = None) -> dict[str, Any]:
@@ -1802,34 +1978,50 @@ class FeatureGroups:
         timestamp = self._time(now, self.store)
         deadline = self._plus_seconds(timestamp, int(getattr(self.store, "diagnostics_retention_seconds", 7 * 86400)))
         path = self.store.storage_root / "diagnostics" / hashlib.sha256(user_id.encode("utf-8")).hexdigest() / f"{bundle_id}.z"
-        with self.store._tx() as conn:
+        with self.store._read() as conn:
             self.store._assert_device(conn, user_id, device_id)
             if not self._diagnostics_enabled_tx(conn, user_id, device_id, timestamp, opt_in_event_id):
                 raise UnauthorizedError("diagnostic bundle requires the exact active opt-in event")
-            existing = conn.execute("SELECT * FROM diagnostic_bundles WHERE bundle_id=?", (bundle_id,)).fetchone()
-            if existing is not None:
-                if existing["payload_sha256"] != digest or existing["user_id"] != user_id or existing["device_id"] != device_id:
-                    raise ConflictError("diagnostic bundle is immutable")
-                return {"bundle_id": bundle_id, "compressed_size": existing["compressed_size"], "expanded_size": existing["expanded_size"], "payload_sha256": existing["payload_sha256"], "created_at": existing["created_at"], "retention_deadline": existing["retention_deadline"]}
-            same_payload = conn.execute("SELECT * FROM diagnostic_bundles WHERE user_id=? AND device_id=? AND payload_sha256=?", (user_id, device_id, digest)).fetchone()
-            if same_payload is not None:
-                return {"bundle_id": same_payload["bundle_id"], "compressed_size": same_payload["compressed_size"], "expanded_size": same_payload["expanded_size"], "payload_sha256": same_payload["payload_sha256"], "created_at": same_payload["created_at"], "retention_deadline": same_payload["retention_deadline"]}
-            self._mkdir_managed_path(self.store.storage_root, path.parent)
-            path_existed = path.exists()
-            if path_existed and self._read_managed_bytes(self.store.storage_root, path) != redacted_compressed:
-                raise ConflictError("diagnostic bundle path already contains different bytes")
-            try:
+        self._mkdir_managed_path(self.store.storage_root, path.parent)
+        receipt_id = self.store._prepare_cleanup_receipt(
+            operation="diagnostic_bundle_ingest_rollback",
+            path=path,
+            expected_sha256=digest,
+            expected_size=len(redacted_compressed),
+            user_id=user_id,
+            device_id=device_id,
+            entity_type="diagnostic_bundle",
+            entity_id=bundle_id,
+            now=timestamp,
+        )
+        try:
+            with self.store._tx() as conn:
+                self.store._assert_device(conn, user_id, device_id)
+                if not self._diagnostics_enabled_tx(conn, user_id, device_id, timestamp, opt_in_event_id):
+                    raise UnauthorizedError("diagnostic bundle requires the exact active opt-in event")
+                existing = conn.execute("SELECT * FROM diagnostic_bundles WHERE bundle_id=?", (bundle_id,)).fetchone()
+                if existing is not None:
+                    if existing["payload_sha256"] != digest or existing["user_id"] != user_id or existing["device_id"] != device_id:
+                        raise ConflictError("diagnostic bundle is immutable")
+                    self.store._complete_cleanup_receipt_tx(conn, receipt_id, now=timestamp)
+                    return {"bundle_id": bundle_id, "compressed_size": existing["compressed_size"], "expanded_size": existing["expanded_size"], "payload_sha256": existing["payload_sha256"], "created_at": existing["created_at"], "retention_deadline": existing["retention_deadline"]}
+                same_payload = conn.execute("SELECT * FROM diagnostic_bundles WHERE user_id=? AND device_id=? AND payload_sha256=?", (user_id, device_id, digest)).fetchone()
+                if same_payload is not None:
+                    self.store._complete_cleanup_receipt_tx(conn, receipt_id, now=timestamp)
+                    return {"bundle_id": same_payload["bundle_id"], "compressed_size": same_payload["compressed_size"], "expanded_size": same_payload["expanded_size"], "payload_sha256": same_payload["payload_sha256"], "created_at": same_payload["created_at"], "retention_deadline": same_payload["retention_deadline"]}
+                path_existed = path.exists()
+                if path_existed and self._read_managed_bytes(self.store.storage_root, path) != redacted_compressed:
+                    raise ConflictError("diagnostic bundle path already contains different bytes")
                 if not path_existed:
                     self.store._safe_write(path, redacted_compressed)
                 conn.execute("INSERT INTO diagnostic_bundles(bundle_id, user_id, device_id, opt_in_event_id, compressed_size, expanded_size, payload_sha256, storage_path, created_at, retention_deadline) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", (bundle_id, user_id, device_id, opt_in_event_id, len(redacted_compressed), len(expanded), digest, str(path), timestamp, deadline))
-            except Exception:
-                if not path_existed and path.exists():
-                    try:
-                        self._unlink_managed_file(self.store.storage_root, path)
-                    except (OSError, RecorderError):
-                        pass
-                raise
-            return {"bundle_id": bundle_id, "compressed_size": len(redacted_compressed), "expanded_size": len(expanded), "payload_sha256": digest, "created_at": timestamp, "retention_deadline": deadline}
+                self.store._complete_cleanup_receipt_tx(conn, receipt_id, now=timestamp)
+                return {"bundle_id": bundle_id, "compressed_size": len(redacted_compressed), "expanded_size": len(expanded), "payload_sha256": digest, "created_at": timestamp, "retention_deadline": deadline}
+        except Exception as exc:
+            cleanup = self.store.recover_cleanup_receipts(receipt_ids=[receipt_id], now=timestamp)
+            if cleanup["pending"] or cleanup["blocked"]:
+                raise CleanupIncompleteError("diagnostic bundle rollback cleanup is incomplete") from exc
+            raise
 
     def list_diagnostics(self, user_id: str, device_id: str, *, category: str | None = None, stage: str | None = None, limit: int = 100) -> dict[str, Any]:
         self._identifier(device_id, "device_id")
@@ -1869,46 +2061,69 @@ class FeatureGroups:
     def delete_diagnostics(self, user_id: str, device_id: str, *, now: str | None = None) -> dict[str, int]:
         self._identifier(device_id, "device_id")
         timestamp = self._time(now, self.store)
-        paths: list[Path] = []
         with self.store._tx() as conn:
             self.store._assert_device(conn, user_id, device_id)
             events = conn.execute("SELECT event_id FROM diagnostic_events WHERE user_id=? AND device_id=? AND deleted_at IS NULL", (user_id, device_id)).fetchall()
-            bundles = conn.execute("SELECT bundle_id, storage_path FROM diagnostic_bundles WHERE user_id=? AND device_id=? AND deleted_at IS NULL", (user_id, device_id)).fetchall()
+            bundles = conn.execute("SELECT bundle_id, storage_path, payload_sha256, compressed_size FROM diagnostic_bundles WHERE user_id=? AND device_id=? AND deleted_at IS NULL", (user_id, device_id)).fetchall()
             for row in events:
                 conn.execute("UPDATE diagnostic_events SET deleted_at=? WHERE event_id=?", (timestamp, row["event_id"]))
                 conn.execute("INSERT OR IGNORE INTO diagnostic_tombstones(tombstone_id, user_id, device_id, entity_type, entity_id, deleted_at) VALUES (?, ?, ?, 'event', ?, ?)", (str(uuid.uuid5(uuid.NAMESPACE_URL, f"recorder-next:diagnostic-tombstone:event:{row['event_id']}")), user_id, device_id, row["event_id"], timestamp))
             for row in bundles:
                 conn.execute("UPDATE diagnostic_bundles SET deleted_at=? WHERE bundle_id=?", (timestamp, row["bundle_id"]))
                 conn.execute("INSERT OR IGNORE INTO diagnostic_tombstones(tombstone_id, user_id, device_id, entity_type, entity_id, deleted_at) VALUES (?, ?, ?, 'bundle', ?, ?)", (str(uuid.uuid5(uuid.NAMESPACE_URL, f"recorder-next:diagnostic-tombstone:bundle:{row['bundle_id']}")), user_id, device_id, row["bundle_id"], timestamp))
-                paths.append(Path(row["storage_path"]))
+                self.store._prepare_cleanup_receipt_tx(
+                    conn,
+                    operation="diagnostic_delete",
+                    path=Path(row["storage_path"]),
+                    expected_sha256=row["payload_sha256"],
+                    expected_size=int(row["compressed_size"]),
+                    user_id=user_id,
+                    device_id=device_id,
+                    entity_type="diagnostic_bundle",
+                    entity_id=row["bundle_id"],
+                    now=timestamp,
+                )
             conn.execute("UPDATE diagnostics_consents SET revoked_at=? WHERE user_id=? AND device_id=? AND revoked_at IS NULL", (timestamp, user_id, device_id))
-        for path in paths:
-            try:
-                self._unlink_managed_file(self.store.storage_root, path)
-            except FileNotFoundError:
-                pass
-            except (OSError, RecorderError):
-                pass
+        self.store.recover_cleanup_receipts(now=timestamp)
+        with self.store._read() as conn:
+            pending = conn.execute(
+                "SELECT COUNT(*) FROM storage_cleanup_receipts WHERE user_id=? AND device_id=? AND operation IN ('diagnostic_delete', 'diagnostic_purge') AND status IN ('PENDING', 'BLOCKED')",
+                (user_id, device_id),
+            ).fetchone()[0]
+        if pending:
+            raise CleanupIncompleteError("diagnostic deletion cleanup is incomplete")
         return {"events": len(events), "bundles": len(bundles), "tombstones": len(events) + len(bundles)}
 
     def purge_diagnostics(self, *, now: str | None = None) -> dict[str, int]:
         timestamp = self._time(now, self.store)
-        paths: list[Path] = []
         with self.store._tx() as conn:
             expired_events = conn.execute("SELECT event_id FROM diagnostic_events WHERE deleted_at IS NULL AND retention_deadline <= ?", (timestamp,)).fetchall()
-            expired_bundles = conn.execute("SELECT bundle_id, storage_path FROM diagnostic_bundles WHERE deleted_at IS NULL AND retention_deadline <= ?", (timestamp,)).fetchall()
+            expired_bundles = conn.execute("SELECT bundle_id, user_id, device_id, storage_path, payload_sha256, compressed_size FROM diagnostic_bundles WHERE deleted_at IS NULL AND retention_deadline <= ?", (timestamp,)).fetchall()
             for row in expired_events:
                 conn.execute("UPDATE diagnostic_events SET deleted_at=? WHERE event_id=?", (timestamp, row["event_id"]))
                 conn.execute("INSERT OR IGNORE INTO diagnostic_tombstones(tombstone_id, user_id, device_id, entity_type, entity_id, deleted_at) SELECT ?, user_id, device_id, 'event', event_id, ? FROM diagnostic_events WHERE event_id=?", (str(uuid.uuid5(uuid.NAMESPACE_URL, f"recorder-next:diagnostic-tombstone:event:{row['event_id']}")), timestamp, row["event_id"]))
             for row in expired_bundles:
                 conn.execute("UPDATE diagnostic_bundles SET deleted_at=? WHERE bundle_id=?", (timestamp, row["bundle_id"]))
                 conn.execute("INSERT OR IGNORE INTO diagnostic_tombstones(tombstone_id, user_id, device_id, entity_type, entity_id, deleted_at) SELECT ?, user_id, device_id, 'bundle', bundle_id, ? FROM diagnostic_bundles WHERE bundle_id=?", (str(uuid.uuid5(uuid.NAMESPACE_URL, f"recorder-next:diagnostic-tombstone:bundle:{row['bundle_id']}")), timestamp, row["bundle_id"]))
-                paths.append(Path(row["storage_path"]))
-        for path in paths:
-            try:
-                self._unlink_managed_file(self.store.storage_root, path)
-            except (OSError, RecorderError):
-                pass
+                self.store._prepare_cleanup_receipt_tx(
+                    conn,
+                    operation="diagnostic_purge",
+                    path=Path(row["storage_path"]),
+                    expected_sha256=row["payload_sha256"],
+                    expected_size=int(row["compressed_size"]),
+                    user_id=row["user_id"],
+                    device_id=row["device_id"],
+                    entity_type="diagnostic_bundle",
+                    entity_id=row["bundle_id"],
+                    now=timestamp,
+                )
+        self.store.recover_cleanup_receipts(now=timestamp)
+        with self.store._read() as conn:
+            pending = conn.execute(
+                "SELECT COUNT(*) FROM storage_cleanup_receipts WHERE operation IN ('diagnostic_delete', 'diagnostic_purge') AND status IN ('PENDING', 'BLOCKED')",
+            ).fetchone()[0]
+        if pending:
+            raise CleanupIncompleteError("diagnostic purge cleanup is incomplete")
         return {"events": len(expired_events), "bundles": len(expired_bundles)}
 
 

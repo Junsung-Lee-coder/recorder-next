@@ -559,4 +559,27 @@ CREATE TABLE IF NOT EXISTS diagnostic_tombstones (
     UNIQUE(entity_type, entity_id)
 );
 
+CREATE TABLE IF NOT EXISTS storage_cleanup_receipts (
+    receipt_id TEXT PRIMARY KEY,
+    operation TEXT NOT NULL,
+    storage_path TEXT NOT NULL,
+    expected_sha256 TEXT NOT NULL,
+    expected_size INTEGER NOT NULL,
+    user_id TEXT,
+    device_id TEXT,
+    entity_type TEXT,
+    entity_id TEXT,
+    status TEXT NOT NULL DEFAULT 'PENDING' CHECK(status IN ('PENDING','COMPLETE','BLOCKED')),
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    completed_at TEXT,
+    UNIQUE(operation, storage_path, expected_sha256, expected_size)
+);
+CREATE INDEX IF NOT EXISTS idx_storage_cleanup_receipts_pending
+    ON storage_cleanup_receipts(status, updated_at);
+CREATE INDEX IF NOT EXISTS idx_storage_cleanup_receipts_owner
+    ON storage_cleanup_receipts(user_id, device_id, status);
+
 INSERT OR IGNORE INTO schema_meta(key, value) VALUES ('schema_version', '4');

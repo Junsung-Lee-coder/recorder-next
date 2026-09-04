@@ -34,31 +34,23 @@ CANDIDATE_HASH_PREFIX = "recorder-next-r7-candidate/v3"
 CANDIDATE_HASH_ALGORITHM = 'sha256(\\"recorder-next-r7-candidate/v3\\"\\0generation\\0product_sha256\\0)'
 PRODUCT_IDENTITY = "recorder-next-server-product-items-1-through-8"
 EXPECTED_PRODUCT_FILE_COUNT = 50
-EXPECTED_PRODUCT_SHA = "b01b345f39d6e40e7ca5bd720de86a80fda7caf603cfcefb59c3ffdf1e3560c8"
+EXPECTED_PRODUCT_SHA = "6fd15c29d1a9201beda61caebf3a5e29ac48b05999b37cee93e7429ed30d08b0"
 PRODUCT_BYTES_CHANGED_FROM_FAILED_CANDIDATE = True
 CHANGED_PRODUCT_PATHS_FROM_FAILED_CANDIDATE = [
-    "api/openapi.json",
-    "recorder_next/adapters.py",
+    "recorder_next/errors.py",
     "recorder_next/features.py",
-    "recorder_next/http.py",
-    "recorder_next/openapi.py",
-    "recorder_next/service.py",
+    "recorder_next/schema.sql",
     "recorder_next/store.py",
-    "tests/test_extended_contract.py",
-    "tests/test_generated_multimodal.py",
-    "tests/test_r1_repairs.py",
-    "tests/test_reliability_contract.py",
-    "tests/test_scheduled_final.py",
-    "tests/test_store_contract.py",
+    "tests/test_feature_groups.py",
 ]
-ARCHIVE_NAME = "candidate-source-feature-groups-r2-rev33.tar"
+ARCHIVE_NAME = "candidate-source-feature-groups-r2-rev34.tar"
 PREDECESSOR = {
     "disposition": "preserved_failed_predecessor",
-    "candidate_id": "recorder-next-feature-groups-r1-rev20-90ff26b7cc4cf821",
-    "candidate_sha256": "90ff26b7cc4cf821b01630dc86d017ee92894955b226943f8f4bff8d96ba02c7",
-    "product_sha256": "def267f5fa28891a481da41ecf12d314ba4c09066e8fcade389b124116e99fba",
-    "archive_sha256": "75d428859ff2d00ef91165cff4280861977f1cb0973c1f3eef10b27bd613a8f3",
-    "declared_source_bundle_sha256": "75d428859ff2d00ef91165cff4280861977f1cb0973c1f3eef10b27bd613a8f3",
+    "candidate_id": "recorder-next-feature-groups-r2-rev33-73ee618266de2ff1",
+    "candidate_sha256": "73ee618266de2ff1bbe99d6371abd21dd1f98bac2cb4af264575dc8ab19c3b31",
+    "product_sha256": "b01b345f39d6e40e7ca5bd720de86a80fda7caf603cfcefb59c3ffdf1e3560c8",
+    "archive_sha256": "7ded863824ca40e400bbae349809240a32d97ee695dcf3f4b6a299f13b7d4e7e",
+    "declared_source_bundle_sha256": "7ded863824ca40e400bbae349809240a32d97ee695dcf3f4b6a299f13b7d4e7e",
 }
 MUTATION_COUNTER_KEYS = (
     "installation",
@@ -364,8 +356,8 @@ def _validate_test_matrix(generation: Path, data: Mapping[str, Any], members: li
     test_payload = "".join(f"{row['path']}\0{row['size']}\0{row['sha256']}\n" for row in test_rows).encode("utf-8")
     if matrix["test_source_rows"] != test_rows or matrix["test_source_file_count"] != len(test_rows) or matrix["test_source_sha256"] != sha256_bytes(test_payload):
         raise ContractError("candidate test source provenance drifted")
-    if len(ids) != 117:
-        raise ContractError(f"candidate product test count is {len(ids)}, expected 117")
+    if len(ids) != 121:
+        raise ContractError(f"candidate product test count is {len(ids)}, expected 121")
 
 
 def _validate_manifest_shape(data: Any) -> dict[str, Any]:
