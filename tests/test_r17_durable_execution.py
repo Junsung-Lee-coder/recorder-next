@@ -391,7 +391,7 @@ class R17AutonomousRuntimeTests(unittest.TestCase):
             finally:
                 service.stop_background_workers()
 
-    def test_mutating_worker_and_scheduler_controls_are_not_http_routes(self):
+    def test_worker_and_scheduler_controls_use_exact_http_routes(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             service = RecorderService(RecorderStore(root / "db.sqlite3", storage_root=root / "data"))
@@ -403,10 +403,10 @@ class R17AutonomousRuntimeTests(unittest.TestCase):
                 "/v1/internal/worker/run",
                 "/v1/internal/scheduler/fire",
                 "/v1/internal/scheduler/recover",
-                "/v1/internal/router",
-                "/v1/internal/hermes",
-                "/v1/internal/tts",
             ):
+                self.assertNotEqual(service.handle_http("POST", path, {}, b"{}")[0], 404, path)
+                self.assertIn(path, OPENAPI["paths"])
+            for path in ("/v1/internal/router", "/v1/internal/hermes", "/v1/internal/tts"):
                 self.assertEqual(service.handle_http("POST", path, {}, b"{}")[0], 404, path)
                 self.assertNotIn(path, OPENAPI["paths"])
 

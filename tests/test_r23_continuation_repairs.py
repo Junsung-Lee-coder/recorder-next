@@ -121,6 +121,7 @@ class R23AdapterRepairTests(unittest.TestCase):
             RecorderConfig(hermes_base_url="https://fixture.invalid?profile=default").validate()
         config = RecorderConfig(
             hermes_base_url="https://fixture.invalid",
+            hermes_audio_base_url="https://audio.fixture.invalid",
             hermes_api_key_file="fixture-reference",
             asr_provider_timeout_seconds=1,
             tts_timeout_seconds=29,
@@ -255,8 +256,18 @@ class R23FeatureBoundaryTests(unittest.TestCase):
             store.record_diagnostics_opt_in("u", "phone", event_id="opt")
             for index in range(501):
                 store.ingest_diagnostic_event("u", "phone", event_id=f"ev-{index}", idempotency_key=f"key-{index}", payload={"category": "fixture", "stage": "test"})
-            exported = store.export_diagnostics("u", "phone")
-            self.assertEqual(len(exported["items"]), 501)
+            exported = store.export_diagnostics("u", "phone", limit=100)
+            all_items = list(exported["items"])
+            pages = 1
+            self.assertLessEqual(len(exported["items"]), 100)
+            self.assertTrue(exported["truncated"])
+            while exported["next_cursor"] is not None:
+                exported = store.export_diagnostics("u", "phone", cursor=exported["next_cursor"], limit=100)
+                all_items.extend(exported["items"])
+                pages += 1
+                self.assertLessEqual(len(exported["items"]), 100)
+            self.assertEqual(len(all_items), 501)
+            self.assertEqual(pages, 6)
             self.assertFalse(exported["truncated"])
             self.assertEqual(exported["next_cursor"], None)
             listed = store.list_diagnostics("u", "phone", limit=500)

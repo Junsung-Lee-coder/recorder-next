@@ -48,6 +48,8 @@ from .store import DEFAULT_MISSING_PAGE_SIZE, MAX_MISSING_PAGE_SIZE, FINAL_ERROR
 class RecorderService:
     """Application service coordinating adapters around RecorderStore."""
 
+    _HERMES_INPUT_ERROR = "첨부 파일 형식이 현재 Hermes 입력 계약과 호환되지 않습니다. 원본은 보존되어 다시 시도할 수 있습니다."
+
     def __init__(
         self,
         store: RecorderStore,
@@ -469,12 +471,27 @@ class RecorderService:
                 stop.set()
                 thread.join(timeout=max(1.0, min(float(lease_seconds), 5.0)))
         try:
-            result = call_with_ingress_lease(lambda: self.hermes.submit(
-                session_key=ingress["gateway_session_key"],
-                request=payload,
-                submission_id=ingress["hermes_submission_id"],
-                marker=ingress["marker"],
-            ))
+            def submit_hermes() -> Any:
+                self._validate_hermes_projection(payload)
+                return self.hermes.submit(
+                    session_key=ingress["gateway_session_key"],
+                    request=payload,
+                    submission_id=ingress["hermes_submission_id"],
+                    marker=ingress["marker"],
+                )
+            result = call_with_ingress_lease(submit_hermes)
+        except ValueError:
+            failed = self.store.commit_hermes_error(
+                ingress["hermes_submission_id"],
+                grace_seconds=0,
+                owner=owner,
+                lease_token=ingress["lease_token"],
+                now=effective_now,
+                worker_claim=worker_claim,
+                message=self._HERMES_INPUT_ERROR,
+            )
+            self._enqueue_tts_jobs(ingress["turn_id"], now=effective_now, worker_claim=worker_claim)
+            return failed
         except Exception:
             result = None
         if result is None:
@@ -523,6 +540,30 @@ class RecorderService:
             worker_claim=worker_claim,
         )
         return self.store.get_turn(ingress["turn_id"])
+
+    @staticmethod
+    def _validate_hermes_projection(payload: Mapping[str, Any]) -> None:
+        """Reject attachment shapes the downstream Hermes input contract cannot consume."""
+        projected = payload.get("request") if isinstance(payload.get("request"), Mapping) else payload
+        if not isinstance(projected, Mapping):
+            raise ValueError("Hermes request projection must be an object")
+        parts = projected.get("parts")
+        if parts is None:
+            return
+        if not isinstance(parts, list):
+            raise ValueError("Hermes request parts must be an array")
+        for part in parts:
+            if not isinstance(part, Mapping):
+                raise ValueError("Hermes request part must be an object")
+            kind = part.get("kind")
+            if kind not in {"attachment", "image", "document", "file", "binary"} and not (kind == "text" and not part.get("text")):
+                continue
+            mime = part.get("mime")
+            normalized_mime = mime.split(";", 1)[0].strip().lower() if isinstance(mime, str) else ""
+            if kind in {"document", "file", "binary"} or not normalized_mime.startswith("image/"):
+                raise ValueError("unsupported Hermes attachment input")
+            if part.get("status") != "COMPLETE":
+                raise ValueError("incomplete Hermes attachment input")
 
     def _requery_combined_content(self, ingress: Mapping[str, Any], result: HermesResult) -> str | None:
         turn = self.store.get_turn(ingress["turn_id"])
@@ -1359,8 +1400,40 @@ class RecorderService:
             decoded_payload = self._verify_network_principal(query, headers, body, path=path, raw_chunk=raw_chunk)
             if "now" in query:
                 raise ValidationError("server time cannot be supplied by a client")
-        if method == "POST" and segments[:2] == ["v1", "internal"] and len(segments) >= 3:
-            raise NotFoundError("API route not found")
+        if segments[:3] == ["v1", "internal", "worker"] and method == "POST":
+            payload = json_body()
+            action = segments[3] if len(segments) > 3 else "claim"
+            if action == "claim":
+                owner = self._json_string(payload, "owner") if "owner" in payload else "worker-1"
+                lease_seconds = self._json_integer(payload, "lease_seconds") if "lease_seconds" in payload else 30
+                assert lease_seconds is not None
+                return 200, {}, self.store.claim_worker_job(owner, now=payload.get("now"), lease_seconds=lease_seconds) or {"job": None}
+            if action == "recover":
+                return 200, {}, self.store.recover_worker_jobs(now=payload.get("now"))
+            if action == "complete":
+                return 200, {}, self.store.complete_worker_job(
+                    self._json_string(payload, "job_id"),
+                    self._json_string(payload, "owner"),
+                    payload["receipt"],
+                    now=payload.get("now"),
+                )
+            if action == "fail":
+                error_kind = self._json_string(payload, "error_kind") if "error_kind" in payload else "internal"
+                retryable = payload.get("retryable", False)
+                if not isinstance(retryable, bool):
+                    raise ValidationError("retryable must be boolean")
+                return 200, {}, self.store.fail_worker_job(
+                    self._json_string(payload, "job_id"),
+                    self._json_string(payload, "owner"),
+                    error_kind=error_kind,
+                    retryable=retryable,
+                    now=payload.get("now"),
+                )
+            if action == "run":
+                owner = self._json_string(payload, "owner") if "owner" in payload else "worker-1"
+                lease_seconds = self._json_integer(payload, "lease_seconds") if "lease_seconds" in payload else 30
+                assert lease_seconds is not None
+                return 200, {}, self.run_background_worker_once(owner=owner, now=payload.get("now"), lease_seconds=lease_seconds) or {"job": None}
         if segments[:2] == ["v1", "updates"] and len(segments) == 4 and segments[3] in {"manifest", "manifest.json"} and method == "GET":
             manifest = self.store.get_update_manifest(segments[2])
             if_none_match = self._header_value(headers, "If-None-Match")
@@ -1477,13 +1550,19 @@ class RecorderService:
             expanded_size = self._json_integer(payload, "expanded_size", allow_none=True) if "expanded_size" in payload else None
             return 201, {}, self.store.ingest_diagnostic_bundle(self._json_string(payload, "user_id"), self._json_string(payload, "device_id"), self._json_string(payload, "bundle_id"), compressed, opt_in_event_id=self._json_string(payload, "opt_in_event_id"), expanded_size=expanded_size, now=payload.get("now"))
         if segments[:2] == ["v1", "diagnostics"] and len(segments) == 2 and method == "GET":
-            if not query.get("user_id") or not query.get("device_id"):
-                raise UnauthorizedError("diagnostics read requires user_id and device_id")
-            return 200, {}, self.store.list_diagnostics(query["user_id"], query["device_id"], category=query.get("category"), stage=query.get("stage"), limit=self._query_integer(query, "limit", default=100, minimum=1, maximum=500) or 100)
+            user_id, device_id = self._authenticated_owner(query, headers)
+            return 200, {}, self.store.list_diagnostics(user_id, device_id, category=query.get("category"), stage=query.get("stage"), limit=self._query_integer(query, "limit", default=100, minimum=1, maximum=500) or 100)
         if segments[:3] == ["v1", "diagnostics", "export"] and method == "GET":
-            if not query.get("user_id") or not query.get("device_id"):
-                raise UnauthorizedError("diagnostics export requires user_id and device_id")
-            return 200, {}, self.store.export_diagnostics(query["user_id"], query["device_id"])
+            user_id, device_id = self._authenticated_owner(query, headers)
+            return 200, {}, self.store.export_diagnostics(
+                user_id,
+                device_id,
+                category=query.get("category"),
+                stage=query.get("stage"),
+                cursor=query.get("cursor"),
+                limit=self._query_integer(query, "limit", default=100, minimum=1, maximum=500) or 100,
+                max_bytes=self._query_integer(query, "max_bytes", default=None, minimum=1024, maximum=64 * 1024 * 1024),
+            )
         if segments[:3] == ["v1", "diagnostics", "delete"] and method == "POST":
             payload = json_body()
             user_id, device_id = self._payload_owner(payload)
@@ -1496,6 +1575,10 @@ class RecorderService:
                 user_id, device_id = self._payload_owner(payload)
                 self.store.assert_active_device(user_id, device_id)
             return 200, {}, self.store.delete_diagnostics(user_id, device_id, now=query.get("now") or payload.get("now"))
+        if segments[:3] == ["v1", "internal", "schedule_create"] and method == "POST":
+            if self._header_value(headers, "X-Recorder-Internal-Trusted") != "1":
+                raise UnauthorizedError("schedule_create requires the trusted Recorder adapter")
+            return 201, {}, self.schedule_create(json_body())
         if segments[:3] == ["v1", "internal", "scheduler"] and len(segments) == 4 and segments[3] == "fire" and method == "POST":
             payload = json_body()
             owner = self._json_string(payload, "owner") if "owner" in payload else "scheduler-1"
@@ -1681,10 +1764,10 @@ def create_configured_service(config: "RecorderConfig", *, ingress_secret: str |
         endpoint = declaration.endpoint
         credential_file = declaration.credential_file
         if adapter in {"hermes", "hermes-default"}:
-            endpoint = endpoint or config.hermes_base_url
+            endpoint = endpoint or config.hermes_audio_base_url
             credential_file = credential_file or config.hermes_api_key_file
             if not endpoint or not credential_file:
-                raise CredentialError("configured Hermes provider requires endpoint and credential file")
+                raise CredentialError("configured Hermes audio provider requires hermes_audio_base_url and credential file")
             profile = declaration.profile if declaration.profile != "default" else config.hermes_profile
             if kind == "asr":
                 return HermesAudioASRProvider(endpoint, profile=profile, timeout=declaration.timeout_seconds, credential_file=credential_file, max_bytes=declaration.max_bytes, health_path=declaration.health_path, capability_path=declaration.capability_path)
@@ -1720,8 +1803,8 @@ def create_configured_service(config: "RecorderConfig", *, ingress_secret: str |
                 raise CredentialError(f"{kind} chain includes a disabled provider")
             declared = declaration.safe_dict()
             if declaration.adapter in {"hermes", "hermes-default"}:
-                if declaration.endpoint is None and config.hermes_base_url:
-                    declared["endpoint"] = config.hermes_base_url
+                if declaration.endpoint is None and kind in {"asr", "tts"} and config.hermes_audio_base_url:
+                    declared["endpoint"] = config.hermes_audio_base_url
                 effective_profile = declaration.profile if declaration.profile != "default" else config.hermes_profile
                 declared["profile"] = effective_profile
             effective_credential_file = declaration.credential_file
@@ -1738,21 +1821,21 @@ def create_configured_service(config: "RecorderConfig", *, ingress_secret: str |
     tts_declarations = tuple(getattr(config, "tts_providers", ()))
     asr_global_names = tuple(getattr(config, "asr_chain", ()))
     tts_global_names = tuple(getattr(config, "tts_chain", ()))
-    if not asr_declarations and not asr_global_names and config.asr_source == "hermes" and config.hermes_base_url and config.hermes_api_key_file:
+    if not asr_declarations and not asr_global_names and config.asr_source == "hermes" and config.hermes_audio_base_url and config.hermes_api_key_file:
         asr_declarations = (
             ProviderConfig.from_spec(
                 "hermes-default",
                 "asr",
-                {"adapter": "hermes", "endpoint": config.hermes_base_url, "profile": config.hermes_profile, "credential_file": config.hermes_api_key_file, "enabled": True},
+                {"adapter": "hermes", "endpoint": config.hermes_audio_base_url, "profile": config.hermes_profile, "credential_file": config.hermes_api_key_file, "enabled": True},
             ),
         )
         asr_global_names = ("hermes-default",)
-    if not tts_declarations and not tts_global_names and config.tts_source == "hermes" and config.hermes_base_url and config.hermes_api_key_file:
+    if not tts_declarations and not tts_global_names and config.tts_source == "hermes" and config.hermes_audio_base_url and config.hermes_api_key_file:
         tts_declarations = (
             ProviderConfig.from_spec(
                 "hermes-default",
                 "tts",
-                {"adapter": "hermes", "endpoint": config.hermes_base_url, "profile": config.hermes_profile, "credential_file": config.hermes_api_key_file, "enabled": True},
+                {"adapter": "hermes", "endpoint": config.hermes_audio_base_url, "profile": config.hermes_profile, "credential_file": config.hermes_api_key_file, "enabled": True},
             ),
         )
         tts_global_names = ("hermes-default",)
@@ -1776,12 +1859,13 @@ def create_configured_service(config: "RecorderConfig", *, ingress_secret: str |
             # Once either half of the inherited Hermes contract is supplied,
             # both halves are mandatory and are validated before the store is
             # opened so a bad deployment cannot create state as a side effect.
-            if not config.hermes_base_url and not config.hermes_api_key_file:
+            endpoint = endpoint or config.hermes_audio_base_url
+            if not endpoint:
                 return None
-            if not config.hermes_base_url or not config.hermes_api_key_file:
-                raise CredentialError("Hermes ASR requires hermes_base_url and credential file")
+            if not config.hermes_api_key_file:
+                raise CredentialError("Hermes ASR requires hermes_audio_base_url and credential file")
             return HermesAudioASRProvider(
-                config.hermes_base_url,
+                endpoint,
                 profile=config.hermes_profile,
                 timeout=config.asr_provider_timeout_seconds,
                 credential_file=config.hermes_api_key_file,
@@ -1824,13 +1908,14 @@ def create_configured_service(config: "RecorderConfig", *, ingress_secret: str |
     if tts_name in {"", "disabled", "none", "off"}:
         tts: TTSProvider = DisabledTTSProvider()
     elif tts_name in {"hermes", "hermes-default", "hermes_profile"}:
-        if not config.hermes_base_url and not config.hermes_api_key_file:
+        endpoint = config.hermes_audio_base_url
+        if not endpoint:
             tts = DisabledTTSProvider()
         else:
-            if not config.hermes_base_url or not config.hermes_api_key_file:
-                raise CredentialError("Hermes TTS requires hermes_base_url and credential file")
+            if not config.hermes_api_key_file:
+                raise CredentialError("Hermes TTS requires hermes_audio_base_url and credential file")
             tts = HermesAudioTTSProvider(
-                config.hermes_base_url,
+                endpoint,
                 profile=config.hermes_profile,
                 timeout=config.tts_timeout_seconds,
                 credential_file=config.hermes_api_key_file,
@@ -1872,6 +1957,8 @@ def create_configured_service(config: "RecorderConfig", *, ingress_secret: str |
         diagnostics_max_compressed_bytes=config.diagnostics_max_compressed_bytes,
         diagnostics_max_expanded_bytes=config.diagnostics_max_expanded_bytes,
         diagnostics_retention_seconds=config.diagnostics_retention_seconds,
+        diagnostics_tombstone_retention_seconds=config.diagnostics_tombstone_retention_seconds,
+        diagnostics_export_max_bytes=config.diagnostics_export_max_bytes,
         tts_artifact_ttl_seconds=config.tts_artifact_ttl_seconds,
     )
     if hermes is not None:

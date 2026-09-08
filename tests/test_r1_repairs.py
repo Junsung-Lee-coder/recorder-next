@@ -480,13 +480,20 @@ class RecorderR1RepairTests(unittest.TestCase):
             self.assertEqual(status, 401)
             self.assertEqual(service.store.get_device("revoke-user", "target")["status"], "active")
 
-    def test_openapi_declares_all_path_variables_and_hides_mutating_worker_controls(self):
+    def test_openapi_declares_all_path_variables_and_hides_generic_worker_controls(self):
         from recorder_next.openapi import OPENAPI, validate_openapi_contract
 
         validate_openapi_contract(OPENAPI)
         self.assertNotIn("/v1/internal/worker/{action}", OPENAPI["paths"])
-        self.assertNotIn("/v1/internal/worker/run", OPENAPI["paths"])
-        self.assertNotIn("/v1/internal/scheduler/fire", OPENAPI["paths"])
+        self.assertIn("/v1/internal/worker/run", OPENAPI["paths"])
+        self.assertIn("/v1/internal/scheduler/fire", OPENAPI["paths"])
+
+    def test_openapi_declares_all_path_variables_and_exact_worker_run_contract(self):
+        from recorder_next.openapi import OPENAPI, validate_openapi_contract
+
+        validate_openapi_contract(OPENAPI)
+        self.assertNotIn("/v1/internal/worker/{action}", OPENAPI["paths"])
+        self.assertIn("/v1/internal/worker/run", OPENAPI["paths"])
 
     def test_raw_socket_rejects_ambiguous_content_length_and_closes_connection(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -283,7 +283,9 @@ class ProviderFeatureTests(unittest.TestCase):
             for profile in ("profile-a", "profile-b"):
                 config = RecorderConfig(
                     database=str(root / f"{profile}.sqlite3"), storage_root=str(root / profile),
-                    hermes_base_url="http://example.invalid", hermes_api_key_file=str(credential),
+                    hermes_base_url="http://example.invalid",
+                    hermes_audio_base_url="http://audio.example.invalid",
+                    hermes_api_key_file=str(credential),
                     hermes_profile=profile, asr_providers=(declaration,), asr_chain=("voice",),
                     tts_source="disabled", tts_provider="disabled",
                 )
@@ -380,7 +382,7 @@ class ProviderFeatureTests(unittest.TestCase):
 
             def _request(self, method, path, payload=None, *, extra_headers=None):
                 self.seen = payload
-                return {"assistant_message_id": "attachment-check", "content": "ok"}
+                return {"run_id": "run-attachment-check", "status": "completed", "assistant_message_id": "attachment-check", "content": "ok"}
 
         digest = hashlib.sha256(b"bytes").hexdigest()
         reference = "recorder://v1/turns/turn-1/parts/part-1?sha256=" + digest
@@ -388,16 +390,17 @@ class ProviderFeatureTests(unittest.TestCase):
 
         def resolver(value):
             calls.append(value)
-            return {"reference": value, "body": b"bytes", "byte_length": 5, "sha256": digest, "mime": "application/octet-stream"}
+            return {"reference": value, "body": b"bytes", "byte_length": 5, "sha256": digest, "mime": "image/png"}
 
-        result = ProbeGateway(resolver).submit(
+        gateway = ProbeGateway(resolver)
+        result = gateway.submit(
             session_key="project:attachments:default",
             request={
                 "input": "",
                 "parts": [{
                     "part_id": "part-1",
                     "kind": "attachment",
-                    "mime": "application/octet-stream",
+                    "mime": "image/png",
                     "declared_bytes": 5,
                     "total_bytes": 5,
                     "whole_stream_sha256": digest,
@@ -410,6 +413,8 @@ class ProviderFeatureTests(unittest.TestCase):
         )
         self.assertEqual(result.content, "ok")
         self.assertEqual(calls, [reference])
+        self.assertEqual(gateway.seen["input"][0]["content"][0]["type"], "input_image")
+        self.assertTrue(gateway.seen["input"][0]["content"][0]["image_url"].startswith("data:image/png;base64,"))
 
     def test_named_provider_registry_freezes_order_and_redacts_credentials(self):
         config_text = """

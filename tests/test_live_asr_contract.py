@@ -63,7 +63,9 @@ class _ASRHandler(BaseHTTPRequestHandler):
         raw = self.rfile.read(size)
         try:
             payload = json.loads(raw.decode("utf-8"))
-            data_url = payload["audio"]
+            data_url = payload["data_url"]
+            if payload.get("mime_type") != "audio/wav":
+                raise ValueError("invalid audio MIME")
             encoded = data_url.split(",", 1)[1]
             fixture.audio_bytes = base64.b64decode(encoded, validate=True)
         except (KeyError, IndexError, ValueError, TypeError, UnicodeDecodeError, json.JSONDecodeError):
@@ -102,6 +104,7 @@ class ConfiguredASRContractTests(unittest.TestCase):
                             "",
                             "[providers]",
                             f'hermes_base_url = "{fixture.url}"',
+                            f'hermes_audio_base_url = "{fixture.url}"',
                             'hermes_api_key_file = "$CREDENTIALS_DIRECTORY/recorder_api_key"',
                             'hermes_profile = "default"',
                             'asr_source = "hermes"',

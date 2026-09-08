@@ -59,6 +59,7 @@ class OwnerCorrectionTests(unittest.TestCase):
                 """
 [providers]
 hermes_base_url = "http://127.0.0.1:8642"
+hermes_audio_base_url = "http://127.0.0.1:9120"
 hermes_api_key_file = "hermes.env"
 """,
                 encoding="utf-8",

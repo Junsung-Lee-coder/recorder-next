@@ -1,728 +1,16 @@
 {
-  "components": {
-    "parameters": {
-      "Action": {
-        "in": "path",
-        "name": "action",
-        "required": true,
-        "schema": {
-          "enum": [
-            "activate",
-            "pause",
-            "resume",
-            "stop",
-            "segments"
-          ],
-          "type": "string"
-        }
-      },
-      "ArtifactId": {
-        "in": "path",
-        "name": "artifact_id",
-        "required": true,
-        "schema": {
-          "type": "string"
-        }
-      },
-      "ArtifactName": {
-        "in": "path",
-        "name": "artifact_name",
-        "required": true,
-        "schema": {
-          "minLength": 1,
-          "type": "string"
-        }
-      },
-      "Channel": {
-        "in": "path",
-        "name": "channel",
-        "required": true,
-        "schema": {
-          "minLength": 1,
-          "type": "string"
-        }
-      },
-      "DeviceId": {
-        "description": "Registered active device identity; a Phone may bridge-read a Watch-targeted artifact.",
-        "in": "query",
-        "name": "device_id",
-        "required": true,
-        "schema": {
-          "minLength": 1,
-          "type": "string"
-        }
-      },
-      "DevicePath": {
-        "in": "path",
-        "name": "device_id",
-        "required": true,
-        "schema": {
-          "minLength": 1,
-          "type": "string"
-        }
-      },
-      "EventId": {
-        "in": "path",
-        "name": "event_id",
-        "required": true,
-        "schema": {
-          "format": "uuid",
-          "type": "string"
-        }
-      },
-      "Generation": {
-        "in": "path",
-        "name": "generation",
-        "required": true,
-        "schema": {
-          "minimum": 1,
-          "type": "integer"
-        }
-      },
-      "PartId": {
-        "in": "path",
-        "name": "part_id",
-        "required": true,
-        "schema": {
-          "minLength": 1,
-          "type": "string"
-        }
-      },
-      "ProjectId": {
-        "in": "path",
-        "name": "project_id",
-        "required": true,
-        "schema": {
-          "minLength": 1,
-          "type": "string"
-        }
-      },
-      "ScheduleId": {
-        "in": "path",
-        "name": "schedule_id",
-        "required": true,
-        "schema": {
-          "minLength": 1,
-          "type": "string"
-        }
-      },
-      "SegmentSequence": {
-        "in": "path",
-        "name": "segment_sequence",
-        "required": true,
-        "schema": {
-          "minimum": 0,
-          "type": "integer"
-        }
-      },
-      "Sequence": {
-        "in": "path",
-        "name": "sequence",
-        "required": true,
-        "schema": {
-          "minimum": 0,
-          "type": "integer"
-        }
-      },
-      "SessionId": {
-        "in": "path",
-        "name": "session_id",
-        "required": true,
-        "schema": {
-          "minLength": 1,
-          "type": "string"
-        }
-      },
-      "TurnId": {
-        "in": "path",
-        "name": "turn_id",
-        "required": true,
-        "schema": {
-          "format": "uuid",
-          "type": "string"
-        }
-      },
-      "UserId": {
-        "description": "Owner identity paired with the registered active device.",
-        "in": "query",
-        "name": "user_id",
-        "required": true,
-        "schema": {
-          "minLength": 1,
-          "type": "string"
-        }
-      }
-    },
-    "schemas": {
-      "ArtifactState": {
-        "enum": [
-          "PENDING",
-          "READY",
-          "DELIVERY_PENDING",
-          "PLAYED",
-          "FAILED_GENERATION",
-          "EXPIRED"
-        ],
-        "type": "string"
-      },
-      "DeviceRevoke": {
-        "additionalProperties": false,
-        "properties": {
-          "actor_device_id": {
-            "minLength": 1,
-            "type": "string"
-          },
-          "user_id": {
-            "minLength": 1,
-            "type": "string"
-          }
-        },
-        "required": [
-          "user_id",
-          "actor_device_id"
-        ],
-        "type": "object"
-      },
-      "Error": {
-        "properties": {
-          "error": {
-            "properties": {
-              "code": {
-                "type": "string"
-              },
-              "message": {
-                "type": "string"
-              }
-            },
-            "type": "object"
-          }
-        },
-        "required": [
-          "error"
-        ],
-        "type": "object"
-      },
-      "EventAck": {
-        "properties": {
-          "device_id": {
-            "minLength": 1,
-            "type": "string"
-          },
-          "event_version": {
-            "minimum": 1,
-            "type": "integer"
-          },
-          "payload_sha256": {
-            "minLength": 1,
-            "type": "string"
-          },
-          "user_id": {
-            "minLength": 1,
-            "type": "string"
-          }
-        },
-        "required": [
-          "user_id",
-          "device_id",
-          "event_version",
-          "payload_sha256"
-        ],
-        "type": "object"
-      },
-      "EventKind": {
-        "enum": [
-          "ACCEPTED",
-          "ROUTED",
-          "FINAL"
-        ],
-        "type": "string"
-      },
-      "FinishPart": {
-        "properties": {
-          "duration_ms": {
-            "minimum": 0,
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "total_bytes": {
-            "minimum": 0,
-            "type": "integer"
-          },
-          "total_chunks": {
-            "minimum": 1,
-            "type": "integer"
-          },
-          "whole_stream_sha256": {
-            "minLength": 1,
-            "type": "string"
-          }
-        },
-        "required": [
-          "total_chunks",
-          "total_bytes",
-          "whole_stream_sha256"
-        ],
-        "type": "object"
-      },
-      "OwnerProof": {
-        "additionalProperties": false,
-        "properties": {
-          "device_id": {
-            "minLength": 1,
-            "type": "string"
-          },
-          "user_id": {
-            "minLength": 1,
-            "type": "string"
-          }
-        },
-        "required": [
-          "user_id",
-          "device_id"
-        ],
-        "type": "object"
-      },
-      "PlaybackAck": {
-        "additionalProperties": false,
-        "properties": {
-          "artifact_version": {
-            "minimum": 1,
-            "type": "integer"
-          },
-          "device_id": {
-            "minLength": 1,
-            "type": "string"
-          },
-          "payload_sha256": {
-            "minLength": 1,
-            "type": "string"
-          },
-          "turn_id": {
-            "format": "uuid",
-            "minLength": 1,
-            "type": "string"
-          },
-          "user_id": {
-            "minLength": 1,
-            "type": "string"
-          }
-        },
-        "required": [
-          "user_id",
-          "device_id",
-          "payload_sha256",
-          "turn_id",
-          "artifact_version"
-        ],
-        "type": "object"
-      },
-      "RelayReceived": {
-        "properties": {
-          "device_id": {
-            "minLength": 1,
-            "type": "string"
-          },
-          "payload_sha256": {
-            "minLength": 1,
-            "type": "string"
-          },
-          "user_id": {
-            "minLength": 1,
-            "type": "string"
-          }
-        },
-        "required": [
-          "user_id",
-          "device_id",
-          "payload_sha256"
-        ],
-        "type": "object"
-      },
-      "ScheduleState": {
-        "enum": [
-          "SCHEDULED",
-          "CLAIMED",
-          "FIRED",
-          "FAILED",
-          "CANCELLED"
-        ],
-        "type": "string"
-      },
-      "ServerTurnSource": {
-        "enum": [
-          "server_schedule"
-        ],
-        "type": "string"
-      },
-      "TurnCreate": {
-        "properties": {
-          "origin_device_id": {
-            "minLength": 1,
-            "type": "string"
-          },
-          "parts": {
-            "minItems": 1,
-            "type": "array"
-          },
-          "turn_id": {
-            "format": "uuid",
-            "type": "string"
-          },
-          "user_id": {
-            "minLength": 1,
-            "type": "string"
-          }
-        },
-        "required": [
-          "user_id",
-          "turn_id",
-          "origin_device_id",
-          "parts"
-        ],
-        "type": "object"
-      },
-      "TurnState": {
-        "enum": [
-          "RECEIVING",
-          "ACCEPTED",
-          "PREPROCESSING",
-          "ROUTING",
-          "ROUTED",
-          "HERMES_PENDING",
-          "FINAL_READY",
-          "DELIVERY_PENDING",
-          "RETRY_WAIT",
-          "LATE_RESULT_GRACE",
-          "DELIVERED",
-          "FAILED_PERMANENT",
-          "EXPIRED"
-        ],
-        "type": "string"
-      }
-    },
-    "securitySchemes": {
-      "RecorderPrincipal": {
-        "description": "HMAC-SHA256 proof over X-Recorder-Principal-User, a NUL byte, and X-Recorder-Principal-Device. The deployment secret stays outside the API payload and logs.",
-        "in": "header",
-        "name": "X-Recorder-Principal-Signature",
-        "type": "apiKey"
-      }
-    }
-  },
-  "info": {
-    "description": "Standalone reliable Recorder adapter; Hermes core and legacy port 5000 are out of scope.",
-    "title": "Recorder Next Server",
-    "version": "1.0.0"
-  },
   "openapi": "3.0.3",
+  "info": {
+    "title": "Recorder Next Server",
+    "version": "1.0.0",
+    "description": "Standalone reliable Recorder adapter; Hermes core and legacy port 5000 are out of scope."
+  },
+  "servers": [
+    {
+      "url": "/"
+    }
+  ],
   "paths": {
-    "/v1/devices": {
-      "post": {
-        "responses": {
-          "201": {
-            "description": "Registered device"
-          }
-        },
-        "security": [
-          {
-            "RecorderPrincipal": []
-          }
-        ]
-      }
-    },
-    "/v1/devices/{device_id}/revoke": {
-      "parameters": [
-        {
-          "$ref": "#/components/parameters/DevicePath"
-        }
-      ],
-      "post": {
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/DeviceRevoke"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "description": "Revoked device"
-          }
-        },
-        "security": [
-          {
-            "RecorderPrincipal": []
-          }
-        ]
-      }
-    },
-    "/v1/diagnostics": {
-      "delete": {
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/OwnerProof"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "description": "Deletion receipt and tombstones"
-          }
-        },
-        "security": [
-          {
-            "RecorderPrincipal": []
-          }
-        ]
-      },
-      "get": {
-        "parameters": [
-          {
-            "$ref": "#/components/parameters/UserId"
-          },
-          {
-            "$ref": "#/components/parameters/DeviceId"
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Diagnostic metadata"
-          }
-        },
-        "security": [
-          {
-            "RecorderPrincipal": []
-          }
-        ]
-      }
-    },
-    "/v1/diagnostics/bundles": {
-      "post": {
-        "responses": {
-          "201": {
-            "description": "Bounded compressed diagnostic bundle"
-          }
-        },
-        "security": [
-          {
-            "RecorderPrincipal": []
-          }
-        ]
-      }
-    },
-    "/v1/diagnostics/delete": {
-      "post": {
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/OwnerProof"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "description": "Deletion receipt and tombstones"
-          }
-        },
-        "security": [
-          {
-            "RecorderPrincipal": []
-          }
-        ]
-      }
-    },
-    "/v1/diagnostics/events": {
-      "post": {
-        "responses": {
-          "201": {
-            "description": "Redacted diagnostic event"
-          }
-        },
-        "security": [
-          {
-            "RecorderPrincipal": []
-          }
-        ]
-      }
-    },
-    "/v1/diagnostics/export": {
-      "get": {
-        "parameters": [
-          {
-            "$ref": "#/components/parameters/UserId"
-          },
-          {
-            "$ref": "#/components/parameters/DeviceId"
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Redacted diagnostic export"
-          }
-        },
-        "security": [
-          {
-            "RecorderPrincipal": []
-          }
-        ]
-      }
-    },
-    "/v1/diagnostics/opt-in": {
-      "post": {
-        "responses": {
-          "201": {
-            "description": "Consent event"
-          }
-        },
-        "security": [
-          {
-            "RecorderPrincipal": []
-          }
-        ]
-      }
-    },
-    "/v1/eavesdrop": {
-      "post": {
-        "responses": {
-          "201": {
-            "description": "Created session"
-          }
-        },
-        "security": [
-          {
-            "RecorderPrincipal": []
-          }
-        ],
-        "summary": "Start a phone-mediated eavesdrop session"
-      }
-    },
-    "/v1/eavesdrop/{session_id}": {
-      "get": {
-        "responses": {
-          "200": {
-            "description": "Session state"
-          }
-        },
-        "security": [
-          {
-            "RecorderPrincipal": []
-          }
-        ]
-      },
-      "parameters": [
-        {
-          "$ref": "#/components/parameters/SessionId"
-        }
-      ]
-    },
-    "/v1/eavesdrop/{session_id}/decisions": {
-      "get": {
-        "responses": {
-          "200": {
-            "description": "Eavesdrop routing decision ledger"
-          }
-        },
-        "security": [
-          {
-            "RecorderPrincipal": []
-          }
-        ]
-      },
-      "parameters": [
-        {
-          "$ref": "#/components/parameters/SessionId"
-        }
-      ]
-    },
-    "/v1/eavesdrop/{session_id}/replies": {
-      "get": {
-        "responses": {
-          "200": {
-            "description": "Optional response receipts"
-          }
-        },
-        "security": [
-          {
-            "RecorderPrincipal": []
-          }
-        ]
-      },
-      "parameters": [
-        {
-          "$ref": "#/components/parameters/SessionId"
-        }
-      ]
-    },
-    "/v1/eavesdrop/{session_id}/segments/{segment_sequence}/route": {
-      "parameters": [
-        {
-          "$ref": "#/components/parameters/SessionId"
-        },
-        {
-          "$ref": "#/components/parameters/SegmentSequence"
-        }
-      ],
-      "post": {
-        "responses": {
-          "200": {
-            "description": "Idempotent fixed-project routing decision"
-          }
-        },
-        "security": [
-          {
-            "RecorderPrincipal": []
-          }
-        ]
-      }
-    },
-    "/v1/eavesdrop/{session_id}/{action}": {
-      "parameters": [
-        {
-          "$ref": "#/components/parameters/SessionId"
-        }
-      ],
-      "post": {
-        "parameters": [
-          {
-            "in": "path",
-            "name": "action",
-            "required": true,
-            "schema": {
-              "enum": [
-                "activate",
-                "pause",
-                "resume",
-                "stop",
-                "segments"
-              ],
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "State transition or segment receipt"
-          }
-        },
-        "security": [
-          {
-            "RecorderPrincipal": []
-          }
-        ]
-      }
-    },
     "/v1/health": {
       "get": {
         "responses": {
@@ -730,43 +18,6 @@
             "description": "Readiness"
           }
         }
-      }
-    },
-    "/v1/history": {
-      "get": {
-        "parameters": [
-          {
-            "$ref": "#/components/parameters/UserId"
-          },
-          {
-            "$ref": "#/components/parameters/DeviceId"
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Paired user/assistant messages"
-          }
-        },
-        "security": [
-          {
-            "RecorderPrincipal": []
-          }
-        ],
-        "summary": "Project-scoped keyset history read model"
-      }
-    },
-    "/v1/internal/worker/health": {
-      "get": {
-        "responses": {
-          "200": {
-            "description": "Bounded worker backlog and lease health"
-          }
-        },
-        "security": [
-          {
-            "RecorderPrincipal": []
-          }
-        ]
       }
     },
     "/v1/openapi.json": {
@@ -778,181 +29,340 @@
         }
       }
     },
-    "/v1/outbox": {
+    "/v1/devices": {
+      "post": {
+        "responses": {
+          "201": {
+            "description": "Registered device"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DeviceRegister"
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "RecorderPrincipal": []
+          }
+        ]
+      }
+    },
+    "/v1/devices/{device_id}/revoke": {
+      "post": {
+        "responses": {
+          "200": {
+            "description": "Revoked device"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DeviceRevoke"
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "RecorderPrincipal": []
+          }
+        ]
+      },
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/DevicePath"
+        }
+      ]
+    },
+    "/v1/turns": {
+      "post": {
+        "summary": "Create an immutable turn envelope or complete a text turn",
+        "responses": {
+          "201": {
+            "description": "Receiving turn"
+          },
+          "202": {
+            "description": "Accepted text turn"
+          },
+          "409": {
+            "description": "TURN_ID_CONFLICT"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TurnCreate"
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "RecorderPrincipal": []
+          }
+        ]
+      }
+    },
+    "/v1/turns/{turn_id}": {
       "get": {
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/TurnId"
+          },
+          {
+            "$ref": "#/components/parameters/UserId"
+          },
+          {
+            "$ref": "#/components/parameters/DeviceId"
+          },
+          {
+            "$ref": "#/components/parameters/PrincipalUserHeader"
+          },
+          {
+            "$ref": "#/components/parameters/PrincipalDeviceHeader"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Turn ledger"
+          }
+        },
+        "security": [
+          {
+            "RecorderPrincipal": []
+          }
+        ]
+      }
+    },
+    "/v1/turns/{turn_id}/accept": {
+      "post": {
+        "responses": {
+          "200": {
+            "description": "Durable ACCEPTED"
+          },
+          "409": {
+            "description": "Incomplete parts"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OwnerProof"
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "RecorderPrincipal": []
+          }
+        ]
+      },
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/TurnId"
+        }
+      ]
+    },
+    "/v1/turns/{turn_id}/parts/{part_id}/chunks/{sequence}": {
+      "put": {
+        "responses": {
+          "200": {
+            "description": "Chunk receipt"
+          },
+          "409": {
+            "description": "Chunk conflict"
+          }
+        },
         "parameters": [
           {
             "$ref": "#/components/parameters/UserId"
           },
           {
             "$ref": "#/components/parameters/DeviceId"
+          },
+          {
+            "$ref": "#/components/parameters/PrincipalUserHeader"
+          },
+          {
+            "$ref": "#/components/parameters/PrincipalDeviceHeader"
           }
         ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/octet-stream": {
+              "schema": {
+                "$ref": "#/components/schemas/ChunkUpload"
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "RecorderPrincipal": []
+          }
+        ]
+      },
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/TurnId"
+        },
+        {
+          "$ref": "#/components/parameters/PartId"
+        },
+        {
+          "$ref": "#/components/parameters/Sequence"
+        }
+      ]
+    },
+    "/v1/turns/{turn_id}/parts/{part_id}/missing": {
+      "get": {
+        "responses": {
+          "200": {
+            "description": "Missing sequence list"
+          }
+        },
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/UserId"
+          },
+          {
+            "$ref": "#/components/parameters/DeviceId"
+          },
+          {
+            "$ref": "#/components/parameters/PrincipalUserHeader"
+          },
+          {
+            "$ref": "#/components/parameters/PrincipalDeviceHeader"
+          }
+        ],
+        "security": [
+          {
+            "RecorderPrincipal": []
+          }
+        ]
+      },
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/TurnId"
+        },
+        {
+          "$ref": "#/components/parameters/PartId"
+        }
+      ]
+    },
+    "/v1/turns/{turn_id}/parts/{part_id}/finish": {
+      "post": {
+        "responses": {
+          "200": {
+            "description": "Verified part"
+          }
+        },
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/UserId"
+          },
+          {
+            "$ref": "#/components/parameters/DeviceId"
+          },
+          {
+            "$ref": "#/components/parameters/PrincipalUserHeader"
+          },
+          {
+            "$ref": "#/components/parameters/PrincipalDeviceHeader"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FinishPart"
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "RecorderPrincipal": []
+          }
+        ]
+      },
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/TurnId"
+        },
+        {
+          "$ref": "#/components/parameters/PartId"
+        }
+      ]
+    },
+    "/v1/turns/{turn_id}/events/{event_id}/ack": {
+      "post": {
+        "responses": {
+          "200": {
+            "description": "Event ACK"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EventAck"
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "RecorderPrincipal": []
+          }
+        ]
+      },
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/TurnId"
+        },
+        {
+          "$ref": "#/components/parameters/EventId"
+        }
+      ]
+    },
+    "/v1/outbox": {
+      "get": {
         "responses": {
           "200": {
             "description": "Origin-device ordered outbox"
           }
         },
-        "security": [
-          {
-            "RecorderPrincipal": []
-          }
-        ]
-      }
-    },
-    "/v1/projects": {
-      "get": {
         "parameters": [
           {
             "$ref": "#/components/parameters/UserId"
           },
           {
             "$ref": "#/components/parameters/DeviceId"
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Project registry"
-          }
-        },
-        "security": [
-          {
-            "RecorderPrincipal": []
-          }
-        ]
-      },
-      "post": {
-        "responses": {
-          "201": {
-            "description": "Project"
-          }
-        },
-        "security": [
-          {
-            "RecorderPrincipal": []
-          }
-        ]
-      }
-    },
-    "/v1/projects/search": {
-      "get": {
-        "parameters": [
-          {
-            "$ref": "#/components/parameters/UserId"
           },
           {
-            "$ref": "#/components/parameters/DeviceId"
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Project search"
-          }
-        },
-        "security": [
-          {
-            "RecorderPrincipal": []
-          }
-        ]
-      }
-    },
-    "/v1/projects/{project_id}": {
-      "get": {
-        "parameters": [
-          {
-            "$ref": "#/components/parameters/UserId"
+            "$ref": "#/components/parameters/PrincipalUserHeader"
           },
           {
-            "$ref": "#/components/parameters/DeviceId"
+            "$ref": "#/components/parameters/PrincipalDeviceHeader"
           }
         ],
-        "responses": {
-          "200": {
-            "description": "Project"
-          }
-        },
-        "security": [
-          {
-            "RecorderPrincipal": []
-          }
-        ]
-      },
-      "parameters": [
-        {
-          "$ref": "#/components/parameters/ProjectId"
-        }
-      ],
-      "patch": {
-        "parameters": [
-          {
-            "$ref": "#/components/parameters/UserId"
-          },
-          {
-            "$ref": "#/components/parameters/DeviceId"
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "CAS update"
-          }
-        },
-        "security": [
-          {
-            "RecorderPrincipal": []
-          }
-        ]
-      }
-    },
-    "/v1/projects/{project_id}/archive": {
-      "parameters": [
-        {
-          "$ref": "#/components/parameters/ProjectId"
-        }
-      ],
-      "post": {
-        "parameters": [
-          {
-            "$ref": "#/components/parameters/UserId"
-          },
-          {
-            "$ref": "#/components/parameters/DeviceId"
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Archive-only transition"
-          }
-        },
-        "security": [
-          {
-            "RecorderPrincipal": []
-          }
-        ]
-      }
-    },
-    "/v1/schedules/{schedule_id}": {
-      "get": {
-        "parameters": [
-          {
-            "in": "path",
-            "name": "schedule_id",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "$ref": "#/components/parameters/UserId"
-          },
-          {
-            "$ref": "#/components/parameters/DeviceId"
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Schedule and occurrence readback"
-          }
-        },
         "security": [
           {
             "RecorderPrincipal": []
@@ -962,6 +372,7 @@
     },
     "/v1/tts/{artifact_id}": {
       "get": {
+        "summary": "Read target TTS or bridge it through an authenticated registered Phone",
         "parameters": [
           {
             "$ref": "#/components/parameters/ArtifactId"
@@ -971,6 +382,12 @@
           },
           {
             "$ref": "#/components/parameters/UserId"
+          },
+          {
+            "$ref": "#/components/parameters/PrincipalUserHeader"
+          },
+          {
+            "$ref": "#/components/parameters/PrincipalDeviceHeader"
           }
         ],
         "responses": {
@@ -988,12 +405,12 @@
           {
             "RecorderPrincipal": []
           }
-        ],
-        "summary": "Read target TTS or bridge it through an authenticated registered Phone"
+        ]
       }
     },
     "/v1/tts/{artifact_id}/bridge-read": {
       "get": {
+        "summary": "Read Watch-targeted TTS through an authenticated registered Phone bridge",
         "parameters": [
           {
             "$ref": "#/components/parameters/ArtifactId"
@@ -1003,6 +420,12 @@
           },
           {
             "$ref": "#/components/parameters/UserId"
+          },
+          {
+            "$ref": "#/components/parameters/PrincipalUserHeader"
+          },
+          {
+            "$ref": "#/components/parameters/PrincipalDeviceHeader"
           }
         ],
         "responses": {
@@ -1020,26 +443,26 @@
           {
             "RecorderPrincipal": []
           }
-        ],
-        "summary": "Read Watch-targeted TTS through an authenticated registered Phone bridge"
+        ]
       }
     },
     "/v1/tts/{artifact_id}/playback-ack": {
       "post": {
+        "summary": "Complete playback on the actual TTS delivery target",
         "parameters": [
           {
             "$ref": "#/components/parameters/ArtifactId"
           }
         ],
         "requestBody": {
+          "required": true,
           "content": {
             "application/json": {
               "schema": {
                 "$ref": "#/components/schemas/PlaybackAck"
               }
             }
-          },
-          "required": true
+          }
         },
         "responses": {
           "200": {
@@ -1059,30 +482,24 @@
           {
             "RecorderPrincipal": []
           }
-        ],
-        "summary": "Complete playback on the actual TTS delivery target"
+        ]
       }
     },
     "/v1/tts/{artifact_id}/relay-received": {
-      "parameters": [
-        {
-          "$ref": "#/components/parameters/ArtifactId"
-        }
-      ],
       "post": {
+        "responses": {
+          "200": {
+            "description": "Non-origin relay receipt"
+          }
+        },
         "requestBody": {
+          "required": true,
           "content": {
             "application/json": {
               "schema": {
                 "$ref": "#/components/schemas/RelayReceived"
               }
             }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "description": "Non-origin relay receipt"
           }
         },
         "security": [
@@ -1090,87 +507,54 @@
             "RecorderPrincipal": []
           }
         ]
-      }
+      },
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/ArtifactId"
+        }
+      ]
     },
-    "/v1/turns": {
-      "post": {
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/TurnCreate"
-              }
-            }
-          },
-          "required": true
+    "/v1/projects": {
+      "get": {
+        "responses": {
+          "200": {
+            "description": "Project registry"
+          }
         },
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/UserId"
+          },
+          {
+            "$ref": "#/components/parameters/DeviceId"
+          },
+          {
+            "$ref": "#/components/parameters/PrincipalUserHeader"
+          },
+          {
+            "$ref": "#/components/parameters/PrincipalDeviceHeader"
+          }
+        ],
+        "security": [
+          {
+            "RecorderPrincipal": []
+          }
+        ]
+      },
+      "post": {
         "responses": {
           "201": {
-            "description": "Receiving turn"
-          },
-          "202": {
-            "description": "Accepted text turn"
-          },
-          "409": {
-            "description": "TURN_ID_CONFLICT"
+            "description": "Project"
           }
         },
-        "security": [
-          {
-            "RecorderPrincipal": []
-          }
-        ],
-        "summary": "Create an immutable turn envelope or complete a text turn"
-      }
-    },
-    "/v1/turns/{turn_id}": {
-      "get": {
-        "parameters": [
-          {
-            "$ref": "#/components/parameters/TurnId"
-          },
-          {
-            "$ref": "#/components/parameters/UserId"
-          },
-          {
-            "$ref": "#/components/parameters/DeviceId"
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Turn ledger"
-          }
-        },
-        "security": [
-          {
-            "RecorderPrincipal": []
-          }
-        ]
-      }
-    },
-    "/v1/turns/{turn_id}/accept": {
-      "parameters": [
-        {
-          "$ref": "#/components/parameters/TurnId"
-        }
-      ],
-      "post": {
         "requestBody": {
+          "required": true,
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/OwnerProof"
+                "$ref": "#/components/schemas/ProjectCreate"
               }
             }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "description": "Durable ACCEPTED"
-          },
-          "409": {
-            "description": "Incomplete parts"
           }
         },
         "security": [
@@ -1180,154 +564,132 @@
         ]
       }
     },
-    "/v1/turns/{turn_id}/archive": {
-      "parameters": [
-        {
-          "$ref": "#/components/parameters/TurnId"
-        }
-      ],
-      "post": {
+    "/v1/projects/search": {
+      "get": {
+        "responses": {
+          "200": {
+            "description": "Project search"
+          }
+        },
         "parameters": [
           {
             "$ref": "#/components/parameters/UserId"
           },
           {
             "$ref": "#/components/parameters/DeviceId"
+          },
+          {
+            "$ref": "#/components/parameters/PrincipalUserHeader"
+          },
+          {
+            "$ref": "#/components/parameters/PrincipalDeviceHeader"
           }
         ],
+        "security": [
+          {
+            "RecorderPrincipal": []
+          }
+        ]
+      }
+    },
+    "/v1/projects/{project_id}": {
+      "get": {
+        "responses": {
+          "200": {
+            "description": "Project"
+          }
+        },
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/UserId"
+          },
+          {
+            "$ref": "#/components/parameters/DeviceId"
+          },
+          {
+            "$ref": "#/components/parameters/PrincipalUserHeader"
+          },
+          {
+            "$ref": "#/components/parameters/PrincipalDeviceHeader"
+          }
+        ],
+        "security": [
+          {
+            "RecorderPrincipal": []
+          }
+        ]
+      },
+      "patch": {
+        "responses": {
+          "200": {
+            "description": "CAS update"
+          }
+        },
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/UserId"
+          },
+          {
+            "$ref": "#/components/parameters/DeviceId"
+          },
+          {
+            "$ref": "#/components/parameters/PrincipalUserHeader"
+          },
+          {
+            "$ref": "#/components/parameters/PrincipalDeviceHeader"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ProjectPatch"
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "RecorderPrincipal": []
+          }
+        ]
+      },
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/ProjectId"
+        }
+      ]
+    },
+    "/v1/turns/{turn_id}/archive": {
+      "post": {
         "responses": {
           "200": {
             "description": "Archive-only turn retention"
           }
         },
-        "security": [
-          {
-            "RecorderPrincipal": []
-          }
-        ]
-      }
-    },
-    "/v1/turns/{turn_id}/events/{event_id}/ack": {
-      "parameters": [
-        {
-          "$ref": "#/components/parameters/TurnId"
-        },
-        {
-          "$ref": "#/components/parameters/EventId"
-        }
-      ],
-      "post": {
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/EventAck"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "description": "Event ACK"
-          }
-        },
-        "security": [
-          {
-            "RecorderPrincipal": []
-          }
-        ]
-      }
-    },
-    "/v1/turns/{turn_id}/parts/{part_id}/chunks/{sequence}": {
-      "parameters": [
-        {
-          "$ref": "#/components/parameters/TurnId"
-        },
-        {
-          "$ref": "#/components/parameters/PartId"
-        },
-        {
-          "$ref": "#/components/parameters/Sequence"
-        }
-      ],
-      "put": {
         "parameters": [
           {
             "$ref": "#/components/parameters/UserId"
           },
           {
             "$ref": "#/components/parameters/DeviceId"
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Chunk receipt"
-          },
-          "409": {
-            "description": "Chunk conflict"
-          }
-        },
-        "security": [
-          {
-            "RecorderPrincipal": []
-          }
-        ]
-      }
-    },
-    "/v1/turns/{turn_id}/parts/{part_id}/finish": {
-      "parameters": [
-        {
-          "$ref": "#/components/parameters/TurnId"
-        },
-        {
-          "$ref": "#/components/parameters/PartId"
-        }
-      ],
-      "post": {
-        "parameters": [
-          {
-            "$ref": "#/components/parameters/UserId"
           },
           {
-            "$ref": "#/components/parameters/DeviceId"
+            "$ref": "#/components/parameters/PrincipalUserHeader"
+          },
+          {
+            "$ref": "#/components/parameters/PrincipalDeviceHeader"
           }
         ],
         "requestBody": {
+          "required": true,
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/FinishPart"
+                "$ref": "#/components/schemas/ArchiveTurn"
               }
             }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "description": "Verified part"
-          }
-        },
-        "security": [
-          {
-            "RecorderPrincipal": []
-          }
-        ]
-      }
-    },
-    "/v1/turns/{turn_id}/parts/{part_id}/missing": {
-      "get": {
-        "parameters": [
-          {
-            "$ref": "#/components/parameters/UserId"
-          },
-          {
-            "$ref": "#/components/parameters/DeviceId"
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Missing sequence list"
           }
         },
         "security": [
@@ -1339,11 +701,138 @@
       "parameters": [
         {
           "$ref": "#/components/parameters/TurnId"
-        },
-        {
-          "$ref": "#/components/parameters/PartId"
         }
       ]
+    },
+    "/v1/projects/{project_id}/archive": {
+      "post": {
+        "responses": {
+          "200": {
+            "description": "Archive-only transition"
+          }
+        },
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/UserId"
+          },
+          {
+            "$ref": "#/components/parameters/DeviceId"
+          },
+          {
+            "$ref": "#/components/parameters/PrincipalUserHeader"
+          },
+          {
+            "$ref": "#/components/parameters/PrincipalDeviceHeader"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ExpectedVersion"
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "RecorderPrincipal": []
+          }
+        ]
+      },
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/ProjectId"
+        }
+      ]
+    },
+    "/v1/internal/schedule_create": {
+      "post": {
+        "summary": "Trusted Recorder adapter schedule creation",
+        "responses": {
+          "201": {
+            "description": "Durably scheduled with atomic confirmation FINAL"
+          },
+          "401": {
+            "description": "Trusted adapter header required"
+          },
+          "409": {
+            "description": "Immutable schedule conflict"
+          }
+        },
+        "security": [
+          {
+            "RecorderPrincipal": []
+          }
+        ]
+      }
+    },
+    "/v1/internal/scheduler/fire": {
+      "post": {
+        "summary": "Claim and fire due server schedules",
+        "responses": {
+          "200": {
+            "description": "Scheduled FINAL readback"
+          }
+        },
+        "security": [
+          {
+            "RecorderPrincipal": []
+          }
+        ]
+      }
+    },
+    "/v1/internal/scheduler/recover": {
+      "post": {
+        "summary": "Requeue expired scheduler leases",
+        "responses": {
+          "200": {
+            "description": "Recovery counts"
+          }
+        },
+        "security": [
+          {
+            "RecorderPrincipal": []
+          }
+        ]
+      }
+    },
+    "/v1/schedules/{schedule_id}": {
+      "get": {
+        "parameters": [
+          {
+            "name": "schedule_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/UserId"
+          },
+          {
+            "$ref": "#/components/parameters/DeviceId"
+          },
+          {
+            "$ref": "#/components/parameters/PrincipalUserHeader"
+          },
+          {
+            "$ref": "#/components/parameters/PrincipalDeviceHeader"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Schedule and occurrence readback"
+          }
+        },
+        "security": [
+          {
+            "RecorderPrincipal": []
+          }
+        ]
+      }
     },
     "/v1/updates/{channel}/manifest": {
       "get": {
@@ -1394,11 +883,1481 @@
           "$ref": "#/components/parameters/ArtifactName"
         }
       ]
+    },
+    "/v1/history": {
+      "get": {
+        "summary": "Project-scoped keyset history read model",
+        "responses": {
+          "200": {
+            "description": "Paired user/assistant messages"
+          }
+        },
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/UserId"
+          },
+          {
+            "$ref": "#/components/parameters/DeviceId"
+          },
+          {
+            "$ref": "#/components/parameters/PrincipalUserHeader"
+          },
+          {
+            "$ref": "#/components/parameters/PrincipalDeviceHeader"
+          }
+        ],
+        "security": [
+          {
+            "RecorderPrincipal": []
+          }
+        ]
+      }
+    },
+    "/v1/eavesdrop": {
+      "post": {
+        "summary": "Start a phone-mediated eavesdrop session",
+        "responses": {
+          "201": {
+            "description": "Created session"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EavesdropStart"
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "RecorderPrincipal": []
+          }
+        ]
+      }
+    },
+    "/v1/eavesdrop/{session_id}": {
+      "get": {
+        "responses": {
+          "200": {
+            "description": "Session state"
+          }
+        },
+        "security": [
+          {
+            "RecorderPrincipal": []
+          }
+        ]
+      },
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/SessionId"
+        }
+      ]
+    },
+    "/v1/eavesdrop/{session_id}/{action}": {
+      "post": {
+        "parameters": [
+          {
+            "name": "action",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "activate",
+                "pause",
+                "resume",
+                "stop",
+                "segments"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "State transition or segment receipt"
+          }
+        },
+        "security": [
+          {
+            "RecorderPrincipal": []
+          }
+        ]
+      },
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/SessionId"
+        }
+      ]
+    },
+    "/v1/eavesdrop/{session_id}/activate": {
+      "post": {
+        "responses": {
+          "200": {
+            "description": "Activated eavesdrop session"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EavesdropAction"
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "RecorderPrincipal": []
+          }
+        ]
+      },
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/SessionId"
+        }
+      ]
+    },
+    "/v1/eavesdrop/{session_id}/pause": {
+      "post": {
+        "responses": {
+          "200": {
+            "description": "Paused eavesdrop session"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EavesdropAction"
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "RecorderPrincipal": []
+          }
+        ]
+      },
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/SessionId"
+        }
+      ]
+    },
+    "/v1/eavesdrop/{session_id}/resume": {
+      "post": {
+        "responses": {
+          "200": {
+            "description": "Resumed eavesdrop session"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EavesdropAction"
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "RecorderPrincipal": []
+          }
+        ]
+      },
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/SessionId"
+        }
+      ]
+    },
+    "/v1/eavesdrop/{session_id}/stop": {
+      "post": {
+        "responses": {
+          "200": {
+            "description": "Stopped eavesdrop session"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EavesdropAction"
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "RecorderPrincipal": []
+          }
+        ]
+      },
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/SessionId"
+        }
+      ]
+    },
+    "/v1/eavesdrop/{session_id}/segments": {
+      "post": {
+        "responses": {
+          "201": {
+            "description": "Eavesdrop segment receipt"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EavesdropSegment"
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "RecorderPrincipal": []
+          }
+        ]
+      },
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/SessionId"
+        }
+      ]
+    },
+    "/v1/eavesdrop/{session_id}/replies": {
+      "get": {
+        "responses": {
+          "200": {
+            "description": "Optional response receipts"
+          }
+        },
+        "security": [
+          {
+            "RecorderPrincipal": []
+          }
+        ]
+      },
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/SessionId"
+        }
+      ]
+    },
+    "/v1/diagnostics/opt-in": {
+      "post": {
+        "responses": {
+          "201": {
+            "description": "Consent event"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DiagnosticsOptIn"
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "RecorderPrincipal": []
+          }
+        ]
+      }
+    },
+    "/v1/diagnostics/events": {
+      "post": {
+        "responses": {
+          "201": {
+            "description": "Redacted diagnostic event"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DiagnosticsEvent"
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "RecorderPrincipal": []
+          }
+        ]
+      }
+    },
+    "/v1/diagnostics/bundles": {
+      "post": {
+        "responses": {
+          "201": {
+            "description": "Bounded compressed diagnostic bundle"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DiagnosticsBundle"
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "RecorderPrincipal": []
+          }
+        ]
+      }
+    },
+    "/v1/diagnostics": {
+      "get": {
+        "responses": {
+          "200": {
+            "description": "Diagnostic metadata"
+          }
+        },
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/UserId"
+          },
+          {
+            "$ref": "#/components/parameters/DeviceId"
+          },
+          {
+            "$ref": "#/components/parameters/PrincipalUserHeader"
+          },
+          {
+            "$ref": "#/components/parameters/PrincipalDeviceHeader"
+          }
+        ],
+        "security": [
+          {
+            "RecorderPrincipal": []
+          }
+        ]
+      },
+      "delete": {
+        "responses": {
+          "200": {
+            "description": "Deletion receipt and tombstones"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OwnerProof"
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "RecorderPrincipal": []
+          }
+        ]
+      }
+    },
+    "/v1/diagnostics/delete": {
+      "post": {
+        "responses": {
+          "200": {
+            "description": "Deletion receipt and tombstones"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OwnerProof"
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "RecorderPrincipal": []
+          }
+        ]
+      }
+    },
+    "/v1/internal/worker/claim": {
+      "post": {
+        "responses": {
+          "200": {
+            "description": "Claim one durable worker lease"
+          }
+        },
+        "security": [
+          {
+            "RecorderPrincipal": []
+          }
+        ]
+      }
+    },
+    "/v1/internal/worker/recover": {
+      "post": {
+        "responses": {
+          "200": {
+            "description": "Recover expired worker leases"
+          }
+        },
+        "security": [
+          {
+            "RecorderPrincipal": []
+          }
+        ]
+      }
+    },
+    "/v1/internal/worker/complete": {
+      "post": {
+        "responses": {
+          "200": {
+            "description": "Complete one durable worker lease"
+          }
+        },
+        "security": [
+          {
+            "RecorderPrincipal": []
+          }
+        ]
+      }
+    },
+    "/v1/internal/worker/fail": {
+      "post": {
+        "responses": {
+          "200": {
+            "description": "Record one durable worker failure"
+          }
+        },
+        "security": [
+          {
+            "RecorderPrincipal": []
+          }
+        ]
+      }
+    },
+    "/v1/internal/worker/run": {
+      "post": {
+        "responses": {
+          "200": {
+            "description": "Run one durable worker lease operation"
+          }
+        },
+        "security": [
+          {
+            "RecorderPrincipal": []
+          }
+        ]
+      }
+    },
+    "/v1/internal/worker/health": {
+      "get": {
+        "responses": {
+          "200": {
+            "description": "Bounded worker backlog and lease health"
+          }
+        },
+        "security": [
+          {
+            "RecorderPrincipal": []
+          }
+        ]
+      }
+    },
+    "/v1/eavesdrop/{session_id}/segments/{segment_sequence}/route": {
+      "post": {
+        "responses": {
+          "200": {
+            "description": "Idempotent fixed-project routing decision"
+          }
+        },
+        "security": [
+          {
+            "RecorderPrincipal": []
+          }
+        ]
+      },
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/SessionId"
+        },
+        {
+          "$ref": "#/components/parameters/SegmentSequence"
+        }
+      ]
+    },
+    "/v1/eavesdrop/{session_id}/decisions": {
+      "get": {
+        "responses": {
+          "200": {
+            "description": "Eavesdrop routing decision ledger"
+          }
+        },
+        "security": [
+          {
+            "RecorderPrincipal": []
+          }
+        ]
+      },
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/SessionId"
+        }
+      ]
+    },
+    "/v1/diagnostics/export": {
+      "get": {
+        "responses": {
+          "200": {
+            "description": "Redacted diagnostic export"
+          }
+        },
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/UserId"
+          },
+          {
+            "$ref": "#/components/parameters/DeviceId"
+          },
+          {
+            "$ref": "#/components/parameters/PrincipalUserHeader"
+          },
+          {
+            "$ref": "#/components/parameters/PrincipalDeviceHeader"
+          }
+        ],
+        "security": [
+          {
+            "RecorderPrincipal": []
+          }
+        ]
+      }
     }
   },
-  "servers": [
-    {
-      "url": "/"
+  "components": {
+    "securitySchemes": {
+      "RecorderPrincipal": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "X-Recorder-Principal-Signature",
+        "description": "HMAC-SHA256 proof over X-Recorder-Principal-User, a NUL byte, and X-Recorder-Principal-Device. The deployment secret stays outside the API payload and logs."
+      }
+    },
+    "parameters": {
+      "TurnId": {
+        "name": "turn_id",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "type": "string",
+          "format": "uuid"
+        }
+      },
+      "ArtifactId": {
+        "name": "artifact_id",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "type": "string"
+        }
+      },
+      "DeviceId": {
+        "name": "device_id",
+        "in": "query",
+        "required": true,
+        "description": "Registered active device identity; a Phone may bridge-read a Watch-targeted artifact.",
+        "schema": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "UserId": {
+        "name": "user_id",
+        "in": "query",
+        "required": true,
+        "description": "Owner identity paired with the registered active device.",
+        "schema": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "DevicePath": {
+        "name": "device_id",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "PartId": {
+        "name": "part_id",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "Sequence": {
+        "name": "sequence",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "EventId": {
+        "name": "event_id",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "type": "string",
+          "format": "uuid"
+        }
+      },
+      "ProjectId": {
+        "name": "project_id",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "ScheduleId": {
+        "name": "schedule_id",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "Channel": {
+        "name": "channel",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "Generation": {
+        "name": "generation",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "type": "integer",
+          "minimum": 1
+        }
+      },
+      "ArtifactName": {
+        "name": "artifact_name",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "SessionId": {
+        "name": "session_id",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "Action": {
+        "name": "action",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "type": "string",
+          "enum": [
+            "activate",
+            "pause",
+            "resume",
+            "stop",
+            "segments"
+          ]
+        }
+      },
+      "SegmentSequence": {
+        "name": "segment_sequence",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "PrincipalUserHeader": {
+        "name": "X-Recorder-User-ID",
+        "in": "header",
+        "required": true,
+        "description": "Authenticated Recorder owner identity.",
+        "schema": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "PrincipalDeviceHeader": {
+        "name": "X-Recorder-Device-ID",
+        "in": "header",
+        "required": true,
+        "description": "Authenticated registered Recorder device identity.",
+        "schema": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "schemas": {
+      "TurnState": {
+        "type": "string",
+        "enum": [
+          "RECEIVING",
+          "ACCEPTED",
+          "PREPROCESSING",
+          "ROUTING",
+          "ROUTED",
+          "HERMES_PENDING",
+          "FINAL_READY",
+          "DELIVERY_PENDING",
+          "RETRY_WAIT",
+          "LATE_RESULT_GRACE",
+          "DELIVERED",
+          "FAILED_PERMANENT",
+          "EXPIRED"
+        ]
+      },
+      "EventKind": {
+        "type": "string",
+        "enum": [
+          "ACCEPTED",
+          "ROUTED",
+          "FINAL"
+        ]
+      },
+      "ArtifactState": {
+        "type": "string",
+        "enum": [
+          "PENDING",
+          "READY",
+          "DELIVERY_PENDING",
+          "PLAYED",
+          "FAILED_GENERATION",
+          "EXPIRED"
+        ]
+      },
+      "ScheduleState": {
+        "type": "string",
+        "enum": [
+          "SCHEDULED",
+          "CLAIMED",
+          "FIRED",
+          "FAILED",
+          "CANCELLED"
+        ]
+      },
+      "ServerTurnSource": {
+        "type": "string",
+        "enum": [
+          "server_schedule"
+        ]
+      },
+      "PlaybackAck": {
+        "type": "object",
+        "required": [
+          "user_id",
+          "device_id",
+          "payload_sha256",
+          "turn_id",
+          "artifact_version"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "user_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "device_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "payload_sha256": {
+            "type": "string",
+            "minLength": 1
+          },
+          "turn_id": {
+            "type": "string",
+            "format": "uuid",
+            "minLength": 1
+          },
+          "artifact_version": {
+            "type": "integer",
+            "minimum": 1
+          }
+        }
+      },
+      "Error": {
+        "type": "object",
+        "required": [
+          "error"
+        ],
+        "properties": {
+          "error": {
+            "type": "object",
+            "properties": {
+              "code": {
+                "type": "string"
+              },
+              "message": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      "TurnPart": {
+        "type": "object",
+        "required": [
+          "part_id",
+          "kind",
+          "mime"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "part_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "kind": {
+            "type": "string",
+            "minLength": 1
+          },
+          "mime": {
+            "type": "string",
+            "minLength": 1
+          },
+          "declared_bytes": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0
+          },
+          "declared_sha256": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "pattern": "^[0-9a-fA-F]{64}$"
+          },
+          "relationship": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "caption_hash": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "pattern": "^[0-9a-fA-F]{64}$"
+          },
+          "duration_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0
+          },
+          "streaming": {
+            "type": "boolean",
+            "default": false
+          }
+        }
+      },
+      "TurnCreate": {
+        "type": "object",
+        "properties": {
+          "schema_version": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "client_created_at": {
+            "type": "string",
+            "minLength": 1
+          },
+          "current_project_number": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "prefer_current_project": {
+            "type": "boolean",
+            "default": false
+          },
+          "parts": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "$ref": "#/components/schemas/TurnPart"
+            }
+          }
+        },
+        "required": [
+          "schema_version",
+          "user_id",
+          "turn_id",
+          "origin_device_id",
+          "client_created_at",
+          "parts"
+        ],
+        "additionalProperties": false
+      },
+      "DeviceRegister": {
+        "type": "object",
+        "required": [
+          "user_id",
+          "device_id",
+          "kind"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "user_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "device_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "phone",
+              "watch",
+              "other"
+            ]
+          }
+        }
+      },
+      "ChunkUpload": {
+        "type": "string",
+        "format": "binary",
+        "description": "Raw chunk bytes; X-Chunk-SHA256 may bind the expected digest."
+      },
+      "ProjectCreate": {
+        "type": "object",
+        "required": [
+          "user_id",
+          "device_id",
+          "project_number",
+          "name"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "user_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "device_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "project_number": {
+            "type": "string",
+            "minLength": 1
+          },
+          "name": {
+            "type": "string",
+            "minLength": 1
+          },
+          "aliases": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "description": {
+            "type": "string"
+          },
+          "idempotency_key": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      },
+      "ProjectPatch": {
+        "type": "object",
+        "required": [
+          "expected_version"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "expected_version": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "name": {
+            "type": "string",
+            "minLength": 1
+          },
+          "aliases": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "description": {
+            "type": "string"
+          }
+        }
+      },
+      "ExpectedVersion": {
+        "type": "object",
+        "required": [
+          "expected_version"
+        ],
+        "properties": {
+          "expected_version": {
+            "type": "integer",
+            "minimum": 1
+          }
+        }
+      },
+      "ArchiveTurn": {
+        "type": "object",
+        "properties": {
+          "source": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      },
+      "EavesdropStart": {
+        "type": "object",
+        "required": [
+          "user_id",
+          "phone_device_id"
+        ],
+        "properties": {
+          "user_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "phone_device_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "session_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "idempotency_key": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "watch_device_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "project_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "response_enabled": {
+            "type": "boolean",
+            "default": true
+          },
+          "tts_enabled": {
+            "type": "boolean",
+            "default": false
+          },
+          "hermes_enabled": {
+            "type": "boolean",
+            "default": false
+          },
+          "mode": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "enum": [
+              "forward_default",
+              "store_silent",
+              "FORWARD_DEFAULT",
+              "STORE_SILENT",
+              null
+            ]
+          },
+          "expires_seconds": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 86400,
+            "default": 300
+          },
+          "now": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "EavesdropAction": {
+        "type": "object",
+        "required": [
+          "user_id",
+          "phone_device_id"
+        ],
+        "properties": {
+          "user_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "phone_device_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "now": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "EavesdropSegment": {
+        "type": "object",
+        "required": [
+          "user_id",
+          "phone_device_id",
+          "sequence",
+          "client_segment_id",
+          "audio_base64"
+        ],
+        "properties": {
+          "user_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "phone_device_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "sequence": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "client_segment_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "audio_base64": {
+            "type": "string",
+            "minLength": 1
+          },
+          "transcript": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "reply_text": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "now": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "DiagnosticsOptIn": {
+        "type": "object",
+        "required": [
+          "user_id",
+          "device_id"
+        ],
+        "properties": {
+          "user_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "device_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "event_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "enabled": {
+            "type": "boolean",
+            "default": true
+          },
+          "expires_at": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "now": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "DiagnosticsEvent": {
+        "type": "object",
+        "required": [
+          "user_id",
+          "device_id",
+          "event_id",
+          "idempotency_key",
+          "payload"
+        ],
+        "properties": {
+          "user_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "device_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "event_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "idempotency_key": {
+            "type": "string",
+            "minLength": 1
+          },
+          "payload": {
+            "type": "object"
+          },
+          "occurred_at": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "now": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "DiagnosticsBundle": {
+        "type": "object",
+        "required": [
+          "user_id",
+          "device_id",
+          "bundle_id",
+          "opt_in_event_id",
+          "compressed_base64"
+        ],
+        "properties": {
+          "user_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "device_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "bundle_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "opt_in_event_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "compressed_base64": {
+            "type": "string",
+            "minLength": 1
+          },
+          "expanded_size": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0
+          },
+          "now": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "OwnerProof": {
+        "type": "object",
+        "required": [
+          "user_id",
+          "device_id"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "user_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "device_id": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      },
+      "DeviceRevoke": {
+        "type": "object",
+        "required": [
+          "user_id",
+          "actor_device_id"
+        ],
+        "properties": {
+          "user_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "actor_device_id": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "additionalProperties": false
+      },
+      "FinishPart": {
+        "type": "object",
+        "required": [
+          "total_chunks",
+          "total_bytes",
+          "whole_stream_sha256"
+        ],
+        "properties": {
+          "total_chunks": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "total_bytes": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "whole_stream_sha256": {
+            "type": "string",
+            "minLength": 1
+          },
+          "duration_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0
+          }
+        }
+      },
+      "EventAck": {
+        "type": "object",
+        "required": [
+          "user_id",
+          "device_id",
+          "event_version",
+          "payload_sha256"
+        ],
+        "properties": {
+          "user_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "device_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "event_version": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "payload_sha256": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      },
+      "RelayReceived": {
+        "type": "object",
+        "required": [
+          "user_id",
+          "device_id",
+          "payload_sha256"
+        ],
+        "properties": {
+          "user_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "device_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "payload_sha256": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
     }
-  ]
+  }
 }

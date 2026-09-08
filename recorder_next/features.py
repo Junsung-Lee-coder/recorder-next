@@ -1233,6 +1233,47 @@ class FeatureGroups:
         expected_generation: int | None = None,
         now: str | None = None,
     ) -> dict[str, Any]:
+        # A rollback receipt is durable before the artifact write so a crash
+        # can recover it.  Serialize that receipt/write/manifest sequence
+        # against cleanup recovery so it cannot unlink an in-flight artifact.
+        with self.store._write_lock:
+            return self._publish_update_manifest(
+                channel=channel,
+                generation=generation,
+                platform=platform,
+                version=version,
+                version_code=version_code,
+                artifact_name=artifact_name,
+                signer_digest=signer_digest,
+                changelog=changelog,
+                min_server_version=min_server_version,
+                authorization_policy=authorization_policy,
+                artifact_path=artifact_path,
+                artifact_bytes=artifact_bytes,
+                etag=etag,
+                expected_generation=expected_generation,
+                now=now,
+            )
+
+    def _publish_update_manifest(
+        self,
+        *,
+        channel: str,
+        generation: int,
+        platform: str,
+        version: str,
+        version_code: int,
+        artifact_name: str,
+        signer_digest: str,
+        changelog: str,
+        min_server_version: str,
+        authorization_policy: str,
+        artifact_path: str | os.PathLike[str] | None = None,
+        artifact_bytes: bytes | None = None,
+        etag: str | None = None,
+        expected_generation: int | None = None,
+        now: str | None = None,
+    ) -> dict[str, Any]:
         channel = self._channel(channel)
         self._apk_name(artifact_name)
         if not isinstance(generation, int) or isinstance(generation, bool) or generation < 1:
@@ -2276,6 +2317,31 @@ class FeatureGroups:
         expanded_size: int | None = None,
         now: str | None = None,
     ) -> dict[str, Any]:
+        # Keep the durable rollback receipt, managed bundle, and DB row
+        # serialized with cleanup recovery for the same reason as chunk
+        # ingestion: the receipt precedes the physical write by design.
+        with self.store._write_lock:
+            return self._ingest_diagnostic_bundle(
+                user_id,
+                device_id,
+                bundle_id,
+                compressed,
+                opt_in_event_id=opt_in_event_id,
+                expanded_size=expanded_size,
+                now=now,
+            )
+
+    def _ingest_diagnostic_bundle(
+        self,
+        user_id: str,
+        device_id: str,
+        bundle_id: str,
+        compressed: bytes,
+        *,
+        opt_in_event_id: str,
+        expanded_size: int | None = None,
+        now: str | None = None,
+    ) -> dict[str, Any]:
         self._identifier(bundle_id, "bundle_id")
         self._identifier(opt_in_event_id, "opt_in_event_id")
         if not isinstance(compressed, bytes) or not compressed:
@@ -2405,17 +2471,171 @@ class FeatureGroups:
             items = self._diagnostic_listing_items(conn, user_id, device_id, category=category, stage=stage, limit=limit)
             return {"items": items[:limit], "has_more": len(items) > limit}
 
-    def export_diagnostics(self, user_id: str, device_id: str) -> dict[str, Any]:
+    @staticmethod
+    def _decode_diagnostics_cursor(cursor: str | None) -> tuple[str, int, str] | None:
+        if cursor is None:
+            return None
+        if not isinstance(cursor, str) or not cursor or len(cursor) > 512:
+            raise ValidationError("diagnostic cursor is invalid")
+        try:
+            encoded = cursor.encode("ascii")
+            encoded += b"=" * (-len(encoded) % 4)
+            payload = json.loads(base64.b64decode(encoded, altchars=b"-_", validate=True).decode("utf-8"))
+        except (ValueError, UnicodeError, json.JSONDecodeError, binascii.Error) as exc:
+            raise ValidationError("diagnostic cursor is invalid") from exc
+        if not isinstance(payload, dict) or set(payload) != {"sort_at", "sort_type", "entity_id"}:
+            raise ValidationError("diagnostic cursor is invalid")
+        sort_at = payload["sort_at"]
+        sort_type = payload["sort_type"]
+        entity_id = payload["entity_id"]
+        if (
+            not isinstance(sort_at, str)
+            or not sort_at
+            or isinstance(sort_type, bool)
+            or not isinstance(sort_type, int)
+            or sort_type not in {0, 1, 2}
+            or not isinstance(entity_id, str)
+            or not entity_id
+        ):
+            raise ValidationError("diagnostic cursor is invalid")
+        return sort_at, sort_type, entity_id
+
+    @staticmethod
+    def _encode_diagnostics_cursor(sort_at: str, sort_type: int, entity_id: str) -> str:
+        payload = {"entity_id": entity_id, "sort_at": sort_at, "sort_type": sort_type}
+        return base64.urlsafe_b64encode(canonical_json(payload)).decode("ascii").rstrip("=")
+
+    @staticmethod
+    def _diagnostic_row_item(row: Any) -> dict[str, Any]:
+        if row["entity_type"] == "event":
+            return {
+                "type": "event",
+                "event_id": row["entity_id"],
+                "category": row["category"],
+                "stage": row["stage"],
+                "metadata": json.loads(row["metadata_json"]),
+                "occurred_at": row["sort_at"],
+                "retention_deadline": row["retention_deadline"],
+            }
+        return {
+            "type": "bundle",
+            "bundle_id": row["entity_id"],
+            "compressed_size": row["compressed_size"],
+            "expanded_size": row["expanded_size"],
+            "payload_sha256": row["payload_sha256"],
+            "created_at": row["sort_at"],
+            "retention_deadline": row["retention_deadline"],
+        }
+
+    def export_diagnostics(
+        self,
+        user_id: str,
+        device_id: str,
+        *,
+        category: str | None = None,
+        stage: str | None = None,
+        cursor: str | None = None,
+        limit: int = 100,
+        max_bytes: int | None = None,
+    ) -> dict[str, Any]:
         self._identifier(device_id, "device_id")
-        self.purge_diagnostics(_recover_cleanup=False)
+        if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 500:
+            raise ValidationError("diagnostic export limit must be between 1 and 500")
+        byte_limit = self.store.diagnostics_export_max_bytes if max_bytes is None else max_bytes
+        if not isinstance(byte_limit, int) or isinstance(byte_limit, bool) or not 1024 <= byte_limit <= 64 * 1024 * 1024:
+            raise ValidationError("diagnostic export byte limit is invalid")
+        decoded_cursor = self._decode_diagnostics_cursor(cursor)
         with self.store._read() as conn:
             self.store._assert_device(conn, user_id, device_id)
-            items = self._diagnostic_listing_items(conn, user_id, device_id, limit=None)
-            tombstones = [
-                {"entity_type": row["entity_type"], "entity_id": row["entity_id"], "deleted_at": row["deleted_at"]}
-                for row in conn.execute("SELECT entity_type, entity_id, deleted_at FROM diagnostic_tombstones WHERE user_id=? AND device_id=? ORDER BY deleted_at, entity_id", (user_id, device_id)).fetchall()
-            ]
-        return {"schema_version": 1, "items": items, "tombstones": tombstones, "truncated": False, "next_cursor": None}
+            event_clauses = ["e.user_id=?", "e.device_id=?", "e.deleted_at IS NULL"]
+            event_args: list[Any] = [user_id, device_id]
+            if category is not None:
+                event_clauses.append("e.category=?")
+                event_args.append(category)
+            if stage is not None:
+                event_clauses.append("e.stage=?")
+                event_args.append(stage)
+            bundle_clauses = ["b.user_id=?", "b.device_id=?", "b.deleted_at IS NULL"]
+            bundle_args: list[Any] = [user_id, device_id]
+            tombstone_clauses = ["t.user_id=?", "t.device_id=?"]
+            tombstone_args: list[Any] = [user_id, device_id]
+            union_sql = (
+                "SELECT 'event' AS entity_type, 0 AS sort_type, e.event_id AS entity_id, e.occurred_at AS sort_at, "
+                "e.category AS category, e.stage AS stage, e.metadata_json AS metadata_json, "
+                "NULL AS compressed_size, NULL AS expanded_size, NULL AS payload_sha256, e.retention_deadline AS retention_deadline "
+                "FROM diagnostic_events e WHERE " + " AND ".join(event_clauses) + " UNION ALL "
+                "SELECT 'bundle' AS entity_type, 1 AS sort_type, b.bundle_id AS entity_id, b.created_at AS sort_at, "
+                "NULL AS category, NULL AS stage, NULL AS metadata_json, b.compressed_size AS compressed_size, "
+                "b.expanded_size AS expanded_size, b.payload_sha256 AS payload_sha256, b.retention_deadline AS retention_deadline "
+                "FROM diagnostic_bundles b WHERE " + " AND ".join(bundle_clauses) + " UNION ALL "
+                "SELECT 'tombstone' AS entity_type, 2 AS sort_type, t.entity_id AS entity_id, t.deleted_at AS sort_at, "
+                "t.entity_type AS category, NULL AS stage, NULL AS metadata_json, NULL AS compressed_size, "
+                "NULL AS expanded_size, NULL AS payload_sha256, NULL AS retention_deadline "
+                "FROM diagnostic_tombstones t WHERE " + " AND ".join(tombstone_clauses)
+            )
+            args = [*event_args, *bundle_args, *tombstone_args]
+            cursor_clause = ""
+            if decoded_cursor is not None:
+                sort_at, sort_type, entity_id = decoded_cursor
+                cursor_clause = (
+                    " WHERE (sort_at > ? OR (sort_at = ? AND sort_type > ?) "
+                    "OR (sort_at = ? AND sort_type = ? AND entity_id > ?))"
+                )
+                args.extend([sort_at, sort_at, sort_type, sort_at, sort_type, entity_id])
+            rows = conn.execute(
+                "SELECT * FROM (" + union_sql + ")" + cursor_clause + " ORDER BY sort_at, sort_type, entity_id LIMIT ?",
+                (*args, limit + 1),
+            ).fetchall()
+
+        accepted: list[dict[str, Any]] = []
+        accepted_tombstones: list[dict[str, Any]] = []
+        next_cursor: str | None = None
+        truncated = False
+        last_key: tuple[str, int, str] | None = None
+
+        def render() -> dict[str, Any]:
+            return {
+                "schema_version": 1,
+                "items": accepted,
+                "tombstones": accepted_tombstones,
+                "next_cursor": next_cursor,
+                "truncated": truncated,
+            }
+
+        for index, row in enumerate(rows):
+            if index >= limit:
+                truncated = True
+                if last_key is not None:
+                    next_cursor = self._encode_diagnostics_cursor(*last_key)
+                break
+            if row["entity_type"] == "tombstone":
+                item = {"entity_type": row["category"], "entity_id": row["entity_id"], "deleted_at": row["sort_at"]}
+            else:
+                item = self._diagnostic_row_item(row)
+            if row["entity_type"] == "tombstone":
+                accepted_tombstones.append(item)
+            else:
+                accepted.append(item)
+            previous_key = last_key
+            last_key = (row["sort_at"], int(row["sort_type"]), row["entity_id"])
+            if len(canonical_json(render())) > byte_limit:
+                if row["entity_type"] == "tombstone":
+                    accepted_tombstones.pop()
+                else:
+                    accepted.pop()
+                if not accepted and not accepted_tombstones:
+                    raise ValidationError("diagnostic export item exceeds byte limit")
+                truncated = True
+                if previous_key is not None:
+                    next_cursor = self._encode_diagnostics_cursor(*previous_key)
+                last_key = previous_key
+                break
+
+        response = render()
+        if len(canonical_json(response)) > byte_limit:
+            raise ValidationError("diagnostic export envelope exceeds byte limit")
+        return response
+
 
     def delete_diagnostics(self, user_id: str, device_id: str, *, now: str | None = None) -> dict[str, int]:
         self._identifier(device_id, "device_id")
@@ -2455,6 +2675,7 @@ class FeatureGroups:
 
     def purge_diagnostics(self, *, now: str | None = None, _recover_cleanup: bool = True) -> dict[str, int]:
         timestamp = self._time(now, self.store)
+        tombstone_cutoff = self._plus_seconds(timestamp, -self.store.diagnostics_tombstone_retention_seconds)
         with self.store._tx() as conn:
             expired_events = conn.execute("SELECT event_id FROM diagnostic_events WHERE deleted_at IS NULL AND retention_deadline <= ?", (timestamp,)).fetchall()
             expired_bundles = conn.execute("SELECT bundle_id, user_id, device_id, storage_path, payload_sha256, compressed_size FROM diagnostic_bundles WHERE deleted_at IS NULL AND retention_deadline <= ?", (timestamp,)).fetchall()
@@ -2476,17 +2697,29 @@ class FeatureGroups:
                     entity_id=row["bundle_id"],
                     now=timestamp,
                 )
+            expired_tombstones = conn.execute(
+                "SELECT tombstone_id FROM diagnostic_tombstones WHERE deleted_at <= ?",
+                (tombstone_cutoff,),
+            ).fetchall()
+            if expired_tombstones:
+                conn.executemany(
+                    "DELETE FROM diagnostic_tombstones WHERE tombstone_id=?",
+                    [(row["tombstone_id"],) for row in expired_tombstones],
+                )
         if _recover_cleanup:
             self.store.recover_cleanup_receipts(now=timestamp)
         if not _recover_cleanup:
-            return {"events": len(expired_events), "bundles": len(expired_bundles)}
+            return {"events": len(expired_events), "bundles": len(expired_bundles), "tombstones": len(expired_tombstones)}
         with self.store._read() as conn:
             pending = conn.execute(
                 "SELECT COUNT(*) FROM storage_cleanup_receipts WHERE operation IN ('diagnostic_delete', 'diagnostic_purge') AND status IN ('PENDING', 'BLOCKED')",
             ).fetchone()[0]
         if pending:
             raise CleanupIncompleteError("diagnostic purge cleanup is incomplete")
-        return {"events": len(expired_events), "bundles": len(expired_bundles)}
+        result = {"events": len(expired_events), "bundles": len(expired_bundles)}
+        if expired_tombstones:
+            result["tombstones"] = len(expired_tombstones)
+        return result
 
 
 class DurableWorker:

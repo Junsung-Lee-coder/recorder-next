@@ -208,7 +208,7 @@ def _upload_and_accept(test: unittest.TestCase, server, manifest: dict[str, obje
     return accepted
 
 
-def _route_hermes_and_ack(test: unittest.TestCase, server, *, user: str, device: str, project_id: str, turn_id: str):
+def _route_hermes_and_ack(test: unittest.TestCase, server, *, user: str, device: str, project_id: str, turn_id: str, expect_error: bool = False):
     service = server.service
     routed = service.route_next(user, owner="fixture-router", expected_turn_id=turn_id)
     test.assertIsNotNone(routed)
@@ -240,6 +240,11 @@ def _route_hermes_and_ack(test: unittest.TestCase, server, *, user: str, device:
     )
     test.assertIsNotNone(final_ready)
     test.assertEqual(final_ready["state"], "FINAL_READY")
+    if expect_error:
+        test.assertEqual(final_ready["final_outcome"], "error")
+        test.assertEqual(final_ready["final_error_kind"], "hermes")
+        test.assertEqual(service.hermes.calls, [])
+        return final_ready
     final_items = _assert_status(test, _request(server, "GET", f"/v1/outbox?user_id={user}&device_id={device}"), 200)["items"]
     final_event = next(item for item in final_items if item["event_kind"] == "FINAL")
     delivered = _assert_status(
@@ -410,11 +415,23 @@ class GeneratedSingleInputHTTPTests(unittest.TestCase):
                     self.assertEqual(part["declared_bytes"], len(payload))
                     self.assertEqual(part["whole_stream_sha256"], hashlib.sha256(payload).hexdigest())
                     self.assertEqual(part["status"], "COMPLETE")
-                    routed = _route_hermes_and_ack(self, server, user=user, device=device, project_id=project["stable_project_id"], turn_id=turn_id)
-                    self.assertEqual(routed["state"], "DELIVERED")
-                    request = gateway.calls[0]["request"]["request"]
-                    self.assertEqual(request["manifest"]["parts"][0]["relationship"], metadata["files"][key].get("relationship"))
-                    self.assertEqual(request["manifest"]["parts"][0]["declared_sha256"], metadata["files"][key]["sha256"])
+                    unsupported = key in {"document_pdf", "data_csv", "generic_binary"}
+                    routed = _route_hermes_and_ack(
+                        self,
+                        server,
+                        user=user,
+                        device=device,
+                        project_id=project["stable_project_id"],
+                        turn_id=turn_id,
+                        expect_error=unsupported,
+                    )
+                    if unsupported:
+                        self.assertEqual(routed["state"], "FINAL_READY")
+                    else:
+                        self.assertEqual(routed["state"], "DELIVERED")
+                        request = gateway.calls[0]["request"]["request"]
+                        self.assertEqual(request["manifest"]["parts"][0]["relationship"], metadata["files"][key].get("relationship"))
+                        self.assertEqual(request["manifest"]["parts"][0]["declared_sha256"], metadata["files"][key]["sha256"])
                     archived = _assert_status(self, _request(server, "POST", f"/v1/turns/{turn_id}/archive?user_id={user}&device_id={device}", {"source": "generated-fixture-test"}), 200)
                     self.assertIsNotNone(archived["archived_at"])
                     self.assertEqual(store.read_part(turn_id, manifest["parts"][0]["part_id"]), payload)

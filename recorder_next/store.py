@@ -87,6 +87,8 @@ class RecorderStore:
         diagnostics_max_compressed_bytes: int = 2 * 1024 * 1024,
         diagnostics_max_expanded_bytes: int = 16 * 1024 * 1024,
         diagnostics_retention_seconds: int = 7 * 86400,
+        diagnostics_tombstone_retention_seconds: int = 30 * 86400,
+        diagnostics_export_max_bytes: int = 2 * 1024 * 1024,
         tts_artifact_ttl_seconds: int = 86400,
     ):
         self.db_path = Path(db_path)
@@ -103,6 +105,20 @@ class RecorderStore:
         self.diagnostics_max_compressed_bytes = diagnostics_max_compressed_bytes
         self.diagnostics_max_expanded_bytes = diagnostics_max_expanded_bytes
         self.diagnostics_retention_seconds = diagnostics_retention_seconds
+        if (
+            not isinstance(diagnostics_tombstone_retention_seconds, int)
+            or isinstance(diagnostics_tombstone_retention_seconds, bool)
+            or not 1 <= diagnostics_tombstone_retention_seconds <= 366 * 86400
+        ):
+            raise ValueError("diagnostics_tombstone_retention_seconds is invalid")
+        if (
+            not isinstance(diagnostics_export_max_bytes, int)
+            or isinstance(diagnostics_export_max_bytes, bool)
+            or not 1024 <= diagnostics_export_max_bytes <= 64 * 1024 * 1024
+        ):
+            raise ValueError("diagnostics_export_max_bytes is invalid")
+        self.diagnostics_tombstone_retention_seconds = diagnostics_tombstone_retention_seconds
+        self.diagnostics_export_max_bytes = diagnostics_export_max_bytes
         self.tts_artifact_ttl_seconds = tts_artifact_ttl_seconds
         self._clock = clock
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -479,7 +495,11 @@ class RecorderStore:
         receipt_ids: list[str] | None = None,
         now: str | None = None,
     ) -> dict[str, int]:
-        return self._features.recover_cleanup_receipts(receipt_ids=receipt_ids, now=now)
+        # Serialize physical cleanup with file-plus-row writes.  A pending
+        # receipt is intentionally visible before a write for crash recovery,
+        # so recovery must not inspect it during that write's critical section.
+        with self._write_lock:
+            return self._features.recover_cleanup_receipts(receipt_ids=receipt_ids, now=now)
 
     def _validate_turn_id(self, value: Any) -> str:
         if not isinstance(value, str) or not UUIDISH.fullmatch(value):
@@ -761,6 +781,31 @@ class RecorderStore:
         self._assert_device(conn, user_id, device_id)
 
     def put_chunk(
+        self,
+        turn_id: str,
+        part_id: str,
+        sequence: int,
+        payload: bytes,
+        *,
+        expected_sha256: str | None = None,
+        user_id: str | None = None,
+        device_id: str | None = None,
+    ) -> dict[str, Any]:
+        # Keep the rollback receipt, managed file, and durable chunk row in
+        # one critical section.  Cleanup recovery must not observe the
+        # receipt after it is prepared but before the row is committed.
+        with self._write_lock:
+            return self._put_chunk(
+                turn_id,
+                part_id,
+                sequence,
+                payload,
+                expected_sha256=expected_sha256,
+                user_id=user_id,
+                device_id=device_id,
+            )
+
+    def _put_chunk(
         self,
         turn_id: str,
         part_id: str,
@@ -1355,6 +1400,10 @@ class RecorderStore:
             parts.append(item)
         text_values = [item["text"] for item in parts if item.get("kind") == "text" and item.get("text") is not None]
         input_text = turn["transcript"] or "\n".join(text_values)
+        if not input_text and any(item.get("kind") in {"attachment", "image", "document", "file", "binary"} for item in parts):
+            # A standalone attachment still needs a user message for the
+            # downstream multimodal schema and for the ROUTED_TTS source.
+            input_text = "첨부된 파일을 확인해 주세요."
         return {
             "turn_id": turn_id,
             "user_id": turn["user_id"],
@@ -1402,7 +1451,13 @@ class RecorderStore:
             if updated != 1:
                 return None
             result = _row(conn.execute("SELECT * FROM router_queue WHERE turn_id=?", (row["turn_id"],)).fetchone()) or {}
-            result["turn"] = self._turn_payload(conn, row["turn_id"])
+            # Routing needs the canonical text/part projection, not merely
+            # the ledger read model.  Text bytes live in the chunk spool, so
+            # _turn_payload cannot reconstruct the input by itself.
+            turn = self._turn_payload(conn, row["turn_id"])
+            routed = self._payload_for_turn_tx(conn, row["turn_id"])
+            turn.update({"input": routed["input"], "parts": routed["parts"], "manifest": routed["manifest"]})
+            result["turn"] = turn
             return result
 
     def renew_router_lease(self, turn_id: str, owner: str, *, lease_seconds: int = 30, now: str | None = None) -> bool:
@@ -1493,10 +1548,16 @@ class RecorderStore:
             )
             submission_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"recorder-next:submission:{turn_id}"))
             marker = f"recorder-next:{submission_id}"
+            hermes_request = dict(payload)
+            # The router's corrected text is the only natural-language input
+            # eligible for the worker.  Keep the immutable part projection for
+            # byte-backed multimodal resolution, but do not forward the raw
+            # transcript when the router has normalized it.
+            hermes_request["input"] = decision.routed_text
             ingress_payload = {
                 "submission_id": submission_id,
                 "marker": marker,
-                "request": payload,
+                "request": hermes_request,
                 "route": route_payload,
             }
             ingress_hash = sha256_json(ingress_payload)
@@ -1843,6 +1904,7 @@ class RecorderStore:
         lease_token: str | None = None,
         now: str | None = None,
         worker_claim: Mapping[str, Any] | None = None,
+        message: str | None = None,
     ) -> dict[str, Any]:
         timestamp = now or self._now()
         with self._tx() as conn:
@@ -1863,7 +1925,7 @@ class RecorderStore:
                 conn,
                 turn_id=turn["turn_id"],
                 error_kind="hermes",
-                message=FINAL_ERROR_MESSAGES["hermes"],
+                message=message or FINAL_ERROR_MESSAGES["hermes"],
                 grace_seconds=grace_seconds,
                 source_ref=f"recorder_protocol:hermes:{submission_id}",
             )
@@ -3508,8 +3570,8 @@ class RecorderStore:
     def list_diagnostics(self, user_id: str, device_id: str, **kwargs: Any) -> dict[str, Any]:
         return self._features.list_diagnostics(user_id, device_id, **kwargs)
 
-    def export_diagnostics(self, user_id: str, device_id: str) -> dict[str, Any]:
-        return self._features.export_diagnostics(user_id, device_id)
+    def export_diagnostics(self, user_id: str, device_id: str, **kwargs: Any) -> dict[str, Any]:
+        return self._features.export_diagnostics(user_id, device_id, **kwargs)
 
     def delete_diagnostics(self, user_id: str, device_id: str, **kwargs: Any) -> dict[str, int]:
         return self._features.delete_diagnostics(user_id, device_id, **kwargs)
