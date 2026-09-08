@@ -191,7 +191,7 @@ def _upload_and_accept(test: unittest.TestCase, server, manifest: dict[str, obje
     return accepted
 
 
-def _route_hermes_and_ack(test: unittest.TestCase, server, *, user: str, device: str, project_id: str, turn_id: str):
+def _route_hermes_and_ack(test: unittest.TestCase, server, *, user: str, device: str, project_id: str, turn_id: str, expect_error: bool = False):
     routed = _assert_status(test, _request(server, "POST", "/v1/internal/router", {"user_id": user, "owner": "fixture-router"}), 200)
     test.assertEqual(routed["state"], "HERMES_PENDING")
     route_items = _assert_status(test, _request(server, "GET", f"/v1/outbox?user_id={user}&device_id={device}"), 200)["items"]
@@ -217,6 +217,8 @@ def _route_hermes_and_ack(test: unittest.TestCase, server, *, user: str, device:
         200,
     )
     test.assertEqual(final_ready["state"], "FINAL_READY")
+    if expect_error:
+        return final_ready
     final_items = _assert_status(test, _request(server, "GET", f"/v1/outbox?user_id={user}&device_id={device}"), 200)["items"]
     final_event = next(item for item in final_items if item["event_kind"] == "FINAL")
     delivered = _assert_status(
@@ -387,11 +389,29 @@ class GeneratedSingleInputHTTPTests(unittest.TestCase):
                     self.assertEqual(part["declared_bytes"], len(payload))
                     self.assertEqual(part["whole_stream_sha256"], hashlib.sha256(payload).hexdigest())
                     self.assertEqual(part["status"], "COMPLETE")
-                    routed = _route_hermes_and_ack(self, server, user=user, device=device, project_id=project["stable_project_id"], turn_id=turn_id)
-                    self.assertEqual(routed["state"], "DELIVERED")
-                    request = gateway.calls[0]["request"]["request"]
-                    self.assertEqual(request["manifest"]["parts"][0]["relationship"], metadata["files"][key].get("relationship"))
-                    self.assertEqual(request["manifest"]["parts"][0]["declared_sha256"], metadata["files"][key]["sha256"])
+                    attachment_input = manifest["parts"][0]["kind"] in {"attachment", "image", "document", "file", "binary"}
+                    image_input = attachment_input and manifest["parts"][0]["mime"].split(";", 1)[0].lower().startswith("image/")
+                    routed = _route_hermes_and_ack(
+                        self,
+                        server,
+                        user=user,
+                        device=device,
+                        project_id=project["stable_project_id"],
+                        turn_id=turn_id,
+                        expect_error=attachment_input and not image_input,
+                    )
+                    if not attachment_input or image_input:
+                        self.assertEqual(routed["state"], "DELIVERED")
+                        request = gateway.calls[0]["request"]["request"]
+                        self.assertEqual(request["manifest"]["parts"][0]["relationship"], metadata["files"][key].get("relationship"))
+                        self.assertEqual(request["manifest"]["parts"][0]["declared_sha256"], metadata["files"][key]["sha256"])
+                    else:
+                        self.assertEqual(routed["state"], "FINAL_READY")
+                        self.assertEqual(gateway.calls, [])
+                        outbox = _assert_status(self, _request(server, "GET", f"/v1/outbox?user_id={user}&device_id={device}"), 200)["items"]
+                        final_event = next(item for item in outbox if item["event_kind"] == "FINAL")
+                        self.assertEqual(final_event["payload"]["outcome"], "error")
+                        self.assertEqual(final_event["payload"]["error_kind"], "hermes")
                     archived = _assert_status(self, _request(server, "POST", f"/v1/turns/{turn_id}/archive?user_id={user}&device_id={device}", {"source": "generated-fixture-test"}), 200)
                     self.assertIsNotNone(archived["archived_at"])
                     self.assertEqual(store.read_part(turn_id, manifest["parts"][0]["part_id"]), payload)

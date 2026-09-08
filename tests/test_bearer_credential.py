@@ -32,7 +32,7 @@ class BearerCredentialTests(unittest.TestCase):
                         "headers": dict(extra_headers or {}),
                     }
                 )
-                return {"assistant_message_id": "message-1", "content": "ok"}
+                return {"run_id": "run-1", "status": "completed", "assistant_message_id": "message-1", "content": "ok"}
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

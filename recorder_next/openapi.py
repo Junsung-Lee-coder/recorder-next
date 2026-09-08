@@ -69,6 +69,11 @@ OPENAPI = {
         "/v1/eavesdrop": {"post": {"summary": "Start a phone-mediated eavesdrop session", "responses": {"201": {"description": "Created session"}}}},
         "/v1/eavesdrop/{session_id}": {"get": {"responses": {"200": {"description": "Session state"}}}},
         "/v1/eavesdrop/{session_id}/{action}": {"post": {"parameters": [{"name": "action", "in": "path", "required": True, "schema": {"type": "string", "enum": ["activate", "pause", "resume", "stop", "segments"]}}], "responses": {"200": {"description": "State transition or segment receipt"}}}},
+        "/v1/eavesdrop/{session_id}/activate": {"post": {"responses": {"200": {"description": "Activated eavesdrop session"}}}},
+        "/v1/eavesdrop/{session_id}/pause": {"post": {"responses": {"200": {"description": "Paused eavesdrop session"}}}},
+        "/v1/eavesdrop/{session_id}/resume": {"post": {"responses": {"200": {"description": "Resumed eavesdrop session"}}}},
+        "/v1/eavesdrop/{session_id}/stop": {"post": {"responses": {"200": {"description": "Stopped eavesdrop session"}}}},
+        "/v1/eavesdrop/{session_id}/segments": {"post": {"responses": {"201": {"description": "Eavesdrop segment receipt"}}}},
         "/v1/eavesdrop/{session_id}/replies": {"get": {"responses": {"200": {"description": "Optional response receipts"}}}},
         "/v1/diagnostics/opt-in": {"post": {"responses": {"201": {"description": "Consent event"}}}},
         "/v1/diagnostics/events": {"post": {"responses": {"201": {"description": "Redacted diagnostic event"}}}},
@@ -206,6 +211,164 @@ def _add_path_parameters(document: dict) -> None:
 
 def _add_owner_contract(document: dict) -> None:
     schemas = document.setdefault("components", {}).setdefault("schemas", {})
+    parameters = document["components"].setdefault("parameters", {})
+    parameters.setdefault(
+        "PrincipalUserHeader",
+        {
+            "name": "X-Recorder-User-ID",
+            "in": "header",
+            "required": True,
+            "description": "Authenticated Recorder owner identity.",
+            "schema": {"type": "string", "minLength": 1},
+        },
+    )
+    parameters.setdefault(
+        "PrincipalDeviceHeader",
+        {
+            "name": "X-Recorder-Device-ID",
+            "in": "header",
+            "required": True,
+            "description": "Authenticated registered Recorder device identity.",
+            "schema": {"type": "string", "minLength": 1},
+        },
+    )
+    schemas["TurnPart"] = {
+        "type": "object",
+        "required": ["part_id", "kind", "mime"],
+        "additionalProperties": False,
+        "properties": {
+            "part_id": {"type": "string", "minLength": 1},
+            "kind": {"type": "string", "minLength": 1},
+            "mime": {"type": "string", "minLength": 1},
+            "declared_bytes": {"type": ["integer", "null"], "minimum": 0},
+            "declared_sha256": {"type": ["string", "null"], "pattern": "^[0-9a-fA-F]{64}$"},
+            "relationship": {"type": ["string", "null"]},
+            "caption_hash": {"type": ["string", "null"], "pattern": "^[0-9a-fA-F]{64}$"},
+            "duration_ms": {"type": ["integer", "null"], "minimum": 0},
+            "streaming": {"type": "boolean", "default": False},
+        },
+    }
+    turn_create = schemas.setdefault("TurnCreate", {"type": "object", "properties": {}})
+    turn_create["required"] = ["schema_version", "user_id", "turn_id", "origin_device_id", "client_created_at", "parts"]
+    turn_create["additionalProperties"] = False
+    turn_create["properties"].update(
+        {
+            "schema_version": {"type": "integer", "minimum": 1},
+            "client_created_at": {"type": "string", "minLength": 1},
+            "current_project_number": {"type": ["string", "null"]},
+            "prefer_current_project": {"type": "boolean", "default": False},
+        }
+    )
+    turn_create["properties"]["parts"] = {"type": "array", "minItems": 1, "items": {"$ref": "#/components/schemas/TurnPart"}}
+    schemas["DeviceRegister"] = {
+        "type": "object",
+        "required": ["user_id", "device_id", "kind"],
+        "additionalProperties": False,
+        "properties": {
+            "user_id": {"type": "string", "minLength": 1},
+            "device_id": {"type": "string", "minLength": 1},
+            "kind": {"type": "string", "enum": ["phone", "watch", "other"]},
+        },
+    }
+    schemas["ChunkUpload"] = {"type": "string", "format": "binary", "description": "Raw chunk bytes; X-Chunk-SHA256 may bind the expected digest."}
+    schemas["ProjectCreate"] = {
+        "type": "object",
+        "required": ["user_id", "device_id", "project_number", "name"],
+        "additionalProperties": False,
+        "properties": {
+            "user_id": {"type": "string", "minLength": 1},
+            "device_id": {"type": "string", "minLength": 1},
+            "project_number": {"type": "string", "minLength": 1},
+            "name": {"type": "string", "minLength": 1},
+            "aliases": {"type": "array", "items": {"type": "string"}},
+            "description": {"type": "string"},
+            "idempotency_key": {"type": "string", "minLength": 1},
+        },
+    }
+    schemas["ProjectPatch"] = {
+        "type": "object",
+        "required": ["expected_version"],
+        "additionalProperties": False,
+        "properties": {
+            "expected_version": {"type": "integer", "minimum": 1},
+            "name": {"type": "string", "minLength": 1},
+            "aliases": {"type": "array", "items": {"type": "string"}},
+            "description": {"type": "string"},
+        },
+    }
+    schemas["ExpectedVersion"] = {"type": "object", "required": ["expected_version"], "properties": {"expected_version": {"type": "integer", "minimum": 1}}}
+    schemas["ArchiveTurn"] = {"type": "object", "properties": {"source": {"type": "string", "minLength": 1}}}
+    schemas["EavesdropStart"] = {
+        "type": "object",
+        "required": ["user_id", "phone_device_id"],
+        "properties": {
+            "user_id": {"type": "string", "minLength": 1},
+            "phone_device_id": {"type": "string", "minLength": 1},
+            "session_id": {"type": ["string", "null"]},
+            "idempotency_key": {"type": ["string", "null"]},
+            "watch_device_id": {"type": ["string", "null"]},
+            "project_id": {"type": ["string", "null"]},
+            "response_enabled": {"type": "boolean", "default": True},
+            "tts_enabled": {"type": "boolean", "default": False},
+            "hermes_enabled": {"type": "boolean", "default": False},
+            "mode": {"type": ["string", "null"], "enum": ["forward_default", "store_silent", "FORWARD_DEFAULT", "STORE_SILENT", None]},
+            "expires_seconds": {"type": "integer", "minimum": 1, "maximum": 86400, "default": 300},
+            "now": {"type": ["string", "null"]},
+        },
+    }
+    schemas["EavesdropAction"] = {"type": "object", "required": ["user_id", "phone_device_id"], "properties": {"user_id": {"type": "string", "minLength": 1}, "phone_device_id": {"type": "string", "minLength": 1}, "now": {"type": ["string", "null"]}}}
+    schemas["EavesdropSegment"] = {
+        "type": "object",
+        "required": ["user_id", "phone_device_id", "sequence", "client_segment_id", "audio_base64"],
+        "properties": {
+            "user_id": {"type": "string", "minLength": 1},
+            "phone_device_id": {"type": "string", "minLength": 1},
+            "sequence": {"type": "integer", "minimum": 0},
+            "client_segment_id": {"type": "string", "minLength": 1},
+            "audio_base64": {"type": "string", "minLength": 1},
+            "transcript": {"type": ["string", "null"]},
+            "reply_text": {"type": ["string", "null"]},
+            "now": {"type": ["string", "null"]},
+        },
+    }
+    schemas["DiagnosticsOptIn"] = {
+        "type": "object",
+        "required": ["user_id", "device_id"],
+        "properties": {
+            "user_id": {"type": "string", "minLength": 1},
+            "device_id": {"type": "string", "minLength": 1},
+            "event_id": {"type": ["string", "null"]},
+            "enabled": {"type": "boolean", "default": True},
+            "expires_at": {"type": ["string", "null"]},
+            "now": {"type": ["string", "null"]},
+        },
+    }
+    schemas["DiagnosticsEvent"] = {
+        "type": "object",
+        "required": ["user_id", "device_id", "event_id", "idempotency_key", "payload"],
+        "properties": {
+            "user_id": {"type": "string", "minLength": 1},
+            "device_id": {"type": "string", "minLength": 1},
+            "event_id": {"type": "string", "minLength": 1},
+            "idempotency_key": {"type": "string", "minLength": 1},
+            "payload": {"type": "object"},
+            "occurred_at": {"type": ["string", "null"]},
+            "now": {"type": ["string", "null"]},
+        },
+    }
+    schemas["DiagnosticsBundle"] = {
+        "type": "object",
+        "required": ["user_id", "device_id", "bundle_id", "opt_in_event_id", "compressed_base64"],
+        "properties": {
+            "user_id": {"type": "string", "minLength": 1},
+            "device_id": {"type": "string", "minLength": 1},
+            "bundle_id": {"type": "string", "minLength": 1},
+            "opt_in_event_id": {"type": "string", "minLength": 1},
+            "compressed_base64": {"type": "string", "minLength": 1},
+            "expanded_size": {"type": ["integer", "null"], "minimum": 0},
+            "now": {"type": ["string", "null"]},
+        },
+    }
     schemas.setdefault(
         "OwnerProof",
         {
@@ -314,7 +477,7 @@ def _add_owner_contract(document: dict) -> None:
                 (_resolve_parameter(document, parameter).get("name"), _resolve_parameter(document, parameter).get("in"))
                 for parameter in parameters
             }
-            for component in ("UserId", "DeviceId"):
+            for component in ("UserId", "DeviceId", "PrincipalUserHeader", "PrincipalDeviceHeader"):
                 parameter = document["components"]["parameters"][component]
                 key = (parameter["name"], parameter["in"])
                 if key not in names:
@@ -322,13 +485,28 @@ def _add_owner_contract(document: dict) -> None:
                     names.add(key)
 
     body_refs = {
+        "/v1/devices": {"post": "DeviceRegister"},
         "/v1/devices/{device_id}/revoke": {"post": "DeviceRevoke"},
         "/v1/turns": {"post": "TurnCreate"},
         "/v1/turns/{turn_id}/accept": {"post": "OwnerProof"},
+        "/v1/turns/{turn_id}/parts/{part_id}/chunks/{sequence}": {"put": "ChunkUpload", "post": "ChunkUpload"},
         "/v1/turns/{turn_id}/parts/{part_id}/finish": {"post": "FinishPart"},
         "/v1/turns/{turn_id}/events/{event_id}/ack": {"post": "EventAck"},
         "/v1/tts/{artifact_id}/relay-received": {"post": "RelayReceived"},
         "/v1/tts/{artifact_id}/playback-ack": {"post": "PlaybackAck"},
+        "/v1/projects": {"post": "ProjectCreate"},
+        "/v1/projects/{project_id}": {"patch": "ProjectPatch"},
+        "/v1/projects/{project_id}/archive": {"post": "ExpectedVersion"},
+        "/v1/turns/{turn_id}/archive": {"post": "ArchiveTurn"},
+        "/v1/eavesdrop": {"post": "EavesdropStart"},
+        "/v1/eavesdrop/{session_id}/activate": {"post": "EavesdropAction"},
+        "/v1/eavesdrop/{session_id}/pause": {"post": "EavesdropAction"},
+        "/v1/eavesdrop/{session_id}/resume": {"post": "EavesdropAction"},
+        "/v1/eavesdrop/{session_id}/stop": {"post": "EavesdropAction"},
+        "/v1/eavesdrop/{session_id}/segments": {"post": "EavesdropSegment"},
+        "/v1/diagnostics/opt-in": {"post": "DiagnosticsOptIn"},
+        "/v1/diagnostics/events": {"post": "DiagnosticsEvent"},
+        "/v1/diagnostics/bundles": {"post": "DiagnosticsBundle"},
         "/v1/diagnostics": {"delete": "OwnerProof"},
         "/v1/diagnostics/delete": {"post": "OwnerProof"},
     }
@@ -339,7 +517,11 @@ def _add_owner_contract(document: dict) -> None:
         for method, schema in methods.items():
             operation = item.get(method)
             if isinstance(operation, dict):
-                operation["requestBody"] = {"required": True, "content": {"application/json": {"schema": {"$ref": f"#/components/schemas/{schema}"}}}}
+                media_type = "application/octet-stream" if schema == "ChunkUpload" else "application/json"
+                operation["requestBody"] = {
+                    "required": True,
+                    "content": {media_type: {"schema": {"$ref": f"#/components/schemas/{schema}"}}},
+                }
 
 
 def validate_openapi_contract(document: dict | None = None) -> bool:

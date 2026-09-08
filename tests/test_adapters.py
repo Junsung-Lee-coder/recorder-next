@@ -8,30 +8,17 @@ from recorder_next.adapters import HttpHermesGateway
 
 
 class HermesAdapterContractTests(unittest.TestCase):
-    def test_http_submit_provisions_missing_session_and_parses_current_envelope(self):
+    def test_http_submit_uses_durable_runs_and_parses_current_envelope(self):
         class ProbeGateway(HttpHermesGateway):
             def __init__(self):
-                super().__init__("http://127.0.0.1:9")
+                super().__init__("http://127.0.0.1:9", poll_interval_seconds=0)
                 self.calls = []
 
             def _request(self, method, path, payload=None, *, extra_headers=None):
                 self.calls.append((method, path, payload, dict(extra_headers or {})))
-                chat_calls = [call for call in self.calls if call[1].endswith("/chat")]
-                if path.endswith("/chat") and len(chat_calls) == 1:
-                    raise urllib.error.HTTPError(
-                        path,
-                        404,
-                        "session not found",
-                        {},
-                        io.BytesIO(b'{"error":{"code":"session_not_found"}}'),
-                    )
-                if method == "POST" and path == "/api/sessions":
-                    return {"object": "hermes.session", "session": {"id": payload["id"]}}
-                return {
-                    "object": "hermes.session.chat.completion",
-                    "session_id": "project:abc:default",
-                    "message": {"role": "assistant", "content": "ok-current-envelope"},
-                }
+                if method == "POST" and path == "/v1/runs":
+                    return {"run_id": "run-current", "status": "queued"}
+                return {"run_id": "run-current", "status": "completed", "output": "ok-current-envelope"}
 
         gateway = ProbeGateway()
         result = gateway.submit(
@@ -43,13 +30,11 @@ class HermesAdapterContractTests(unittest.TestCase):
 
         self.assertEqual(result.content, "ok-current-envelope")
         self.assertEqual([call[0:2] for call in gateway.calls], [
-            ("POST", "/api/sessions/project%3Aabc%3Adefault/chat"),
-            ("POST", "/api/sessions"),
-            ("POST", "/api/sessions/project%3Aabc%3Adefault/chat"),
+            ("POST", "/v1/runs"),
+            ("GET", "/v1/runs/run-current"),
         ])
-        self.assertEqual(gateway.calls[1][2]["id"], "project:abc:default")
-        self.assertNotIn("title", gateway.calls[1][2])
-        self.assertEqual(gateway.calls[2][3]["Idempotency-Key"], "sub-current")
+        self.assertEqual(gateway.calls[0][2], {"input": "normalized", "session_id": "project:abc:default"})
+        self.assertEqual(gateway.calls[0][3]["Idempotency-Key"], "sub-current")
 
     def test_http_history_parses_current_data_envelope(self):
         class ProbeGateway(HttpHermesGateway):
@@ -74,30 +59,36 @@ class HermesAdapterContractTests(unittest.TestCase):
     def test_http_submit_projects_only_input_marker_and_submission_identity(self):
         class ProbeGateway(HttpHermesGateway):
             def __init__(self):
-                super().__init__("http://127.0.0.1:9")
-                self.seen = None
+                super().__init__("http://127.0.0.1:9", poll_interval_seconds=0)
+                self.seen = []
 
             def _request(self, method, path, payload=None, *, extra_headers=None):
-                self.seen = {"method": method, "path": path, "payload": payload, "headers": dict(extra_headers or {})}
-                return {"assistant_message_id": "m-1", "content": "ok"}
+                self.seen.append({"method": method, "path": path, "payload": payload, "headers": dict(extra_headers or {})})
+                if method == "POST":
+                    return {"run_id": "run-1", "status": "queued"}
+                return {"run_id": "run-1", "status": "completed", "output": "ok", "assistant_message_id": "m-1"}
 
         gateway = ProbeGateway()
         result = gateway.submit(session_key="project:abc:default", request={"input": "normalized", "parts": [{"text": "secret metadata"}], "manifest": {"device": "watch"}}, submission_id="sub-1", marker="marker-1")
         self.assertEqual(result.content, "ok")
-        self.assertEqual(gateway.seen["payload"], {"input": "normalized", "marker": "marker-1", "hermes_submission_id": "sub-1"})
-        self.assertNotIn("parts", gateway.seen["payload"])
-        self.assertNotIn("manifest", gateway.seen["payload"])
-        self.assertEqual(gateway.seen["headers"]["X-Hermes-Session-Key"], "project:abc:default")
+        self.assertEqual(gateway.seen[0]["payload"], {"input": "normalized", "session_id": "project:abc:default"})
+        self.assertNotIn("parts", gateway.seen[0]["payload"])
+        self.assertNotIn("manifest", gateway.seen[0]["payload"])
+        self.assertNotIn("marker-1", json.dumps(gateway.seen[0]["payload"]))
+        self.assertEqual(gateway.seen[0]["headers"]["X-Hermes-Session-Key"], "project:abc:default")
+        self.assertEqual(gateway.seen[0]["headers"]["Idempotency-Key"], "sub-1")
 
     def test_http_submit_projects_inner_request_from_durable_ingress_envelope(self):
         class ProbeGateway(HttpHermesGateway):
             def __init__(self):
-                super().__init__("http://127.0.0.1:9")
-                self.seen = None
+                super().__init__("http://127.0.0.1:9", poll_interval_seconds=0)
+                self.seen = []
 
             def _request(self, method, path, payload=None, *, extra_headers=None):
-                self.seen = {"method": method, "path": path, "payload": payload, "headers": dict(extra_headers or {})}
-                return {"assistant_message_id": "m-2", "content": "ok"}
+                self.seen.append({"method": method, "path": path, "payload": payload, "headers": dict(extra_headers or {})})
+                if method == "POST":
+                    return {"run_id": "run-2", "status": "queued"}
+                return {"run_id": "run-2", "status": "completed", "output": "ok", "assistant_message_id": "m-2"}
 
         gateway = ProbeGateway()
         gateway.submit(
@@ -112,9 +103,10 @@ class HermesAdapterContractTests(unittest.TestCase):
             marker="marker-2",
         )
         self.assertEqual(
-            gateway.seen["payload"],
-            {"input": "normalized from durable ingress", "marker": "marker-2", "hermes_submission_id": "sub-2"},
+            gateway.seen[0]["payload"],
+            {"input": "normalized from durable ingress", "session_id": "project:abc:default"},
         )
+        self.assertEqual(gateway.seen[0]["headers"]["Idempotency-Key"], "sub-2")
 
     def test_http_submit_projects_each_attachment_type_as_safe_reference(self):
         class ProbeGateway(HttpHermesGateway):
@@ -122,17 +114,20 @@ class HermesAdapterContractTests(unittest.TestCase):
                 attachment_sha256 = hashlib.sha256(b"x" * 42).hexdigest()
                 super().__init__(
                     "http://127.0.0.1:9",
+                    poll_interval_seconds=0,
                     attachment_resolver=lambda _reference: {
                         "body": b"x" * 42,
                         "sha256": attachment_sha256,
                         "mime": mime,
                     },
                 )
-                self.seen = None
+                self.seen = []
 
             def _request(self, method, path, payload=None, *, extra_headers=None):
-                self.seen = {"method": method, "path": path, "payload": payload, "headers": dict(extra_headers or {})}
-                return {"assistant_message_id": "m-attachments", "content": "ok"}
+                self.seen.append({"method": method, "path": path, "payload": payload, "headers": dict(extra_headers or {})})
+                if method == "POST":
+                    return {"run_id": "run-attachments", "status": "queued"}
+                return {"run_id": "run-attachments", "status": "completed", "output": "ok"}
 
         cases = {
             "image_png": ("image/png", "image-1"),
@@ -145,42 +140,47 @@ class HermesAdapterContractTests(unittest.TestCase):
         for name, (mime, part_id) in cases.items():
             with self.subTest(attachment=name):
                 gateway = ProbeGateway(mime)
-                gateway.submit(
-                    session_key="project:attachments:default",
-                    request={
-                        "turn_id": "018f5a2e-7b6e-7abc-8d11-1234567890aa",
-                        "origin_device_id": "private-device-must-not-leak",
-                        "input": "",
-                        "parts": [
-                            {
-                                "part_id": part_id,
-                                "kind": "attachment",
-                                "mime": mime,
-                                "declared_bytes": 42,
-                                "total_bytes": 42,
-                                "whole_stream_sha256": attachment_sha256,
-                                "status": "COMPLETE",
-                                "source_path": "/private/spool/never-send",
-                            }
-                        ],
-                    },
-                    submission_id=f"sub-{name}",
-                    marker=f"marker-{name}",
-                )
-                payload = gateway.seen["payload"]
-                self.assertTrue(payload["input"])
-                self.assertEqual(payload["attachment_schema"], "recorder-next/attachment-reference/v1")
-                self.assertEqual(len(payload["attachments"]), 1)
-                reference = payload["attachments"][0]
-                self.assertEqual(reference["part_id"], part_id)
-                self.assertEqual(reference["mime"], mime)
-                self.assertEqual(reference["byte_length"], 42)
-                self.assertEqual(reference["sha256"], attachment_sha256)
-                self.assertTrue(reference["reference"].startswith("recorder://"))
-                serialized = json.dumps(payload, ensure_ascii=False)
-                self.assertNotIn("source_path", serialized)
-                self.assertNotIn("private-device-must-not-leak", serialized)
-                self.assertNotIn("parts", payload)
+                request = {
+                    "turn_id": "018f5a2e-7b6e-7abc-8d11-1234567890aa",
+                    "origin_device_id": "private-device-must-not-leak",
+                    "input": "",
+                    "parts": [
+                        {
+                            "part_id": part_id,
+                            "kind": "attachment",
+                            "mime": mime,
+                            "declared_bytes": 42,
+                            "total_bytes": 42,
+                            "whole_stream_sha256": attachment_sha256,
+                            "status": "COMPLETE",
+                            "source_path": "/private/spool/never-send",
+                        }
+                    ],
+                }
+                if name == "image_png":
+                    result = gateway.submit(
+                        session_key="project:attachments:default",
+                        request=request,
+                        submission_id=f"sub-{name}",
+                        marker=f"marker-{name}",
+                    )
+                    self.assertEqual(result.content, "ok")
+                    payload = gateway.seen[0]["payload"]
+                    self.assertEqual(payload["session_id"], "project:attachments:default")
+                    self.assertEqual(payload["input"][0]["role"], "user")
+                    self.assertEqual(payload["input"][0]["content"][0]["type"], "input_image")
+                    self.assertTrue(payload["input"][0]["content"][0]["image_url"].startswith("data:image/png;base64,"))
+                    self.assertNotIn("source_path", json.dumps(payload, ensure_ascii=False))
+                    self.assertNotIn("private-device-must-not-leak", json.dumps(payload, ensure_ascii=False))
+                else:
+                    with self.assertRaisesRegex(ValueError, "document input"):
+                        gateway.submit(
+                            session_key="project:attachments:default",
+                            request=request,
+                            submission_id=f"sub-{name}",
+                            marker=f"marker-{name}",
+                        )
+                    self.assertEqual(gateway.seen, [])
 
     def test_http_submit_rejects_empty_attachment_only_projection_before_upstream_call(self):
         class ProbeGateway(HttpHermesGateway):
@@ -195,7 +195,7 @@ class HermesAdapterContractTests(unittest.TestCase):
         for projected in ({"input": ""}, {"input": "", "parts": []}):
             with self.subTest(projected=projected):
                 gateway = ProbeGateway()
-                with self.assertRaisesRegex(ValueError, "attachment-only projection"):
+                with self.assertRaisesRegex(ValueError, "projection has no input"):
                     gateway.submit(
                         session_key="project:empty/default",
                         request=projected,
@@ -207,10 +207,12 @@ class HermesAdapterContractTests(unittest.TestCase):
     def test_http_submit_projects_authoritative_assistant_message_id(self):
         class ProbeGateway(HttpHermesGateway):
             def __init__(self):
-                super().__init__("http://127.0.0.1:9")
+                super().__init__("http://127.0.0.1:9", poll_interval_seconds=0)
 
             def _request(self, method, path, payload=None, *, extra_headers=None):
-                return {"assistant_message_id": "authoritative-id", "content": "ok"}
+                if method == "POST":
+                    return {"run_id": "run-authoritative", "status": "queued"}
+                return {"run_id": "run-authoritative", "status": "completed", "output": "ok", "assistant_message_id": "authoritative-id"}
 
         result = ProbeGateway().submit(
             session_key="project:id/default",

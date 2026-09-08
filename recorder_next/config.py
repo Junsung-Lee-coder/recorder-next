@@ -304,6 +304,7 @@ class RecorderConfig:
     asr_provider_timeout_seconds: int = 10
     tts_retry_seconds: int = 10
     hermes_base_url: str | None = None
+    hermes_audio_base_url: str | None = None
     hermes_api_key_file: str | None = None
     hermes_profile: str = "default"
     asr_source: str = "hermes"
@@ -334,6 +335,8 @@ class RecorderConfig:
     diagnostics_max_compressed_bytes: int = 2 * 1024 * 1024
     diagnostics_max_expanded_bytes: int = 16 * 1024 * 1024
     diagnostics_retention_seconds: int = 7 * 86400
+    diagnostics_tombstone_retention_seconds: int = 7 * 86400
+    diagnostics_export_max_bytes: int = 2 * 1024 * 1024
     asr_providers: tuple[ProviderConfig, ...] = ()
     tts_providers: tuple[ProviderConfig, ...] = ()
     asr_chain: tuple[str, ...] = ()
@@ -386,11 +389,11 @@ class RecorderConfig:
             object.__setattr__(self, chain_field, ("primary",))
 
         asr_primary_source = self.asr_mode or (self.asr_source if str(self.asr_source).lower() != "hermes" or self.realtime_asr_provider.strip().lower() == "hermes" else self.realtime_asr_provider)
-        asr_primary_endpoint = self.hermes_base_url if str(asr_primary_source).lower() == "hermes" else self.realtime_asr_endpoint
+        asr_primary_endpoint = self.hermes_audio_base_url if str(asr_primary_source).lower() == "hermes" else self.realtime_asr_endpoint
         asr_primary_credential = self.hermes_api_key_file if str(asr_primary_source).lower() == "hermes" else self.realtime_asr_credential_file
         materialize_primary("asr", str(asr_primary_source), asr_primary_endpoint, self.realtime_asr_model, None, asr_primary_credential)
         tts_primary_source = self.tts_mode or (self.tts_source if str(self.tts_source).lower() != "hermes" or self.tts_provider.strip().lower() == "hermes" else self.tts_provider)
-        tts_primary_endpoint = self.hermes_base_url if str(tts_primary_source).lower() == "hermes" else self.tts_endpoint
+        tts_primary_endpoint = self.hermes_audio_base_url if str(tts_primary_source).lower() == "hermes" else self.tts_endpoint
         tts_primary_credential = self.hermes_api_key_file if str(tts_primary_source).lower() == "hermes" else self.tts_credential_file
         materialize_primary("tts", str(tts_primary_source), tts_primary_endpoint, self.tts_model, self.tts_voice, tts_primary_credential)
 
@@ -443,7 +446,7 @@ class RecorderConfig:
             # The inherited Hermes profile is the only implicit primary.  A
             # Recorder-owned target is never discovered merely because its
             # declaration is present; it must appear in an explicit chain.
-            hermes_base_url = providers.get("hermes_base_url")
+            hermes_base_url = providers.get("hermes_audio_base_url")
             hermes_credential = providers.get("hermes_api_key_file")
             if hermes_base_url and hermes_credential:
                 declarations.append(
@@ -596,6 +599,7 @@ class RecorderConfig:
             asr_provider_timeout_seconds=int(retries.get("asr_provider_timeout_seconds", cls.asr_provider_timeout_seconds)),
             tts_retry_seconds=int(retries.get("tts_retry_seconds", cls.tts_retry_seconds)),
             hermes_base_url=providers.get("hermes_base_url"),
+            hermes_audio_base_url=providers.get("hermes_audio_base_url"),
             hermes_api_key_file=providers.get(
                 "hermes_api_key_file", os.environ.get("RECORDER_NEXT_HERMES_API_KEY_FILE")
             ),
@@ -628,6 +632,8 @@ class RecorderConfig:
             diagnostics_max_compressed_bytes=int(limits.get("diagnostics_max_compressed_bytes", cls.diagnostics_max_compressed_bytes)),
             diagnostics_max_expanded_bytes=int(limits.get("diagnostics_max_expanded_bytes", cls.diagnostics_max_expanded_bytes)),
             diagnostics_retention_seconds=int(limits.get("diagnostics_retention_seconds", cls.diagnostics_retention_seconds)),
+            diagnostics_tombstone_retention_seconds=int(limits.get("diagnostics_tombstone_retention_seconds", cls.diagnostics_tombstone_retention_seconds)),
+            diagnostics_export_max_bytes=int(limits.get("diagnostics_export_max_bytes", cls.diagnostics_export_max_bytes)),
             asr_providers=asr_registry,
             tts_providers=tts_registry,
             asr_chain=asr_chain,
@@ -652,12 +658,14 @@ class RecorderConfig:
                 raise ValueError(f"{field_name} is invalid")
         if not isinstance(self.hermes_profile, str) or not re.fullmatch(r"^[A-Za-z0-9_.-]{1,64}$", self.hermes_profile):
             raise ValueError("Hermes profile is invalid")
-        if self.hermes_base_url is not None:
-            if not isinstance(self.hermes_base_url, str) or len(self.hermes_base_url) > 512 or not self.hermes_base_url.startswith(("http://", "https://")):
-                raise ValueError("Hermes endpoint is invalid")
-            parsed = urlsplit(self.hermes_base_url)
+        for endpoint_name, endpoint in (("Hermes endpoint", self.hermes_base_url), ("Hermes audio endpoint", self.hermes_audio_base_url)):
+            if endpoint is None:
+                continue
+            if not isinstance(endpoint, str) or len(endpoint) > 512 or not endpoint.startswith(("http://", "https://")):
+                raise ValueError(f"{endpoint_name} is invalid")
+            parsed = urlsplit(endpoint)
             if parsed.username or parsed.password or parsed.fragment or any(part.split("=", 1)[0].lower() in {"key", "token", "secret", "password", "authorization"} for part in parsed.query.split("&") if "=" in part) or any(part.split("=", 1)[0].lower() != "profile" for part in parsed.query.split("&") if part):
-                raise ValueError("Hermes endpoint contains credentials")
+                raise ValueError(f"{endpoint_name} contains credentials")
         for credential in (self.hermes_api_key_file, self.realtime_asr_credential_file, self.batch_asr_credential_file, self.local_asr_credential_file, self.tts_credential_file):
             if credential is not None and (not isinstance(credential, str) or not credential or any(ord(char) < 0x20 for char in credential) or re.search(r"(?:api[_-]?key|token|secret|password|authorization)\s*=", credential, re.I)):
                 raise ValueError("credential configuration must be a file reference")
@@ -665,6 +673,13 @@ class RecorderConfig:
             raise ValueError("ASR deadline is invalid")
         if not isinstance(self.tts_deadline_seconds, (int, float)) or isinstance(self.tts_deadline_seconds, bool) or not 0 < float(self.tts_deadline_seconds) <= 1800:
             raise ValueError("TTS deadline is invalid")
+        for field_name, minimum, maximum in (
+            ("diagnostics_tombstone_retention_seconds", 1, 366 * 86400),
+            ("diagnostics_export_max_bytes", 1024, 64 * 1024 * 1024),
+        ):
+            value = getattr(self, field_name)
+            if not isinstance(value, int) or isinstance(value, bool) or not minimum <= value <= maximum:
+                raise ValueError(f"{field_name} is invalid")
         if len(set(self.asr_fallback_order)) != len(self.asr_fallback_order) or any(item not in {"realtime", "batch", "local"} for item in self.asr_fallback_order):
             raise ValueError("ASR fallback order is invalid")
         asr_names = {item.name for item in self.asr_providers}
@@ -710,6 +725,9 @@ class RecorderConfig:
         self.validate()
         return {
             "hermes_profile": self.hermes_profile,
+            "hermes_audio_base_url": self.hermes_audio_base_url,
+            "diagnostics_tombstone_retention_seconds": self.diagnostics_tombstone_retention_seconds,
+            "diagnostics_export_max_bytes": self.diagnostics_export_max_bytes,
             "asr_source": self.asr_source,
             "tts_source": self.tts_source,
             "asr_chain": list(self.asr_chain),
@@ -776,6 +794,7 @@ class RecorderConfig:
             asr_provider_timeout_seconds=self.asr_provider_timeout_seconds,
             tts_retry_seconds=self.tts_retry_seconds,
             hermes_base_url=self.hermes_base_url,
+            hermes_audio_base_url=self.hermes_audio_base_url,
             hermes_api_key_file=credential,
             hermes_profile=self.hermes_profile,
             asr_source=self.asr_source,

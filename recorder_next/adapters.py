@@ -230,7 +230,7 @@ class DeterministicRouter:
             project_id=selected["stable_project_id"],
             session_key=selected["default_session_key"],
             project_record_version=int(selected["record_version"]),
-            routed_text="요청을 프로젝트 세션에 전달했습니다.",
+            routed_text=str(turn.get("input") or turn.get("transcript") or ""),
             decision_reason_code="fixture_current_project" if current else "fixture_first_active_project",
         )
 
@@ -271,7 +271,18 @@ class MemoryHermesGateway:
 
 
 class HttpHermesGateway:
-    """Minimal adapter for the existing Hermes HTTP session/chat seam."""
+    """Recorder client for Hermes' durable, idempotent ``/v1/runs`` seam.
+
+    The OpenAI-compatible run endpoint is intentionally used instead of the
+    legacy session-chat endpoint.  ``Idempotency-Key`` is persisted by Hermes,
+    so a response lost after admission can be replayed without starting a
+    second agent/tool invocation.  The returned ``run_id`` is the durable
+    correlation identity stored by Recorder.
+    """
+
+    durable_correlation = True
+    _RUN_TERMINAL_STATUSES = {"completed", "failed", "cancelled", "expired", "stopped"}
+    _RUN_PENDING_STATUSES = {"queued", "started", "running", "in_progress", "waiting_for_approval"}
 
     def __init__(
         self,
@@ -281,12 +292,24 @@ class HttpHermesGateway:
         gateway_session_key: str | None = None,
         api_key_file: str | os.PathLike[str] | None = None,
         attachment_resolver: Any | None = None,
+        max_submit_attempts: int = 2,
+        poll_interval_seconds: float = 1.0,
+        run_timeout_seconds: float = 120.0,
     ):
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
         self.gateway_session_key = gateway_session_key
         self._api_key = _read_api_key_file(api_key_file) if api_key_file is not None else None
         self._attachment_resolver = attachment_resolver
+        if not isinstance(max_submit_attempts, int) or isinstance(max_submit_attempts, bool) or not 1 <= max_submit_attempts <= 5:
+            raise ValueError("Hermes submission attempts must be between 1 and 5")
+        if not isinstance(poll_interval_seconds, (int, float)) or isinstance(poll_interval_seconds, bool) or not 0 <= float(poll_interval_seconds) <= 60:
+            raise ValueError("Hermes run poll interval must be between 0 and 60 seconds")
+        if not isinstance(run_timeout_seconds, (int, float)) or isinstance(run_timeout_seconds, bool) or not 0 < float(run_timeout_seconds) <= 3600:
+            raise ValueError("Hermes run timeout must be between 0 and 3600 seconds")
+        self.max_submit_attempts = max_submit_attempts
+        self.poll_interval_seconds = float(poll_interval_seconds)
+        self.run_timeout_seconds = float(run_timeout_seconds)
 
     def _session_headers(self, session_key: str) -> dict[str, str]:
         headers = {"X-Hermes-Session-Key": session_key}
@@ -328,6 +351,10 @@ class HttpHermesGateway:
             is_attachment = kind in {"attachment", "image", "document", "file", "binary"} or (kind == "text" and not part.get("text"))
             if not is_attachment:
                 continue
+            mime_value = part.get("mime")
+            normalized_mime = mime_value.split(";", 1)[0].strip().lower() if isinstance(mime_value, str) else ""
+            if kind == "document" or (kind in {"attachment", "image", "file", "binary"} and not normalized_mime.startswith("image/")):
+                raise ValueError("document input is unsupported by Hermes /v1/runs")
             if part.get("status") != "COMPLETE":
                 if not require_complete:
                     continue
@@ -362,91 +389,197 @@ class HttpHermesGateway:
             )
         return references
 
-    def submit(self, *, session_key: str, request: Mapping[str, Any], submission_id: str, marker: str) -> HermesResult | None:
-        # The durable session_ingress row stores an envelope containing the
-        # normalized request plus route metadata.  Project only the inner
-        # request into Hermes.  Attachments use opaque, hash-bound references;
-        # spool paths, manifests, and device metadata never cross this seam.
-        projected_value = request.get("request") if isinstance(request.get("request"), Mapping) else request
-        if not isinstance(projected_value, Mapping):
-            raise ValueError("Hermes request projection must be an object")
-        projected = projected_value
-        body = {"input": projected.get("input") or projected.get("text") or ""}
+    @staticmethod
+    def _input_with_inline_images(text: Any, attachments: list[dict[str, Any]]) -> str | list[dict[str, Any]]:
+        if isinstance(text, list):
+            if not text:
+                raise ValueError("Hermes input list must contain a user message")
+            content: list[dict[str, Any]] = []
+            for item in text:
+                if not isinstance(item, Mapping):
+                    raise ValueError("Hermes input messages must be objects")
+                content.append(dict(item))
+            if attachments:
+                user_index = next((index for index in range(len(content) - 1, -1, -1) if content[index].get("role") == "user"), None)
+                if user_index is None:
+                    raise ValueError("Hermes multimodal input requires a user message")
+                user_message = content[user_index]
+                existing = user_message.get("content", "")
+                if isinstance(existing, str):
+                    blocks: list[dict[str, Any]] = [{"type": "input_text", "text": existing}] if existing else []
+                elif isinstance(existing, list):
+                    blocks = [dict(block) for block in existing if isinstance(block, Mapping)]
+                    if len(blocks) != len(existing):
+                        raise ValueError("Hermes user content blocks must be objects")
+                else:
+                    raise ValueError("Hermes user content must be text or content blocks")
+                for attachment in attachments:
+                    mime = str(attachment["mime"]).split(";", 1)[0].strip().lower()
+                    if not mime.startswith("image/"):
+                        raise ValueError("document input is unsupported by Hermes /v1/runs")
+                    data_url = attachment.get("data_url")
+                    if not isinstance(data_url, str) or not data_url.startswith("data:"):
+                        raise ValueError("image attachment is missing an inline data URL")
+                    blocks.append({"type": "input_image", "image_url": data_url})
+                user_message["content"] = blocks
+            return content
+        if not isinstance(text, str):
+            raise ValueError("Hermes input must be a string or multimodal message list")
+        if not attachments:
+            if not text:
+                raise ValueError("Hermes projection has no input")
+            return text
+        blocks: list[dict[str, Any]] = []
+        if text:
+            blocks.append({"type": "input_text", "text": text})
+        for attachment in attachments:
+            mime = str(attachment["mime"]).split(";", 1)[0].strip().lower()
+            if not mime.startswith("image/"):
+                raise ValueError("document input is unsupported by Hermes /v1/runs")
+            data_url = attachment.get("data_url")
+            if not isinstance(data_url, str) or not data_url.startswith("data:"):
+                raise ValueError("image attachment is missing an inline data URL")
+            blocks.append({"type": "input_image", "image_url": data_url})
+        if not blocks:
+            raise ValueError("attachment-only projection has no supported input")
+        return [{"role": "user", "content": blocks}]
+
+    def _resolve_inline_attachments(self, projected: Mapping[str, Any], *, submission_id: str) -> list[dict[str, Any]]:
         references = self._attachment_references(
             projected,
             fallback_scope=None if self._attachment_resolver is not None else submission_id,
             require_complete=True,
         )
-        if references and self._attachment_resolver is None:
+        if not references:
+            return []
+        if self._attachment_resolver is None:
             raise ValueError("attachment byte resolver is required")
-        if not body["input"] and not references:
-            raise ValueError("attachment-only projection has no complete references")
-        if references:
-            if self._attachment_resolver is not None:
-                resolved: list[dict[str, Any]] = []
-                for reference in references:
-                    try:
-                        fetched = self._attachment_resolver(reference["reference"])
-                    except Exception as exc:
-                        raise ValueError("attachment resolver failed") from exc
-                    if not isinstance(fetched, Mapping):
-                        raise ValueError("attachment resolver returned an invalid result")
-                    raw = fetched.get("body")
-                    if not isinstance(raw, bytes) or not raw:
-                        raise ValueError("attachment resolver returned invalid bytes")
-                    digest = fetched.get("sha256")
-                    mime = fetched.get("mime")
-                    length = fetched.get("byte_length", len(raw))
-                    if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", digest):
-                        raise ValueError("attachment resolver returned an invalid hash")
-                    if digest.lower() != reference["sha256"].lower() or sha256_bytes(raw) != digest.lower():
-                        raise ValueError("attachment resolver bytes do not match the declared hash")
-                    if not isinstance(length, int) or isinstance(length, bool) or length != len(raw):
-                        raise ValueError("attachment resolver bytes do not match the declared size")
-                    if not isinstance(mime, str) or not mime or mime.split(";", 1)[0].lower() != reference["mime"].split(";", 1)[0].lower():
-                        raise ValueError("attachment resolver MIME does not match the declared MIME")
-                    delivered = dict(reference)
-                    delivered["byte_length"] = len(raw)
-                    delivered["data_url"] = f"data:{mime};base64,{base64.b64encode(raw).decode('ascii')}"
-                    resolved.append(delivered)
-                references = resolved
-            body["attachment_schema"] = "recorder-next/attachment-reference/v1"
-            body["attachments"] = references
-            if not body["input"]:
-                body["input"] = "Process the attached file(s) using the provided references."
-        encoded_session = quote(session_key, safe="")
-        body["marker"] = marker
-        body["hermes_submission_id"] = submission_id
+        resolved: list[dict[str, Any]] = []
+        for reference in references:
+            try:
+                fetched = self._attachment_resolver(reference["reference"])
+            except Exception as exc:
+                raise ValueError("attachment resolver failed") from exc
+            if not isinstance(fetched, Mapping):
+                raise ValueError("attachment resolver returned an invalid result")
+            raw = fetched.get("body")
+            if not isinstance(raw, bytes) or not raw:
+                raise ValueError("attachment resolver returned invalid bytes")
+            if len(raw) > 16 * 1024 * 1024:
+                raise ValueError("attachment exceeds Hermes inline input limit")
+            digest = fetched.get("sha256")
+            mime = fetched.get("mime")
+            length = fetched.get("byte_length", len(raw))
+            if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", digest):
+                raise ValueError("attachment resolver returned an invalid hash")
+            if digest.lower() != reference["sha256"].lower() or sha256_bytes(raw) != digest.lower():
+                raise ValueError("attachment resolver bytes do not match the declared hash")
+            if not isinstance(length, int) or isinstance(length, bool) or length != len(raw):
+                raise ValueError("attachment resolver bytes do not match the declared size")
+            if not isinstance(mime, str) or not mime or mime.split(";", 1)[0].lower() != reference["mime"].split(";", 1)[0].lower():
+                raise ValueError("attachment resolver MIME does not match the declared MIME")
+            base_mime = mime.split(";", 1)[0].strip().lower()
+            delivered = dict(reference)
+            delivered["mime"] = base_mime
+            delivered["byte_length"] = len(raw)
+            delivered["data_url"] = f"data:{base_mime};base64,{base64.b64encode(raw).decode('ascii')}"
+            resolved.append(delivered)
+        return resolved
+
+    @staticmethod
+    def _run_text(result: Mapping[str, Any]) -> str:
+        value = result.get("output") or result.get("text") or result.get("content") or result.get("assistant_content")
+        if isinstance(value, Mapping):
+            value = value.get("content") or value.get("text")
+        if isinstance(value, list):
+            values: list[str] = []
+            for item in value:
+                if isinstance(item, str):
+                    values.append(item)
+                elif isinstance(item, Mapping):
+                    text = item.get("text") or item.get("content")
+                    if isinstance(text, str):
+                        values.append(text)
+            value = "".join(values)
+        return value.strip() if isinstance(value, str) else ""
+
+    def _parse_run_result(self, result: Any, run_id: str) -> HermesResult | None:
+        if not isinstance(result, Mapping):
+            return None
+        status = str(result.get("status") or "").lower().replace("-", "_")
+        if status and status not in self._RUN_TERMINAL_STATUSES:
+            return None
+        text = self._run_text(result)
+        if not text:
+            return None
+        assistant_id = result.get("assistant_message_id") or result.get("message_id") or result.get("response_id") or run_id
+        return HermesResult(str(assistant_id), text, True, "hermes-run")
+
+    def submit(self, *, session_key: str, request: Mapping[str, Any], submission_id: str, marker: str) -> HermesResult | None:
+        # The durable session_ingress row stores an envelope containing the
+        # normalized request plus route metadata.  Only user input bytes cross
+        # this seam; Recorder IDs are transport/session state, not prompt text.
+        projected_value = request.get("request") if isinstance(request.get("request"), Mapping) else request
+        if not isinstance(projected_value, Mapping):
+            raise ValueError("Hermes request projection must be an object")
+        if not isinstance(submission_id, str) or not 1 <= len(submission_id) <= 255 or any(ord(ch) < 33 or ord(ch) > 126 for ch in submission_id):
+            raise ValueError("Hermes submission id is not a valid Idempotency-Key")
+        projected = projected_value
+        text = projected.get("input") or projected.get("text") or ""
+        attachments = self._resolve_inline_attachments(projected, submission_id=submission_id)
+        if not text and not attachments:
+            raise ValueError("Hermes projection has no input")
+        body: dict[str, Any] = {
+            "input": self._input_with_inline_images(text, attachments),
+            "session_id": session_key,
+        }
         headers = self._session_headers(session_key)
         headers["Idempotency-Key"] = submission_id
-        chat_path = f"/api/sessions/{encoded_session}/chat"
-        try:
-            result = self._request("POST", chat_path, body, extra_headers=headers)
-        except urllib.error.HTTPError as exc:
-            if exc.code != 404:
-                return None
+        deadline = time.monotonic() + self.run_timeout_seconds
+        accepted: Mapping[str, Any] | None = None
+        for attempt in range(self.max_submit_attempts):
             try:
-                self._request(
-                    "POST",
-                    "/api/sessions",
-                    {
-                        "id": session_key,
-                        "source": "api_server",
-                    },
-                    extra_headers=self._session_headers(session_key),
-                )
-            except urllib.error.HTTPError as create_exc:
-                if create_exc.code != 409:
+                response = self._request("POST", "/v1/runs", body, extra_headers=headers)
+            except urllib.error.HTTPError:
+                return None
+            except (urllib.error.URLError, TimeoutError):
+                if attempt + 1 >= self.max_submit_attempts:
                     return None
-            except (urllib.error.URLError, TimeoutError):
+                continue
+            if not isinstance(response, Mapping):
                 return None
-            try:
-                result = self._request("POST", chat_path, body, extra_headers=headers)
-            except (urllib.error.URLError, TimeoutError):
-                return None
-        except (urllib.error.URLError, TimeoutError):
+            run_id = response.get("run_id") or response.get("id")
+            if isinstance(run_id, str) and run_id:
+                accepted = response
+                break
             return None
-        return self._parse_result(result)
+        if accepted is None:
+            return None
+        run_id = str(accepted.get("run_id") or accepted.get("id"))
+        immediate = self._parse_run_result(accepted, run_id)
+        if immediate is not None:
+            return immediate
+        while time.monotonic() <= deadline:
+            try:
+                status = self._request("GET", f"/v1/runs/{quote(run_id, safe='')}", extra_headers=self._session_headers(session_key))
+            except (urllib.error.URLError, TimeoutError):
+                if time.monotonic() >= deadline:
+                    return None
+                if self.poll_interval_seconds:
+                    time.sleep(min(self.poll_interval_seconds, max(0.0, deadline - time.monotonic())))
+                continue
+            if isinstance(status, Mapping):
+                normalized = str(status.get("status") or "").lower().replace("-", "_")
+                parsed = self._parse_run_result(status, run_id)
+                if parsed is not None:
+                    return parsed
+                if normalized in self._RUN_TERMINAL_STATUSES:
+                    return None
+                if normalized not in self._RUN_PENDING_STATUSES:
+                    return None
+            if self.poll_interval_seconds:
+                time.sleep(min(self.poll_interval_seconds, max(0.0, deadline - time.monotonic())))
+        return None
 
     def history(self, *, session_key: str, marker: str) -> HermesResult | None:
         values = self.history_messages(session_key=session_key, marker=marker)
@@ -698,7 +831,7 @@ class _HTTPProvider:
             raise ProviderFailure("malformed_probe", retryable=False) from None
         if not isinstance(payload, Mapping):
             raise ProviderFailure("malformed_probe", retryable=False)
-        allowed = {"ok", "ready", "status", "provider", "model", "profile", "version", "capabilities", "media_types"}
+        allowed = {"ok", "ready", "status", "provider", "model", "profile", "version", "capabilities", "media_types", "audio_api", "stt"}
         result: dict[str, Any] = {}
         for key in allowed:
             value = payload.get(key)
@@ -706,6 +839,16 @@ class _HTTPProvider:
                 result[key] = value
             elif key in {"capabilities", "media_types"} and isinstance(value, list) and all(isinstance(item, str) and len(item) <= 128 for item in value):
                 result[key] = list(value)
+            elif key in {"capabilities", "stt"} and isinstance(value, Mapping):
+                nested: dict[str, Any] = {}
+                for nested_key, nested_value in value.items():
+                    if str(nested_key).lower() in {"api_key", "authorization", "credential", "password", "secret", "token"}:
+                        continue
+                    if isinstance(nested_value, (str, int, float, bool)):
+                        nested[str(nested_key)] = nested_value
+                    elif isinstance(nested_value, list) and all(isinstance(item, str) and len(item) <= 128 for item in nested_value):
+                        nested[str(nested_key)] = list(nested_value)
+                result[key] = nested
         return result
 
     def health_check(self) -> dict[str, Any]:
@@ -846,7 +989,7 @@ class HermesAudioASRProvider(_HTTPProvider):
         timeout: float = 10.0,
         credential_file: str | os.PathLike[str] | None,
         max_bytes: int | None = None,
-        health_path: str | None = "/health",
+        health_path: str | None = "/api/health",
         capability_path: str | None = "/api/audio/voice-config",
     ):
         self.profile = profile
@@ -864,7 +1007,10 @@ class HermesAudioASRProvider(_HTTPProvider):
         if not isinstance(audio, bytes) or not audio or (self.max_bytes is not None and len(audio) > self.max_bytes):
             raise ProviderFailure("oversized_or_empty_media", retryable=False)
         data_url = "data:audio/wav;base64," + base64.b64encode(audio).decode("ascii")
-        _content_type, raw = self._request({"audio": data_url}, max_response_bytes=16 * 1024 * 1024)
+        _content_type, raw = self._request(
+            {"data_url": data_url, "mime_type": "audio/wav"},
+            max_response_bytes=16 * 1024 * 1024,
+        )
         try:
             payload = json.loads(raw.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError):
@@ -895,6 +1041,29 @@ class HermesAudioASRProvider(_HTTPProvider):
                 "attempt_identity": f"{turn_id}:{generation}",
             },
         )
+
+    def readiness_check(self) -> dict[str, Any]:
+        """Verify the isolated Hermes audio listener exposes usable STT."""
+        health = self.health_check()
+        capability = self.capability_check()
+        if capability.get("ok") is False or capability.get("ready") is False:
+            raise ProviderFailure("stt_unavailable", retryable=True)
+        if capability.get("audio_api") is False:
+            raise ProviderFailure("stt_audio_api_unavailable", retryable=True)
+        stt = capability.get("stt")
+        if isinstance(stt, Mapping):
+            mode = str(stt.get("mode") or "").strip().lower()
+            if mode in {"disabled", "off", "none"}:
+                raise ProviderFailure("stt_disabled", retryable=False)
+            reason = str(stt.get("reason") or "").strip().lower()
+            if mode == "relay" and reason in {"stt disabled", "resolution error"}:
+                raise ProviderFailure(
+                    "stt_disabled" if reason == "stt disabled" else "stt_unavailable",
+                    retryable=reason != "stt disabled",
+                )
+        elif capability.get("provider") is None and capability.get("status") is None:
+            raise ProviderFailure("stt_capability_unknown", retryable=True)
+        return {"health": health, "capability": capability, "endpoint_contract": self.endpoint_contract}
 
 
 class HttpTTSProvider(_HTTPProvider):
@@ -1051,7 +1220,7 @@ class HermesAudioTTSProvider(_HTTPProvider):
         timeout: float = 10.0,
         credential_file: str | os.PathLike[str] | None,
         max_bytes: int | None = None,
-        health_path: str | None = "/health",
+        health_path: str | None = "/api/health",
         capability_path: str | None = "/api/audio/voice-config",
     ):
         self.profile = profile
