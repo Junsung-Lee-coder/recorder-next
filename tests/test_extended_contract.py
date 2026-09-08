@@ -1,4 +1,5 @@
 import hashlib
+import hmac
 import json
 import tempfile
 import unittest
@@ -339,7 +340,7 @@ class HTTPContractTests(unittest.TestCase):
         from recorder_next.http import create_http_server
 
         with tempfile.TemporaryDirectory() as tmp:
-            service = RecorderService(RecorderStore(Path(tmp) / "db.sqlite3", storage_root=Path(tmp) / "data"))
+            service = RecorderService(RecorderStore(Path(tmp) / "db.sqlite3", storage_root=Path(tmp) / "data"), ingress_secret="fixture-ingress-secret")
             service.store.register_device("u", "d", "phone")
             server = create_http_server(service, host="127.0.0.1", port=0)
             thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -358,7 +359,18 @@ class HTTPContractTests(unittest.TestCase):
                     "prefer_current_project": False,
                     "text": "fixture",
                 }
-                request = urllib.request.Request(base + "/v1/turns", data=json.dumps(payload).encode(), headers={"Content-Type": "application/json"}, method="POST")
+                principal_signature = hmac.new(b"fixture-ingress-secret", b"u\x00d", hashlib.sha256).hexdigest()
+                request = urllib.request.Request(
+                    base + "/v1/turns",
+                    data=json.dumps(payload).encode(),
+                    headers={
+                        "Content-Type": "application/json",
+                        "X-Recorder-Principal-User": "u",
+                        "X-Recorder-Principal-Device": "d",
+                        "X-Recorder-Principal-Signature": principal_signature,
+                    },
+                    method="POST",
+                )
                 with urllib.request.urlopen(request, timeout=2) as response:
                     body = json.loads(response.read())
                     self.assertEqual(response.status, 202)

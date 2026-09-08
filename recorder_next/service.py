@@ -3,9 +3,14 @@ from __future__ import annotations
 import base64
 import binascii
 import hashlib
+import hmac
 import json
 import math
+import os
+import sqlite3
 import threading
+import time
+import uuid
 from dataclasses import asdict
 from typing import Any, Mapping, Sequence
 from urllib.parse import parse_qs, unquote, urlsplit
@@ -34,7 +39,7 @@ from .adapters import (
 )
 from .canonical import hermes_content_hash, normalize_hermes_text
 from .config import RecorderConfig
-from .errors import NotFoundError, RecorderError, UnauthorizedError, ValidationError
+from .errors import LeaseConflict, NotFoundError, RecorderError, UnauthorizedError, UnsupportedMediaType, ValidationError
 from .features import DurableWorker
 from .models import AsrResult, HermesResult, RouterDecision, TTSResult
 from .store import DEFAULT_MISSING_PAGE_SIZE, MAX_MISSING_PAGE_SIZE, FINAL_ERROR_MESSAGES, RecorderStore
@@ -59,6 +64,7 @@ class RecorderService:
         asr_fallback_order: Sequence[str] = ("realtime", "batch", "local"),
         hermes_max_attempts: int = 2,
         hermes_grace_seconds: int = 30,
+        ingress_secret: str | None = None,
     ):
         self.store = store
         self.router = router or DeterministicRouter()
@@ -78,7 +84,128 @@ class RecorderService:
         self.schedule_adapter = TrustedScheduleCreateAdapter(store)
         self.hermes_max_attempts = max(1, hermes_max_attempts)
         self.hermes_grace_seconds = max(0, hermes_grace_seconds)
+        configured_ingress_secret = ingress_secret if ingress_secret is not None else os.environ.get("RECORDER_INGRESS_SECRET")
+        self._ingress_secret = configured_ingress_secret if isinstance(configured_ingress_secret, str) and configured_ingress_secret else None
         self._lock = threading.RLock()
+        self._background_stop: threading.Event | None = None
+        self._background_threads: list[threading.Thread] = []
+        self._shutdown_requested = threading.Event()
+
+    @staticmethod
+    def _poll_seconds(value: float, field: str) -> float:
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)) or not 0 < float(value) <= 300:
+            raise ValueError(f"{field} must be between 0 and 300 seconds")
+        return float(value)
+
+    @staticmethod
+    def _lease_seconds(value: int, field: str) -> int:
+        if not isinstance(value, int) or isinstance(value, bool) or not 1 <= value <= 86400:
+            raise ValueError(f"{field} must be between 1 and 86400 seconds")
+        return value
+
+    def start_background_workers(
+        self,
+        *,
+        worker_poll_seconds: float = 0.25,
+        scheduler_poll_seconds: float = 1.0,
+        worker_lease_seconds: int = 30,
+        scheduler_lease_seconds: int = 30,
+    ) -> None:
+        """Start the in-process worker and scheduler lifecycle threads."""
+
+        worker_poll_seconds = self._poll_seconds(worker_poll_seconds, "worker_poll_seconds")
+        scheduler_poll_seconds = self._poll_seconds(scheduler_poll_seconds, "scheduler_poll_seconds")
+        worker_lease_seconds = self._lease_seconds(worker_lease_seconds, "worker_lease_seconds")
+        scheduler_lease_seconds = self._lease_seconds(scheduler_lease_seconds, "scheduler_lease_seconds")
+        with self._lock:
+            self._background_threads = [thread for thread in self._background_threads if thread.is_alive()]
+            if self._background_threads or self._shutdown_requested.is_set():
+                return
+            stop = threading.Event()
+            worker_owner = f"recorder-worker-{uuid.uuid4()}"
+            scheduler_owner = f"recorder-scheduler-{uuid.uuid4()}"
+            worker = threading.Thread(
+                target=self._background_worker_loop,
+                args=(stop, worker_owner, worker_poll_seconds, worker_lease_seconds),
+                name="recorder-worker",
+                daemon=True,
+            )
+            scheduler = threading.Thread(
+                target=self._background_scheduler_loop,
+                args=(stop, scheduler_owner, scheduler_poll_seconds, scheduler_lease_seconds),
+                name="recorder-scheduler",
+                daemon=True,
+            )
+            self._background_stop = stop
+            self._background_threads = [worker, scheduler]
+            worker.start()
+            scheduler.start()
+
+    def _background_worker_loop(self, stop: threading.Event, owner: str, poll_seconds: float, lease_seconds: int) -> None:
+        error_streak = 0
+        while not stop.is_set():
+            try:
+                result = self.run_background_worker_once(owner=owner, lease_seconds=lease_seconds)
+                error_streak = 0
+                delay = poll_seconds if result is None else 0.0
+            except Exception:
+                error_streak = min(error_streak + 1, 8)
+                delay = min(30.0, max(poll_seconds, poll_seconds * (2 ** error_streak)))
+            stop.wait(delay)
+
+    def _background_scheduler_loop(self, stop: threading.Event, owner: str, poll_seconds: float, lease_seconds: int) -> None:
+        error_streak = 0
+        while not stop.is_set():
+            try:
+                self.recover_scheduler()
+                self.store.recover_worker_jobs()
+                self.run_scheduler(owner=owner, lease_seconds=lease_seconds)
+                error_streak = 0
+                delay = poll_seconds
+            except Exception:
+                error_streak = min(error_streak + 1, 8)
+                delay = min(30.0, max(poll_seconds, poll_seconds * (2 ** error_streak)))
+            stop.wait(delay)
+
+    def stop_background_workers(self, *, timeout: float = 10.0) -> None:
+        """Request both lifecycle threads to stop and wait for clean exit."""
+
+        if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not math.isfinite(float(timeout)) or timeout < 0:
+            raise ValueError("timeout must be a non-negative number")
+        with self._lock:
+            stop = self._background_stop
+            threads = list(self._background_threads)
+        if stop is None:
+            return
+        stop.set()
+        deadline = time.monotonic() + float(timeout)
+        for thread in threads:
+            remaining = max(0.0, deadline - time.monotonic())
+            thread.join(remaining)
+        with self._lock:
+            self._background_threads = [thread for thread in threads if thread.is_alive()]
+            if not self._background_threads:
+                self._background_stop = None
+
+    def request_shutdown(self) -> None:
+        """Request the shared lifecycle stop without waiting in a signal handler."""
+
+        self._shutdown_requested.set()
+        with self._lock:
+            stop = self._background_stop
+        if stop is not None:
+            stop.set()
+
+    def start_background_loops(self, **kwargs: Any) -> None:
+        self.start_background_workers(**kwargs)
+
+    def stop_background_loops(self, **kwargs: Any) -> None:
+        self.stop_background_workers(**kwargs)
+
+    @property
+    def background_workers_running(self) -> bool:
+        with self._lock:
+            return any(thread.is_alive() for thread in self._background_threads)
 
     @staticmethod
     def _turn_scopes(turn: Mapping[str, Any], *, eavesdrop: bool = False) -> tuple[str, ...]:
@@ -108,33 +235,38 @@ class RecorderService:
                 return selected
         return self.asr_chain if kind == "asr" else self.tts_chain
 
-    def route_next(self, user_id: str, owner: str = "router-1") -> dict[str, Any] | None:
-        claim = self.store.claim_router(user_id, owner)
+    def route_next(self, user_id: str, owner: str = "router-1", *, expected_turn_id: str | None = None, now: str | None = None, worker_claim: Mapping[str, Any] | None = None) -> dict[str, Any] | None:
+        effective_now = self._worker_now(worker_claim, now)
+        self._assert_worker_effect(worker_claim, stage="route", turn_id=expected_turn_id, now=effective_now)
+        claim = self.store.claim_router(user_id, owner, turn_id=expected_turn_id, now=effective_now)
         if claim is None:
             return None
         turn = claim["turn"]
+        self._assert_worker_effect(worker_claim, stage="route", turn_id=str(turn["turn_id"]), now=effective_now)
         projects = self.store.list_projects(user_id)
         try:
             decision = self.router.decide(turn, projects)
         except Exception:
-            return self.store.commit_routing_error(turn["turn_id"], owner=owner)
+            return self.store.commit_routing_error(turn["turn_id"], owner=owner, worker_claim=worker_claim)
         if decision is None and not turn.get("current_project_number") and not projects:
+            self._assert_worker_effect(worker_claim, stage="route", turn_id=str(turn["turn_id"]), now=effective_now)
             auto = self.store.create_project(
                 user_id,
                 project_number=f"AUTO-{int(turn['accepted_seq']):06d}",
                 name=f"Recorder project {int(turn['accepted_seq'])}",
                 description="Automatically created by the project router seam",
                 idempotency_key=turn["turn_id"],
+                worker_claim=worker_claim,
             )
             projects = [auto]
             try:
                 decision = self.router.decide(turn, projects)
             except Exception:
-                return self.store.commit_routing_error(turn["turn_id"], owner=owner)
+                return self.store.commit_routing_error(turn["turn_id"], owner=owner, now=effective_now, worker_claim=worker_claim)
         if decision is None:
-            return self.store.commit_routing_error(turn["turn_id"], owner=owner)
-        routed = self.store.commit_route(turn["turn_id"], decision, owner=owner)
-        self._enqueue_hermes_job(routed)
+            return self.store.commit_routing_error(turn["turn_id"], owner=owner, now=effective_now, worker_claim=worker_claim)
+        routed = self.store.commit_route(turn["turn_id"], decision, owner=owner, now=effective_now, worker_claim=worker_claim)
+        self._enqueue_hermes_job(routed, now=effective_now, worker_claim=worker_claim)
         return routed
 
     def route_turn(self, turn_id: str, decision: RouterDecision, *, owner: str | None = None) -> dict[str, Any]:
@@ -142,15 +274,22 @@ class RecorderService:
         self._enqueue_hermes_job(routed)
         return routed
 
-    def process_eavesdrop_segment(self, session_id: str, segment_sequence: int, *, owner: str = "eavesdrop-1", now: str | None = None, expected_segment_sha256: str | None = None) -> dict[str, Any] | None:
-        session = self.store.get_eavesdrop_session(session_id, now=now)
+    def process_eavesdrop_segment(self, session_id: str, segment_sequence: int, *, owner: str = "eavesdrop-1", now: str | None = None, expected_segment_sha256: str | None = None, worker_claim: Mapping[str, Any] | None = None) -> dict[str, Any] | None:
+        effective_now = self._worker_now(worker_claim, now)
+        session = self.store.get_eavesdrop_session(session_id, now=effective_now)
+        self._assert_worker_effect(worker_claim, stage="hermes", now=effective_now)
+        if worker_claim is not None:
+            claim_payload = worker_claim.get("payload")
+            if not isinstance(claim_payload, Mapping) or claim_payload.get("session_id") != session_id or claim_payload.get("segment_sequence") != segment_sequence:
+                raise LeaseConflict("worker eavesdrop claim does not match the segment")
         decision = next((item for item in session.get("routing_decisions", []) if item.get("segment_sequence") == segment_sequence), None)
         if decision is None:
             raise ValidationError("eavesdrop routing decision is missing")
         if decision.get("decision") != "FORWARD_DEFAULT" or decision.get("result_state") != "QUEUED":
             return {"session_id": session_id, "segment_sequence": segment_sequence, "state": decision.get("result_state"), "outcome": decision.get("decision"), "reason": decision.get("reason")}
-        if session.get("state") == "EXPIRED":
-            failed = self.store.mark_eavesdrop_decision(session_id, segment_sequence, result_state="FAILED", reason="session_expired")
+        if session.get("state") != "ACTIVE":
+            reason = "session_expired" if session.get("state") == "EXPIRED" else "session_inactive"
+            failed = self.store.mark_eavesdrop_decision(session_id, segment_sequence, result_state="FAILED", reason=reason, worker_claim=worker_claim)
             return {"session_id": session_id, "segment_sequence": segment_sequence, "state": failed.get("result_state", "FAILED"), "outcome": failed.get("decision"), "reason": failed.get("reason")}
         if self.hermes is None:
             raise ProviderFailure("provider_unavailable", retryable=False)
@@ -164,11 +303,11 @@ class RecorderService:
         if expected_segment_sha256 is not None and expected_segment_sha256 != segment.get("sha256"):
             raise ValidationError("eavesdrop segment digest does not match the queued job")
         if not segment.get("transcript"):
-            self.store.mark_eavesdrop_decision(session_id, segment_sequence, result_state="NO_SPEECH", reason="segment_has_no_transcript")
+            self.store.mark_eavesdrop_decision(session_id, segment_sequence, result_state="NO_SPEECH", reason="segment_has_no_transcript", now=effective_now, worker_claim=worker_claim)
             return {"session_id": session_id, "segment_sequence": segment_sequence, "state": "NO_SPEECH"}
         conversation = "\n".join(str(item["transcript"]).strip() for item in segments if isinstance(item.get("transcript"), str) and item["transcript"].strip())
         if not conversation:
-            self.store.mark_eavesdrop_decision(session_id, segment_sequence, result_state="NO_SPEECH", reason="conversation_has_no_transcript")
+            self.store.mark_eavesdrop_decision(session_id, segment_sequence, result_state="NO_SPEECH", reason="conversation_has_no_transcript", now=effective_now, worker_claim=worker_claim)
             return {"session_id": session_id, "segment_sequence": segment_sequence, "state": "NO_SPEECH"}
         request = {"input": conversation}
         result: HermesResult | None = None
@@ -190,9 +329,25 @@ class RecorderService:
             raise ProviderFailure("transport", retryable=True)
         if not result.terminal or not isinstance(result.content, str) or not result.content.strip():
             raise ProviderFailure("malformed_response", retryable=False)
+        # The remote call can outlive the session and worker deadline.  Read
+        # both authorities again before recording a reply or publishing
+        # DELIVERED, rather than treating the initial snapshot as a lease.
+        session = self.store.get_eavesdrop_session(session_id, now=effective_now)
+        self._assert_worker_effect(worker_claim, stage="hermes", now=effective_now)
+        if session.get("state") != "ACTIVE":
+            reason = "session_expired" if session.get("state") == "EXPIRED" else "session_inactive"
+            failed = self.store.mark_eavesdrop_decision(
+                session_id,
+                segment_sequence,
+                result_state="FAILED",
+                reason=reason,
+                now=effective_now,
+                worker_claim=worker_claim,
+            )
+            return {"session_id": session_id, "segment_sequence": segment_sequence, "state": failed.get("result_state", "FAILED"), "outcome": failed.get("decision"), "reason": failed.get("reason")}
         reply = None
         if session.get("response_enabled") and result.content:
-            reply = self.store.record_eavesdrop_reply(session_id, segment_sequence=segment_sequence, text=result.content)
+            reply = self.store.record_eavesdrop_reply(session_id, segment_sequence=segment_sequence, text=result.content, now=effective_now, worker_claim=worker_claim)
         effect_receipt: dict[str, Any] = {
             "submission_id": decision["hermes_submission_id"],
             "session_id": session_id,
@@ -212,40 +367,161 @@ class RecorderService:
             result_state="DELIVERED",
             reason="hermes_response_available",
             effect_receipt=effect_receipt,
+            now=effective_now,
+            worker_claim=worker_claim,
         )
         return {"session_id": session_id, "segment_sequence": segment_sequence, "state": "DELIVERED", "reply_id": reply.get("reply_id") if reply else None, "content_hash": hermes_content_hash(result.content)}
 
-    def process_next_hermes(self, session_id: str, owner: str = "hermes-1") -> dict[str, Any] | None:
+    @staticmethod
+    def _valid_terminal_hermes_result(
+        result: Any,
+        *,
+        submission_id: str | None = None,
+        turn_id: str | None = None,
+        marker: str | None = None,
+    ) -> HermesResult | None:
+        if not isinstance(result, HermesResult):
+            return None
+        if result.terminal is not True or not isinstance(result.assistant_message_id, str) or not result.assistant_message_id.strip() or not isinstance(result.content, str) or not result.content.strip():
+            return None
+        if not isinstance(result.source, str) or not result.source.startswith("hermes"):
+            return None
+        if result.submission_id is not None and result.submission_id != submission_id:
+            return None
+        if result.turn_id is not None and result.turn_id != turn_id:
+            return None
+        if result.marker is not None and result.marker != marker:
+            return None
+        return result
+
+    def process_next_hermes(
+        self,
+        session_id: str,
+        owner: str = "hermes-1",
+        *,
+        hermes_submission_id: str | None = None,
+        expected_turn_id: str | None = None,
+        now: str | None = None,
+        lease_seconds: int = 30,
+        worker_claim: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
         if self.hermes is None:
             raise ValidationError("Hermes adapter is not configured")
-        ingress = self.store.claim_session_ingress(session_id, owner)
+        effective_now = self._worker_now(worker_claim, now)
+        ingress = self.store.claim_session_ingress(
+            session_id,
+            owner,
+            hermes_submission_id=hermes_submission_id,
+            now=effective_now,
+            lease_seconds=lease_seconds,
+        )
         if ingress is None:
             return None
+        self._assert_worker_effect(worker_claim, stage="hermes", turn_id=str(ingress["turn_id"]), now=effective_now)
+        if expected_turn_id is not None and ingress["turn_id"] != expected_turn_id:
+            self.store.release_session_ingress(
+                ingress["hermes_submission_id"],
+                owner=owner,
+                lease_token=ingress["lease_token"],
+                now=effective_now,
+                worker_claim=worker_claim,
+            )
+            raise ValidationError("Hermes worker submission is bound to a different turn")
         payload = ingress["payload"]
+        payload_turn_id = payload.get("turn_id") if isinstance(payload, Mapping) else None
+        if payload_turn_id is not None and payload_turn_id != ingress["turn_id"]:
+            self.store.release_session_ingress(
+                ingress["hermes_submission_id"],
+                owner=owner,
+                lease_token=ingress["lease_token"],
+                now=effective_now,
+                worker_claim=worker_claim,
+            )
+            raise ValidationError("Hermes ingress payload turn binding is invalid")
+        def call_with_ingress_lease(callback: Any) -> Any:
+            stop = threading.Event()
+            lost = threading.Event()
+            interval = max(0.05, min(float(lease_seconds) / 3.0, 5.0))
+
+            def renew() -> None:
+                while not stop.wait(interval):
+                    try:
+                        renewed = self.store.renew_session_ingress(
+                            ingress["hermes_submission_id"],
+                            owner=owner,
+                            lease_token=ingress["lease_token"],
+                            lease_seconds=lease_seconds,
+                        )
+                    except Exception:
+                        renewed = False
+                    if not renewed:
+                        lost.set()
+                        return
+
+            thread = threading.Thread(target=renew, name=f"recorder-ingress-heartbeat-{ingress['turn_id'][:12]}", daemon=True)
+            thread.start()
+            try:
+                result = callback()
+                if lost.is_set():
+                    raise ProviderFailure("lease_lost", retryable=True)
+                return result
+            finally:
+                stop.set()
+                thread.join(timeout=max(1.0, min(float(lease_seconds), 5.0)))
         try:
-            result = self.hermes.submit(
+            result = call_with_ingress_lease(lambda: self.hermes.submit(
                 session_key=ingress["gateway_session_key"],
                 request=payload,
                 submission_id=ingress["hermes_submission_id"],
                 marker=ingress["marker"],
-            )
+            ))
         except Exception:
             result = None
         if result is None:
             try:
-                result = self.hermes.history(session_key=ingress["gateway_session_key"], marker=ingress["marker"])
+                result = call_with_ingress_lease(lambda: self.hermes.history(session_key=ingress["gateway_session_key"], marker=ingress["marker"]))
             except Exception:
                 result = None
+        result = self._valid_terminal_hermes_result(
+            result,
+            submission_id=ingress["hermes_submission_id"],
+            turn_id=ingress["turn_id"],
+            marker=ingress["marker"],
+        )
         if result is not None:
+            self._assert_worker_effect(worker_claim, stage="hermes", turn_id=str(ingress["turn_id"]), now=effective_now)
             combined_content = self._requery_combined_content(ingress, result)
-            committed = self.store.commit_hermes_result(ingress["hermes_submission_id"], result, combined_content=combined_content)
-            self._enqueue_tts_jobs(ingress["turn_id"])
+            committed = self.store.commit_hermes_result(
+                ingress["hermes_submission_id"],
+                result,
+                combined_content=combined_content,
+                owner=owner,
+                lease_token=ingress["lease_token"],
+                now=effective_now,
+                worker_claim=worker_claim,
+            )
+            self._enqueue_tts_jobs(ingress["turn_id"], now=effective_now, worker_claim=worker_claim)
             return committed
         if ingress["attempt_count"] >= self.hermes_max_attempts:
-            failed = self.store.commit_hermes_error(ingress["hermes_submission_id"], grace_seconds=self.hermes_grace_seconds)
-            self._enqueue_tts_jobs(ingress["turn_id"])
+            self._assert_worker_effect(worker_claim, stage="hermes", turn_id=str(ingress["turn_id"]), now=effective_now)
+            failed = self.store.commit_hermes_error(
+                ingress["hermes_submission_id"],
+                grace_seconds=self.hermes_grace_seconds,
+                owner=owner,
+                lease_token=ingress["lease_token"],
+                now=effective_now,
+                worker_claim=worker_claim,
+            )
+            self._enqueue_tts_jobs(ingress["turn_id"], now=effective_now, worker_claim=worker_claim)
             return failed
-        self.store.release_session_ingress(ingress["hermes_submission_id"], owner=owner)
+        self._assert_worker_effect(worker_claim, stage="hermes", turn_id=str(ingress["turn_id"]), now=effective_now)
+        self.store.release_session_ingress(
+            ingress["hermes_submission_id"],
+            owner=owner,
+            lease_token=ingress["lease_token"],
+            now=effective_now,
+            worker_claim=worker_claim,
+        )
         return self.store.get_turn(ingress["turn_id"])
 
     def _requery_combined_content(self, ingress: Mapping[str, Any], result: HermesResult) -> str | None:
@@ -266,14 +542,49 @@ class RecorderService:
             values.append(fixed)
             seen.add(hermes_content_hash(fixed))
         for item in list(messages or []) + [result]:
-            text = normalize_hermes_text(item.content)
+            terminal = self._valid_terminal_hermes_result(
+                item,
+                submission_id=ingress["hermes_submission_id"],
+                turn_id=ingress["turn_id"],
+                marker=ingress["marker"],
+            )
+            if terminal is None:
+                continue
+            text = normalize_hermes_text(terminal.content)
             digest = hermes_content_hash(text)
             if digest not in seen:
                 seen.add(digest)
                 values.append(text)
         return "\n".join(values) if values else None
 
-    def run_asr(self, turn_id: str, *, frozen: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    def _assert_worker_effect(
+        self,
+        worker_claim: Mapping[str, Any] | None,
+        *,
+        stage: str,
+        turn_id: str | None = None,
+        now: str | None = None,
+    ) -> None:
+        effective_now = self._worker_now(worker_claim, now)
+        if worker_claim is not None and not self.store.assert_worker_effect_authority(worker_claim, stage=stage, turn_id=turn_id, now=effective_now):
+            raise LeaseConflict("worker effect deadline has expired")
+
+    @staticmethod
+    def _worker_now(worker_claim: Mapping[str, Any] | None, now: str | None) -> str | None:
+        """Use a worker's logical claim clock only when the worker supplied one.
+
+        Public/service callers must not be able to backdate effect fencing by
+        passing an arbitrary ``now`` alongside a hand-built claim.  The durable
+        worker adds ``_worker_now`` after it has claimed the row; direct callers
+        therefore continue to use the store clock for claim authority.
+        """
+        if worker_claim is None:
+            return now
+        claimed_now = worker_claim.get("_worker_now")
+        return claimed_now if isinstance(claimed_now, str) and claimed_now else None
+
+    def run_asr(self, turn_id: str, *, frozen: Mapping[str, Any] | None = None, worker_claim: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        self._assert_worker_effect(worker_claim, stage="asr", turn_id=turn_id)
         turn = self.store.get_turn(turn_id)
         if turn.get("authoritative_asr_outcome"):
             return turn
@@ -284,7 +595,8 @@ class RecorderService:
         chain = self._chain_for_turn("asr", turn)
         if chain is not None:
             generation = int(turn["asr_generation"])
-            next_generation = self.store.set_asr_stage(turn_id, expected_generation=generation, stage="provider-chain")
+            self._assert_worker_effect(worker_claim, stage="asr", turn_id=turn_id)
+            next_generation = self.store.set_asr_stage(turn_id, expected_generation=generation, stage="provider-chain", worker_claim=worker_claim)
             if next_generation is None:
                 return self.store.get_turn(turn_id)
             try:
@@ -299,24 +611,39 @@ class RecorderService:
                         "statuses": [dict(item) for item in exc.statuses],
                     },
                 )
-                self.store.commit_asr_result(turn_id, expected_generation=next_generation, stage="provider-chain", result=result)
-                self.store.commit_protocol_error(turn_id, "asr", message=FINAL_ERROR_MESSAGES["asr"])
+                self.store.commit_asr_result(
+                    turn_id,
+                    expected_generation=next_generation,
+                    stage="provider-chain",
+                    result=result,
+                    authoritative=not exc.retryable,
+                    worker_claim=worker_claim,
+                )
+                if exc.retryable:
+                    raise ProviderFailure(exc.kind, retryable=True) from exc
+                self._assert_worker_effect(worker_claim, stage="asr", turn_id=turn_id)
+                self.store.commit_protocol_error(turn_id, "asr", message=FINAL_ERROR_MESSAGES["asr"], worker_claim=worker_claim)
                 return self.store.get_turn(turn_id)
-            self.store.commit_asr_result(turn_id, expected_generation=next_generation, stage="provider-chain", result=result)
+            committed_ok = self.store.commit_asr_result(turn_id, expected_generation=next_generation, stage="provider-chain", result=result, worker_claim=worker_claim)
+            if not committed_ok:
+                return self.store.get_turn(turn_id)
             committed = self.store.get_turn(turn_id)
             if result.outcome == "VALID_TRANSCRIPT":
-                self._enqueue_turn_stage(committed)
+                self._assert_worker_effect(worker_claim, stage="asr", turn_id=turn_id)
+                self._enqueue_turn_stage(committed, worker_claim=worker_claim)
             return committed
         stage_order = list(self.asr_fallback_order)
         if not stage_order:
-            self.store.commit_protocol_error(turn_id, "asr", message=FINAL_ERROR_MESSAGES["asr"])
+            self._assert_worker_effect(worker_claim, stage="asr", turn_id=turn_id)
+            self.store.commit_protocol_error(turn_id, "asr", message=FINAL_ERROR_MESSAGES["asr"], worker_claim=worker_claim)
             return self.store.get_turn(turn_id)
         generation = int(turn["asr_generation"])
         for index, stage in enumerate(stage_order):
             current = self.store.get_turn(turn_id)
             if current["authoritative_asr_outcome"]:
                 return current
-            next_generation = self.store.set_asr_stage(turn_id, expected_generation=generation, stage=stage)
+            self._assert_worker_effect(worker_claim, stage="asr", turn_id=turn_id)
+            next_generation = self.store.set_asr_stage(turn_id, expected_generation=generation, stage=stage, worker_claim=worker_claim)
             if next_generation is None:
                 return self.store.get_turn(turn_id)
             provider = self.asr_providers.get(stage)
@@ -332,12 +659,15 @@ class RecorderService:
             # Silence is a successful, authoritative provider result.  It is
             # not permission to send the same media to a fallback provider.
             if result.outcome == "NO_SPEECH":
-                self.store.commit_asr_result(turn_id, expected_generation=next_generation, stage=stage, result=result)
+                if not self.store.commit_asr_result(turn_id, expected_generation=next_generation, stage=stage, result=result, worker_claim=worker_claim):
+                    return self.store.get_turn(turn_id)
                 return self.store.get_turn(turn_id)
             if result.outcome == "VALID_TRANSCRIPT":
-                self.store.commit_asr_result(turn_id, expected_generation=next_generation, stage=stage, result=result)
+                if not self.store.commit_asr_result(turn_id, expected_generation=next_generation, stage=stage, result=result, worker_claim=worker_claim):
+                    return self.store.get_turn(turn_id)
                 committed = self.store.get_turn(turn_id)
-                self._enqueue_turn_stage(committed)
+                self._assert_worker_effect(worker_claim, stage="asr", turn_id=turn_id)
+                self._enqueue_turn_stage(committed, worker_claim=worker_claim)
                 return committed
             # Permanent provider failures (auth, unsupported media, malformed
             # success, policy, and other non-retryable errors) fail closed and
@@ -348,8 +678,10 @@ class RecorderService:
                     expected_generation=next_generation,
                     stage=stage,
                     result=result,
+                    worker_claim=worker_claim,
                 )
-                self.store.commit_protocol_error(turn_id, "asr", message=FINAL_ERROR_MESSAGES["asr"])
+                self._assert_worker_effect(worker_claim, stage="asr", turn_id=turn_id)
+                self.store.commit_protocol_error(turn_id, "asr", message=FINAL_ERROR_MESSAGES["asr"], worker_claim=worker_claim)
                 return self.store.get_turn(turn_id)
             if index < len(stage_order) - 1:
                 self.store.commit_asr_result(
@@ -358,32 +690,69 @@ class RecorderService:
                     stage=stage,
                     result=result,
                     authoritative=False,
+                    worker_claim=worker_claim,
                 )
                 generation = next_generation
                 continue
-            self.store.commit_asr_result(turn_id, expected_generation=next_generation, stage=stage, result=result)
-            self.store.commit_protocol_error(turn_id, "asr", message=FINAL_ERROR_MESSAGES["asr"])
+            self.store.commit_asr_result(
+                turn_id,
+                expected_generation=next_generation,
+                stage=stage,
+                result=result,
+                authoritative=provider_failure is None or not provider_failure.retryable,
+                worker_claim=worker_claim,
+            )
+            if provider_failure is not None and provider_failure.retryable:
+                raise provider_failure
+            self._assert_worker_effect(worker_claim, stage="asr", turn_id=turn_id)
+            self.store.commit_protocol_error(turn_id, "asr", message=FINAL_ERROR_MESSAGES["asr"], worker_claim=worker_claim)
             return self.store.get_turn(turn_id)
         return self.store.get_turn(turn_id)
 
-    def generate_tts(self, artifact_id: str, *, frozen: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    def generate_tts(self, artifact_id: str, *, frozen: Mapping[str, Any] | None = None, worker_claim: Mapping[str, Any] | None = None) -> dict[str, Any]:
         artifact = self.store.get_artifact(artifact_id)
+        self._assert_worker_effect(worker_claim, stage="tts", turn_id=str(artifact["turn_id"]))
         if artifact["status"] in {"READY", "DELIVERY_PENDING", "PLAYED", "EXPIRED"}:
             return artifact
         try:
             turn = self.store.get_turn(artifact["turn_id"])
             chain = self._chain_for_turn("tts", turn)
+            self._assert_worker_effect(worker_claim, stage="tts", turn_id=str(artifact["turn_id"]))
             if chain is not None:
                 result = chain.execute_tts(artifact["source_text"], artifact_id=artifact_id, frozen=frozen)
             else:
                 result = self.tts.synthesize(artifact["source_text"], artifact_id=artifact_id)
         except ChainFailure as exc:
-            return self.store.set_tts_result(artifact_id, None, error=exc.kind)
+            status_code = next(
+                (
+                    item.get("status_code")
+                    for item in reversed(exc.statuses)
+                    if isinstance(item, Mapping) and item.get("status_code") is not None
+                ),
+                None,
+            )
+            if exc.retryable:
+                raise ProviderFailure(exc.kind, retryable=True, status_code=status_code) from exc
+            return self.store.set_tts_result(
+                artifact_id,
+                None,
+                error=exc.kind,
+                error_metadata={"status_code": status_code},
+                worker_claim=worker_claim,
+            )
         except ProviderFailure as exc:  # provider failures stay separate from text FINAL
-            return self.store.set_tts_result(artifact_id, None, error=exc.kind)
+            if exc.retryable:
+                raise
+            return self.store.set_tts_result(
+                artifact_id,
+                None,
+                error=exc.kind,
+                error_metadata={"status_code": exc.status_code},
+                worker_claim=worker_claim,
+            )
         except Exception:  # provider failures stay separate from text FINAL
-            return self.store.set_tts_result(artifact_id, None, error="provider_error")
-        return self.store.set_tts_result(artifact_id, result)
+            return self.store.set_tts_result(artifact_id, None, error="provider_error", worker_claim=worker_claim)
+        return self.store.set_tts_result(artifact_id, result, worker_claim=worker_claim)
 
     def generate_pending_tts(self, *, limit: int = 50) -> list[dict[str, Any]]:
         results = []
@@ -403,6 +772,9 @@ class RecorderService:
         worker = DurableWorker(self.store, owner=owner, handlers=handlers)
         return worker.run_once(now=now, lease_seconds=lease_seconds)
 
+    def get_ingress_for_turn(self, turn_id: str) -> dict[str, Any] | None:
+        return self.store.get_ingress_for_turn(turn_id)
+
     def schedule_create(self, command: Mapping[str, Any]) -> dict[str, Any]:
         return self.schedule_adapter.schedule_create(command)
 
@@ -414,10 +786,30 @@ class RecorderService:
         limit: int = 50,
         now: str | None = None,
     ) -> list[dict[str, Any]]:
-        return self.store.fire_due_schedules(owner=owner, lease_seconds=lease_seconds, limit=limit, now=now)
+        fired = self.store.fire_due_schedules(owner=owner, lease_seconds=lease_seconds, limit=limit, now=now)
+        try:
+            # Firing and worker-job projection use separate store
+            # transactions.  Preserve a fired occurrence for reconciliation,
+            # but make transient SQLite failures retryable to the durable
+            # scheduler instead of permanently acknowledging the gap.
+            self._enqueue_pending_tts_jobs(now=now, scheduled_only=True)
+        except sqlite3.DatabaseError as exc:
+            raise ProviderFailure("transport", retryable=True) from exc
+        return fired
 
     def recover_scheduler(self, *, now: str | None = None) -> dict[str, Any]:
-        return self.store.recover(now=now)
+        result = self.store.recover(now=now)
+        reconciled = 0
+        for turn in self.store.list_accepted_turns():
+            if self._enqueue_turn_stage(turn, now=now) is not None:
+                reconciled += 1
+        try:
+            jobs = self._enqueue_pending_tts_jobs(now=now, scheduled_only=True)
+        except sqlite3.DatabaseError as exc:
+            raise ProviderFailure("transport", retryable=True) from exc
+        result["tts_jobs_enqueued"] = len(jobs)
+        result["accepted_turns_reconciled"] = reconciled
+        return result
 
     def _enqueue_stage_job(
         self,
@@ -427,15 +819,19 @@ class RecorderService:
         idempotency_key: str,
         provider_chain: ProviderChain | None = None,
         now: str | None = None,
+        worker_claim: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
+        effective_now = self._worker_now(worker_claim, now)
         return self.store.enqueue_worker_job(
             kind=stage,
             stage=stage,
             payload=dict(payload),
             idempotency_key=idempotency_key,
             max_attempts=self.hermes_max_attempts if stage == "hermes" else 3,
-            now=now,
+            now=effective_now,
             provider_chain=provider_chain,
+            worker_claim=worker_claim,
+            worker_stage=(str(worker_claim.get("stage")) if isinstance(worker_claim, Mapping) and isinstance(worker_claim.get("stage"), str) else None),
             deadline_seconds=(
                 max(1, int(math.ceil(provider_chain.overall_deadline_seconds)))
                 if provider_chain is not None
@@ -443,7 +839,7 @@ class RecorderService:
             ),
         )
 
-    def _enqueue_turn_stage(self, turn: Mapping[str, Any], *, now: str | None = None) -> dict[str, Any] | None:
+    def _enqueue_turn_stage(self, turn: Mapping[str, Any], *, now: str | None = None, worker_claim: Mapping[str, Any] | None = None) -> dict[str, Any] | None:
         if turn.get("state") not in {"ACCEPTED", "ASR_PENDING"}:
             return None
         audio = any(part.get("kind") == "audio" for part in turn.get("parts", []))
@@ -456,34 +852,84 @@ class RecorderService:
             idempotency_key=f"turn:{turn['turn_id']}:{stage}",
             provider_chain=chain,
             now=now,
+            worker_claim=worker_claim,
         )
 
-    def _enqueue_hermes_job(self, turn: Mapping[str, Any], *, now: str | None = None) -> dict[str, Any] | None:
+    def _enqueue_hermes_job(self, turn: Mapping[str, Any], *, now: str | None = None, worker_claim: Mapping[str, Any] | None = None) -> dict[str, Any] | None:
         if not turn.get("project_id") or not turn.get("session_key"):
             return None
+        ingress = self.store.get_ingress_for_turn(str(turn["turn_id"]))
+        if ingress is None:
+            if turn.get("state") in {"FINAL_READY", "DELIVERED", "EXPIRED"}:
+                return None
+            raise ValidationError("Hermes worker projection is missing its durable submission")
+        if ingress.get("turn_id") != turn.get("turn_id") or ingress.get("target_session_id") != turn.get("project_id") or ingress.get("gateway_session_key") != turn.get("session_key"):
+            raise ValidationError("Hermes worker projection does not match its durable ingress")
         return self._enqueue_stage_job(
             "hermes",
-            {"turn_id": turn["turn_id"], "session_id": turn["project_id"]},
+            {
+                "turn_id": turn["turn_id"],
+                "session_id": turn["project_id"],
+                "hermes_submission_id": ingress["hermes_submission_id"],
+            },
             idempotency_key=f"turn:{turn['turn_id']}:hermes",
             now=now,
+            worker_claim=worker_claim,
         )
 
-    def _enqueue_tts_jobs(self, turn_id: str, *, now: str | None = None) -> list[dict[str, Any]]:
+    def _enqueue_pending_tts_jobs(
+        self,
+        *,
+        turn_id: str | None = None,
+        now: str | None = None,
+        limit: int = 500,
+        scheduled_only: bool = False,
+        worker_claim: Mapping[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
         jobs: list[dict[str, Any]] = []
-        for artifact in self.store.pending_tts(limit=500):
-            if artifact.get("turn_id") != turn_id:
+        # Terminal-row reconciliation is a separate maintenance operation. It
+        # is intentionally not piggy-backed on a claimed Hermes effect, whose
+        # worker authority is scoped to one turn and one stage.
+        if worker_claim is None:
+            self.store.reconcile_terminal_tts_jobs(now=now)
+        pending_kwargs: dict[str, Any] = {"limit": limit, "include_recording_active": True}
+        # Generation is durable work and must not be suppressed by the
+        # playback/recording eligibility gate. Delivery remains gated later.
+        if scheduled_only:
+            # Filter by source in SQL before applying the bounded page.  A
+            # large client-originated backlog must not hide scheduled FINALs.
+            pending_kwargs["turn_source"] = "server_schedule"
+            # A terminal or already-running projection must not consume the
+            # whole page forever.  Ask the store for only artifacts without a
+            # durable TTS worker projection so later eligible rows converge.
+            pending_kwargs["unprojected_only"] = True
+        for artifact in self.store.pending_tts(**pending_kwargs):
+            artifact_turn_id = artifact.get("turn_id")
+            if not isinstance(artifact_turn_id, str):
                 continue
-            turn = self.store.get_turn(turn_id)
+            if turn_id is not None and artifact_turn_id != turn_id:
+                continue
+            turn = self.store.get_turn(artifact_turn_id)
             jobs.append(
                 self._enqueue_stage_job(
                     "tts",
-                    {"turn_id": turn_id, "artifact_id": artifact["artifact_id"]},
+                    {"turn_id": artifact_turn_id, "artifact_id": artifact["artifact_id"]},
                     idempotency_key=f"artifact:{artifact['artifact_id']}:tts",
                     provider_chain=self._chain_for_turn("tts", turn),
                     now=now,
+                    worker_claim=worker_claim,
                 )
             )
         return jobs
+
+    def _enqueue_tts_jobs(
+        self,
+        turn_id: str,
+        *,
+        now: str | None = None,
+        worker_claim: Mapping[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        return self._enqueue_pending_tts_jobs(turn_id=turn_id, now=now, worker_claim=worker_claim)
 
     def accept_turn(
         self,
@@ -493,9 +939,26 @@ class RecorderService:
         user_id: str | None = None,
         device_id: str | None = None,
     ) -> dict[str, Any]:
-        accepted = self.store.accept_turn(turn_id, now=now, user_id=user_id, device_id=device_id)
-        if accepted.get("state") == "ACCEPTED":
-            self._enqueue_turn_stage(accepted, now=now)
+        # Build the immutable provider snapshot before entering the acceptance
+        # transaction.  RecorderStore persists it together with ACCEPTED and
+        # the first worker intent; it must never be reconstructed after a
+        # successful acceptance.
+        current = self.store.get_turn(turn_id, user_id=user_id, device_id=device_id)
+        audio = any(part.get("kind") == "audio" for part in current.get("parts", []))
+        initial_chain = self._chain_for_turn("asr", current) if audio else None
+        accepted = self.store.accept_turn(
+            turn_id,
+            now=now,
+            user_id=user_id,
+            device_id=device_id,
+            enqueue_worker_job=True,
+            provider_chain=initial_chain,
+            max_attempts=3,
+            deadline_seconds=(
+                max(1, int(math.ceil(initial_chain.overall_deadline_seconds)))
+                if initial_chain is not None else 300
+            ),
+        )
         return accepted
 
     def _default_worker_handlers(self) -> dict[str, Any]:
@@ -507,62 +970,157 @@ class RecorderService:
             return value
 
         def asr(job: Mapping[str, Any]) -> Mapping[str, Any]:
-            result = self.run_asr(str(job["payload"]["turn_id"]), frozen=job.get("provider_chain"))
-            return receipt("asr", str(job["payload"]["turn_id"]), outcome=result.get("authoritative_asr_outcome") or "pending")
+            turn_id = str(job["payload"]["turn_id"])
+            try:
+                result = self.run_asr(turn_id, frozen=job.get("provider_chain"), worker_claim=job)
+            except ProviderFailure as exc:
+                if not exc.retryable or int(job.get("attempt_count", 0)) < int(job.get("max_attempts", 0)):
+                    raise
+                self.store.commit_protocol_error(turn_id, "asr", message=FINAL_ERROR_MESSAGES["asr"], worker_claim=job)
+                result = self.store.get_turn(turn_id)
+            return receipt("asr", turn_id, outcome=result.get("authoritative_asr_outcome") or "pending")
 
         def route(job: Mapping[str, Any]) -> Mapping[str, Any]:
-            result = self.route_next(str(job["payload"]["user_id"]), owner=f"worker:{job['job_id']}")
+            result = self.route_next(
+                str(job["payload"]["user_id"]),
+                owner=str(job.get("_worker_owner") or f"worker:{job['job_id']}"),
+                expected_turn_id=str(job["payload"]["turn_id"]),
+                worker_claim=job,
+            )
             if result is None:
                 raise ProviderFailure("provider_unavailable", retryable=True)
             return receipt("route", str(job["payload"]["turn_id"]), state=result.get("state", "accepted"))
 
         def hermes(job: Mapping[str, Any]) -> Mapping[str, Any]:
+            payload = job["payload"]
+            turn_id = str(payload["turn_id"])
+            submission_id = payload.get("hermes_submission_id")
+            if not isinstance(submission_id, str) or not submission_id:
+                ingress = self.store.get_ingress_for_turn(turn_id)
+                if ingress is None:
+                    raise ValidationError("Hermes worker submission is missing")
+                submission_id = str(ingress["hermes_submission_id"])
             try:
-                result = self.process_next_hermes(str(job["payload"]["session_id"]), owner=f"worker:{job['job_id']}")
+                result = self.process_next_hermes(
+                    str(payload["session_id"]),
+                    owner=str(job.get("_worker_owner") or f"worker:{job['job_id']}"),
+                    hermes_submission_id=submission_id,
+                    expected_turn_id=turn_id,
+                    now=job.get("_worker_now"),
+                    worker_claim=job,
+                )
             except ValidationError:
                 raise ProviderFailure("provider_unavailable", retryable=False) from None
             if result is None:
                 raise ProviderFailure("provider_unavailable", retryable=True)
             if result.get("state") in {"ROUTED", "HERMES_PENDING"} and not result.get("final_event_version"):
                 raise ProviderFailure("transport", retryable=True)
-            return receipt("hermes", str(job["payload"]["turn_id"]), state=result.get("state", "accepted"))
+            return receipt("hermes", str(payload["turn_id"]), state=result.get("state", "accepted"))
+
+        def hermes_history(job: Mapping[str, Any]) -> Mapping[str, Any]:
+            payload = job["payload"]
+            submission_id = str(payload["hermes_submission_id"])
+            ingress = self.store.get_ingress(submission_id)
+            turn = self.store.get_turn(str(payload["turn_id"]))
+            self._assert_worker_effect(job, stage="hermes", turn_id=str(payload["turn_id"]))
+            if turn.get("final_outcome") == "success" or turn.get("state") not in {"LATE_RESULT_GRACE", "ROUTED", "HERMES_PENDING"}:
+                return receipt("hermes-history", submission_id, status="already_terminal", state=turn.get("state"))
+            if self.hermes is None:
+                raise ProviderFailure("provider_unavailable", retryable=True)
+            result = self._valid_terminal_hermes_result(
+                self.hermes.history(session_key=ingress["gateway_session_key"], marker=ingress["marker"])
+            )
+            if result is None:
+                raise ProviderFailure("transport", retryable=True)
+            combined_content = self._requery_combined_content(ingress, result)
+            committed = self.store.commit_hermes_result(
+                submission_id,
+                result,
+                combined_content=combined_content,
+                now=None,
+                worker_claim=job,
+            )
+            return receipt("hermes-history", submission_id, state=committed.get("state", "accepted"))
 
         def eavesdrop(job: Mapping[str, Any]) -> Mapping[str, Any]:
             result = self.process_eavesdrop_segment(
                 str(job["payload"]["session_id"]),
                 int(job["payload"]["segment_sequence"]),
-                owner=f"worker:{job['job_id']}",
+                owner=str(job.get("_worker_owner") or f"worker:{job['job_id']}"),
                 now=job.get("_worker_now"),
                 expected_segment_sha256=job["payload"].get("segment_sha256"),
+                worker_claim=job,
             )
             if result is None:
                 raise ProviderFailure("provider_unavailable", retryable=True)
             return receipt("eavesdrop", f"{job['payload']['session_id']}:{job['payload']['segment_sequence']}", state=result.get("state", "accepted"))
 
         def tts(job: Mapping[str, Any]) -> Mapping[str, Any]:
-            result = self.generate_tts(str(job["payload"]["artifact_id"]), frozen=job.get("provider_chain"))
+            result = self.generate_tts(str(job["payload"]["artifact_id"]), frozen=job.get("provider_chain"), worker_claim=job)
             if result.get("status") == "FAILED_GENERATION":
                 error_kind = "provider_unavailable"
+                status_code = None
                 raw_metadata = result.get("provider_metadata_json")
                 if isinstance(raw_metadata, str):
                     try:
                         parsed_metadata = json.loads(raw_metadata)
                         if isinstance(parsed_metadata, Mapping) and isinstance(parsed_metadata.get("error_kind"), str):
                             error_kind = parsed_metadata["error_kind"]
+                        if isinstance(parsed_metadata, Mapping):
+                            candidate_status = parsed_metadata.get("status_code")
+                            if isinstance(candidate_status, int) and not isinstance(candidate_status, bool) and 100 <= candidate_status <= 599:
+                                status_code = candidate_status
                     except json.JSONDecodeError:
                         pass
                 retryable = error_kind in {"transport", "dns", "connect", "timeout", "rate_limited", "server", "provider_unavailable", "capacity"}
-                raise ProviderFailure(error_kind, retryable=retryable)
+                raise ProviderFailure(error_kind, retryable=retryable, status_code=status_code)
             return receipt("tts", str(job["payload"]["artifact_id"]), state=result.get("status", "accepted"))
 
         def scheduler(job: Mapping[str, Any]) -> Mapping[str, Any]:
-            result = self.run_scheduler(owner=f"worker:{job['job_id']}", now=job.get("payload", {}).get("now"))
+            result = self.run_scheduler(
+                owner=str(job.get("_worker_owner") or f"worker:{job['job_id']}"),
+                now=job.get("payload", {}).get("now"),
+            )
             return receipt("scheduler", job["job_id"], count=len(result))
 
-        return {"asr": asr, "route": route, "hermes": hermes, "eavesdrop": eavesdrop, "tts": tts, "scheduler": scheduler}
+        return {"asr": asr, "route": route, "hermes": hermes, "hermes_history": hermes_history, "eavesdrop": eavesdrop, "tts": tts, "scheduler": scheduler}
 
     def run_background_worker_once(self, *, owner: str = "recorder-worker-1", now: str | None = None, lease_seconds: int = 30) -> dict[str, Any] | None:
-        return self.run_durable_worker_once(owner=owner, handlers=self._default_worker_handlers(), now=now, lease_seconds=lease_seconds)
+        # Process already durable work first.  Reconciliation is deliberately
+        # an idle-tick action: an enqueue fault must be represented by the
+        # scheduler/worker job being processed rather than escaping before its
+        # lease and retry receipt are updated.
+        self.store.expire_tts_artifacts(now=now)
+        receipt = self.run_durable_worker_once(
+            owner=owner,
+            handlers=self._default_worker_handlers(),
+            now=now,
+            lease_seconds=lease_seconds,
+        )
+        if receipt is not None:
+            return receipt
+        timestamp = now or self.store._now()
+        # A deadline sweep may have terminalized a job without claiming any
+        # handler.  Do not immediately select unrelated client TTS backlog in
+        # that same tick; the next tick is the recovery boundary and avoids
+        # reporting new work for a request that just converged to EXPIRED.
+        if any(
+            job.get("status") == "FAILED_PERMANENT"
+            and job.get("last_error_kind") == "deadline"
+            and job.get("updated_at") == timestamp
+            for job in self.store.list_worker_jobs()
+        ):
+            return None
+        try:
+            self._enqueue_pending_tts_jobs(now=now, scheduled_only=False)
+        except sqlite3.DatabaseError as exc:
+            raise ProviderFailure("transport", retryable=True) from exc
+        return self.run_durable_worker_once(
+            owner=owner,
+            handlers=self._default_worker_handlers(),
+            now=now,
+            lease_seconds=lease_seconds,
+        )
 
     def accept_text_turn(
         self,
@@ -606,9 +1164,17 @@ class RecorderService:
 
     # ---- Small HTTP surface ----------------------------------------------
 
-    def handle_http(self, method: str, target: str, headers: Mapping[str, str], body: bytes) -> tuple[int, dict[str, str], Any]:
+    def handle_http(
+        self,
+        method: str,
+        target: str,
+        headers: Mapping[str, str],
+        body: bytes,
+        *,
+        peer_addr: tuple[str, int] | None = None,
+    ) -> tuple[int, dict[str, str], Any]:
         try:
-            return self._handle_http(method, target, headers, body)
+            return self._handle_http(method, target, headers, body, peer_addr=peer_addr)
         except RecorderError as exc:
             return exc.status, {"Content-Type": "application/json"}, {"error": {"code": exc.code, "message": exc.message}}
         except (ValueError, KeyError, json.JSONDecodeError) as exc:
@@ -617,7 +1183,9 @@ class RecorderService:
             return 500, {"Content-Type": "application/json"}, {"error": {"code": "INTERNAL_ERROR", "message": "request failed"}}
 
     @staticmethod
-    def _json_body(body: bytes) -> dict[str, Any]:
+    def _json_body(body: bytes, decoded: dict[str, Any] | None = None) -> dict[str, Any]:
+        if decoded is not None:
+            return decoded
         if not body:
             return {}
         value = json.loads(body.decode("utf-8"))
@@ -628,10 +1196,8 @@ class RecorderService:
     @staticmethod
     def _header_value(headers: Mapping[str, str], name: str) -> str | None:
         wanted = name.lower()
-        for key, value in headers.items():
-            if str(key).lower() == wanted:
-                return value
-        return None
+        values = [value for key, value in headers.items() if str(key).lower() == wanted]
+        return values[0] if len(values) == 1 else None
 
     @staticmethod
     def _json_string(payload: Mapping[str, Any], key: str) -> str:
@@ -674,12 +1240,16 @@ class RecorderService:
 
     @classmethod
     def _request_owner(cls, query: Mapping[str, str], headers: Mapping[str, str]) -> tuple[str, str]:
-        user_id = query.get("user_id")
-        device_id = query.get("device_id")
-        if user_id is None:
-            user_id = cls._header_value(headers, "X-Recorder-User-ID")
-        if device_id is None:
-            device_id = cls._header_value(headers, "X-Recorder-Device-ID")
+        query_user = query.get("user_id")
+        query_device = query.get("device_id")
+        header_user = cls._header_value(headers, "X-Recorder-User-ID") or cls._header_value(headers, "X-Recorder-Principal-User")
+        header_device = cls._header_value(headers, "X-Recorder-Device-ID") or cls._header_value(headers, "X-Recorder-Principal-Device")
+        if query_user is not None and header_user is not None and query_user != header_user:
+            raise UnauthorizedError("request identity fields do not agree")
+        if query_device is not None and header_device is not None and query_device != header_device:
+            raise UnauthorizedError("request identity fields do not agree")
+        user_id = query_user if query_user is not None else header_user
+        device_id = query_device if query_device is not None else header_device
         if not isinstance(user_id, str) or not user_id or not isinstance(device_id, str) or not device_id:
             raise UnauthorizedError("a registered user and device are required")
         return user_id, device_id
@@ -695,19 +1265,102 @@ class RecorderService:
         self.store.assert_active_device(user_id, device_id)
         return user_id, device_id
 
-    def _handle_http(self, method: str, target: str, headers: Mapping[str, str], body: bytes) -> tuple[int, dict[str, str], Any]:
+    def _verify_network_principal(
+        self,
+        query: Mapping[str, str],
+        headers: Mapping[str, str],
+        body: bytes,
+        *,
+        path: str,
+        raw_chunk: bool = False,
+    ) -> dict[str, Any] | None:
+        if self._ingress_secret is None:
+            raise UnauthorizedError("authenticated ingress is not configured")
+        principal_user = self._header_value(headers, "X-Recorder-Principal-User")
+        principal_device = self._header_value(headers, "X-Recorder-Principal-Device")
+        proof = self._header_value(headers, "X-Recorder-Principal-Signature")
+        if not principal_user or not principal_device or proof is None:
+            raise UnauthorizedError("verified request principal is required")
+        if any(not isinstance(value, str) or not value or "\x00" in value for value in (principal_user, principal_device)):
+            raise UnauthorizedError("verified request principal is invalid")
+        message = f"{principal_user}\x00{principal_device}".encode("utf-8")
+        expected = hmac.new(self._ingress_secret.encode("utf-8"), message, hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(proof, expected):
+            raise UnauthorizedError("verified request principal is invalid")
+        query_pairs = {key: query.get(key) for key in ("user_id", "device_id", "phone_device_id")}
+        claimed_header_user = self._header_value(headers, "X-Recorder-User-ID")
+        claimed_header_device = self._header_value(headers, "X-Recorder-Device-ID")
+        if claimed_header_user is not None and claimed_header_user != principal_user:
+            raise UnauthorizedError("request identity does not match verified principal")
+        if claimed_header_device is not None and claimed_header_device != principal_device:
+            raise UnauthorizedError("request identity does not match verified principal")
+        for key, value in query_pairs.items():
+            if value is None:
+                continue
+            expected_value = principal_user if key == "user_id" else principal_device
+            if value != expected_value:
+                raise UnauthorizedError("request identity does not match verified principal")
+        content_type = self._header_value(headers, "Content-Type")
+        media_type = content_type.split(";", 1)[0].strip().lower() if isinstance(content_type, str) else None
+        if body and not raw_chunk and media_type != "application/json":
+            raise UnsupportedMediaType("JSON routes require Content-Type: application/json")
+        if body and raw_chunk and media_type != "application/octet-stream":
+            raise UnsupportedMediaType("chunk routes require an octet-stream body")
+        if body and not raw_chunk:
+            try:
+                decoded = json.loads(body.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise ValidationError("request body is not valid JSON") from exc
+            if not isinstance(decoded, dict):
+                raise ValidationError("request body must be a JSON object")
+            if "now" in decoded:
+                raise ValidationError("server time cannot be supplied by a client")
+            for key in ("user_id", "device_id", "origin_device_id", "phone_device_id", "actor_device_id"):
+                value = decoded.get(key)
+                if value is None:
+                    continue
+                expected_value = principal_user if key == "user_id" else principal_device
+                if value != expected_value:
+                    raise UnauthorizedError("request identity does not match verified principal")
+            return decoded
+        return None
+
+    def _handle_http(
+        self,
+        method: str,
+        target: str,
+        headers: Mapping[str, str],
+        body: bytes,
+        *,
+        peer_addr: tuple[str, int] | None = None,
+    ) -> tuple[int, dict[str, str], Any]:
         if method == "HEAD":
             method = "GET"
         parsed = urlsplit(target)
         path = parsed.path.rstrip("/") or "/"
         query = {key: values[-1] for key, values in parse_qs(parsed.query).items()}
+        segments = [unquote(item) for item in path.split("/") if item]
         if method == "GET" and path in {"/healthz", "/v1/health"}:
             return 200, {}, {"status": "ok", "product_identity": "recorder-next-server-product-items-1-through-8", "api_version": "v1", "worker": self.store.worker_health()}
         if method == "GET" and path == "/v1/openapi.json":
             from .openapi import OPENAPI
 
             return 200, {}, OPENAPI
-        segments = [unquote(item) for item in path.split("/") if item]
+        decoded_payload: dict[str, Any] | None = None
+
+        def json_body() -> dict[str, Any]:
+            nonlocal decoded_payload
+            if decoded_payload is None:
+                decoded_payload = self._json_body(body)
+            return decoded_payload
+
+        if peer_addr is not None and path not in {"/healthz", "/v1/health", "/v1/openapi.json"} and not path.startswith("/v1/updates/"):
+            raw_chunk = len(segments) == 7 and segments[:2] == ["v1", "turns"] and segments[3] == "parts" and segments[5] == "chunks"
+            decoded_payload = self._verify_network_principal(query, headers, body, path=path, raw_chunk=raw_chunk)
+            if "now" in query:
+                raise ValidationError("server time cannot be supplied by a client")
+        if method == "POST" and segments[:2] == ["v1", "internal"] and len(segments) >= 3:
+            raise NotFoundError("API route not found")
         if segments[:2] == ["v1", "updates"] and len(segments) == 4 and segments[3] in {"manifest", "manifest.json"} and method == "GET":
             manifest = self.store.get_update_manifest(segments[2])
             if_none_match = self._header_value(headers, "If-None-Match")
@@ -724,29 +1377,6 @@ class RecorderService:
                 if_none_match=self._header_value(headers, "If-None-Match"),
             )
             return result["status"], result["headers"], result["body"]
-        if segments[:3] == ["v1", "internal", "worker"] and method == "POST":
-            payload = self._json_body(body)
-            action = segments[3] if len(segments) > 3 else "claim"
-            if action == "claim":
-                owner = self._json_string(payload, "owner") if "owner" in payload else "worker-1"
-                lease_seconds = self._json_integer(payload, "lease_seconds") if "lease_seconds" in payload else 30
-                assert lease_seconds is not None
-                return 200, {}, self.store.claim_worker_job(owner, now=payload.get("now"), lease_seconds=lease_seconds) or {"job": None}
-            if action == "recover":
-                return 200, {}, self.store.recover_worker_jobs(now=payload.get("now"))
-            if action == "complete":
-                return 200, {}, self.store.complete_worker_job(self._json_string(payload, "job_id"), self._json_string(payload, "owner"), payload["receipt"], now=payload.get("now"))
-            if action == "fail":
-                error_kind = self._json_string(payload, "error_kind") if "error_kind" in payload else "internal"
-                retryable = payload.get("retryable", False)
-                if not isinstance(retryable, bool):
-                    raise ValidationError("retryable must be boolean")
-                return 200, {}, self.store.fail_worker_job(self._json_string(payload, "job_id"), self._json_string(payload, "owner"), error_kind=error_kind, retryable=retryable, now=payload.get("now"))
-            if action == "run":
-                owner = self._json_string(payload, "owner") if "owner" in payload else "worker-1"
-                lease_seconds = self._json_integer(payload, "lease_seconds") if "lease_seconds" in payload else 30
-                assert lease_seconds is not None
-                return 200, {}, self.run_background_worker_once(owner=owner, now=payload.get("now"), lease_seconds=lease_seconds) or {"job": None}
         if segments[:4] == ["v1", "internal", "worker", "health"] and method == "GET":
             return 200, {}, self.store.worker_health(now=query.get("now"))
         if segments[:2] == ["v1", "history"] and len(segments) == 2 and method == "GET":
@@ -762,7 +1392,7 @@ class RecorderService:
                 limit=self._query_integer(query, "limit", default=50, minimum=1, maximum=200) or 50,
             )
         if segments[:2] == ["v1", "eavesdrop"] and len(segments) == 2 and method == "POST":
-            payload = self._json_body(body)
+            payload = json_body()
             optional_string = lambda key: self._json_string(payload, key) if key in payload and payload[key] is not None else None
             expires_seconds = self._json_integer(payload, "expires_seconds") if "expires_seconds" in payload else 300
             return 201, {}, self.store.start_eavesdrop(
@@ -786,13 +1416,13 @@ class RecorderService:
                     raise UnauthorizedError("eavesdrop read requires user_id and phone_device_id")
                 return 200, {}, self.store.get_eavesdrop_session(session_id, user_id=query.get("user_id"), phone_device_id=query.get("phone_device_id"), now=query.get("now"))
             if len(segments) == 4 and segments[3] in {"activate", "pause", "resume", "stop"} and method == "POST":
-                payload = self._json_body(body)
+                payload = json_body()
                 args = (session_id, self._json_string(payload, "user_id"), self._json_string(payload, "phone_device_id"))
                 action = segments[3]
                 result = {"activate": self.store.activate_eavesdrop, "pause": self.store.pause_eavesdrop, "resume": self.store.resume_eavesdrop, "stop": self.store.stop_eavesdrop}[action](*args, now=payload.get("now"))
                 return 200, {}, result
             if len(segments) == 4 and segments[3] == "segments" and method == "POST":
-                payload = self._json_body(body)
+                payload = json_body()
                 try:
                     audio = base64.b64decode(str(payload["audio_base64"]), validate=True)
                 except (ValueError, binascii.Error) as exc:
@@ -810,10 +1440,10 @@ class RecorderService:
                     now=payload.get("now"),
                 )
             if len(segments) == 5 and segments[3] == "segments" and segments[4] == "route" and method == "POST":
-                payload = self._json_body(body)
+                payload = json_body()
                 return 200, {}, self.store.route_eavesdrop_segment(session_id, self._json_string(payload, "user_id"), self._json_string(payload, "phone_device_id"), segment_sequence=self._json_integer(payload, "segment_sequence"), now=payload.get("now"))
             if len(segments) == 6 and segments[3] == "segments" and segments[5] == "route" and method == "POST":
-                payload = self._json_body(body)
+                payload = json_body()
                 return 200, {}, self.store.route_eavesdrop_segment(session_id, self._json_string(payload, "user_id"), self._json_string(payload, "phone_device_id"), segment_sequence=int(segments[4]), now=payload.get("now"))
             if len(segments) == 4 and segments[3] == "decisions" and method == "GET":
                 if not query.get("user_id") or not query.get("phone_device_id"):
@@ -824,7 +1454,7 @@ class RecorderService:
                     raise UnauthorizedError("eavesdrop read requires user_id and phone_device_id")
                 return 200, {}, {"items": self.store.list_eavesdrop_replies(session_id, user_id=query.get("user_id"), phone_device_id=query.get("phone_device_id"))}
         if segments[:3] == ["v1", "diagnostics", "opt-in"] and method == "POST":
-            payload = self._json_body(body)
+            payload = json_body()
             event_id = self._json_string(payload, "event_id") if "event_id" in payload and payload["event_id"] is not None else None
             expires_at = self._json_string(payload, "expires_at") if "expires_at" in payload and payload["expires_at"] is not None else None
             enabled = payload.get("enabled", True)
@@ -832,11 +1462,11 @@ class RecorderService:
                 raise ValidationError("enabled must be boolean")
             return 201, {}, self.store.record_diagnostics_opt_in(self._json_string(payload, "user_id"), self._json_string(payload, "device_id"), event_id=event_id, enabled=enabled, expires_at=expires_at, now=payload.get("now"))
         if segments[:3] == ["v1", "diagnostics", "events"] and method == "POST":
-            payload = self._json_body(body)
+            payload = json_body()
             occurred_at = self._json_string(payload, "occurred_at") if "occurred_at" in payload and payload["occurred_at"] is not None else None
             return 201, {}, self.store.ingest_diagnostic_event(self._json_string(payload, "user_id"), self._json_string(payload, "device_id"), event_id=self._json_string(payload, "event_id"), idempotency_key=self._json_string(payload, "idempotency_key"), payload=payload.get("payload", {}), occurred_at=occurred_at, now=payload.get("now"))
         if segments[:3] == ["v1", "diagnostics", "bundles"] and method == "POST":
-            payload = self._json_body(body)
+            payload = json_body()
             compressed_value = payload.get("compressed_base64")
             if not isinstance(compressed_value, str):
                 raise ValidationError("compressed_base64 is required and must be a string")
@@ -855,23 +1485,19 @@ class RecorderService:
                 raise UnauthorizedError("diagnostics export requires user_id and device_id")
             return 200, {}, self.store.export_diagnostics(query["user_id"], query["device_id"])
         if segments[:3] == ["v1", "diagnostics", "delete"] and method == "POST":
-            payload = self._json_body(body)
+            payload = json_body()
             user_id, device_id = self._payload_owner(payload)
             return 200, {}, self.store.delete_diagnostics(user_id, device_id, now=payload.get("now"))
         if segments[:2] == ["v1", "diagnostics"] and len(segments) == 2 and method == "DELETE":
-            payload = self._json_body(body) if body else {}
+            payload = json_body() if body else {}
             if "user_id" in query or "device_id" in query:
                 user_id, device_id = self._authenticated_owner(query, headers)
             else:
                 user_id, device_id = self._payload_owner(payload)
                 self.store.assert_active_device(user_id, device_id)
             return 200, {}, self.store.delete_diagnostics(user_id, device_id, now=query.get("now") or payload.get("now"))
-        if segments[:3] == ["v1", "internal", "schedule_create"] and method == "POST":
-            if self._header_value(headers, "X-Recorder-Internal-Trusted") != "1":
-                raise UnauthorizedError("schedule_create requires the trusted Recorder adapter")
-            return 201, {}, self.schedule_create(self._json_body(body))
         if segments[:3] == ["v1", "internal", "scheduler"] and len(segments) == 4 and segments[3] == "fire" and method == "POST":
-            payload = self._json_body(body)
+            payload = json_body()
             owner = self._json_string(payload, "owner") if "owner" in payload else "scheduler-1"
             lease_seconds = self._json_integer(payload, "lease_seconds") if "lease_seconds" in payload else 30
             limit = self._json_integer(payload, "limit") if "limit" in payload else 50
@@ -884,22 +1510,22 @@ class RecorderService:
             )
             return 200, {}, {"items": items}
         if segments[:3] == ["v1", "internal", "scheduler"] and len(segments) == 4 and segments[3] == "recover" and method == "POST":
-            payload = self._json_body(body)
+            payload = json_body()
             return 200, {}, self.recover_scheduler(now=payload.get("now"))
         if segments[:2] == ["v1", "schedules"] and len(segments) == 3 and method == "GET":
             user_id, device_id = self._authenticated_owner(query, headers)
             return 200, {}, self.store.get_schedule(segments[2], user_id=user_id, device_id=device_id)
         if segments[:2] == ["v1", "devices"] and len(segments) == 2 and method == "POST":
-            payload = self._json_body(body)
+            payload = json_body()
             return 201, {}, self.store.register_device(self._json_string(payload, "user_id"), self._json_string(payload, "device_id"), self._json_string(payload, "kind"))
         if segments[:2] == ["v1", "devices"] and len(segments) == 4 and segments[3] == "revoke" and method == "POST":
-            payload = self._json_body(body)
+            payload = json_body()
             user_id = self._json_string(payload, "user_id")
             actor_device_id = self._json_string(payload, "actor_device_id")
             self.store.revoke_device(user_id, segments[2], actor_device_id=actor_device_id)
             return 200, {}, self.store.get_device(user_id, segments[2])
         if segments[:2] == ["v1", "turns"] and len(segments) == 2 and method == "POST":
-            payload = self._json_body(body)
+            payload = json_body()
             if "text" in payload and not payload.get("parts"):
                 if not isinstance(payload["text"], str):
                     raise ValidationError("text must be a JSON string")
@@ -909,7 +1535,7 @@ class RecorderService:
             self._payload_owner(payload, device_key="origin_device_id")
             return 201, {}, self.store.create_turn(payload, require_registered_device=True)
         if segments[:2] == ["v1", "turns"] and len(segments) == 4 and segments[3] == "accept" and method == "POST":
-            payload = self._json_body(body)
+            payload = json_body()
             user_id, device_id = self._payload_owner(payload)
             return 200, {}, self.accept_turn(segments[2], user_id=user_id, device_id=device_id)
         if segments[:2] == ["v1", "turns"] and len(segments) == 3:
@@ -944,7 +1570,7 @@ class RecorderService:
                 return 200, {}, result
             if len(segments) == 6 and segments[5] == "finish" and method == "POST":
                 user_id, device_id = self._authenticated_owner(query, headers)
-                payload = self._json_body(body)
+                payload = json_body()
                 total_chunks = self._json_integer(payload, "total_chunks")
                 total_bytes = self._json_integer(payload, "total_bytes")
                 assert total_chunks is not None and total_bytes is not None
@@ -959,7 +1585,7 @@ class RecorderService:
                     device_id=device_id,
                 )
         if len(segments) in {5, 6} and segments[:2] == ["v1", "turns"] and segments[3] == "events" and (len(segments) == 5 or segments[5] == "ack") and method == "POST":
-            payload = self._json_body(body)
+            payload = json_body()
             user_id, device_id = self._payload_owner(payload)
             event_version = self._json_integer(payload, "event_version")
             assert event_version is not None
@@ -978,7 +1604,7 @@ class RecorderService:
             metadata["audio_base64"] = base64.b64encode(audio).decode("ascii")
             return 200, {}, metadata
         if len(segments) == 4 and segments[:2] == ["v1", "tts"] and segments[3] == "playback-ack" and method == "POST":
-            payload = self._json_body(body)
+            payload = json_body()
             user_id, device_id = self._payload_owner(payload)
             return 200, {}, self.store.ack_playback(
                 segments[2],
@@ -989,7 +1615,7 @@ class RecorderService:
                 artifact_version=self._json_integer(payload, "artifact_version"),
             )
         if len(segments) == 4 and segments[:2] == ["v1", "tts"] and segments[3] == "relay-received" and method == "POST":
-            payload = self._json_body(body)
+            payload = json_body()
             user_id, device_id = self._payload_owner(payload)
             return 200, {}, self.store.relay_tts_received(segments[2], user_id=user_id, device_id=device_id, payload_sha256=self._json_string(payload, "payload_sha256"))
         if segments[:2] == ["v1", "projects"] and len(segments) == 2:
@@ -997,7 +1623,7 @@ class RecorderService:
                 user_id, _device_id = self._authenticated_owner(query, headers)
                 return 200, {}, {"items": self.store.list_projects(user_id, include_archived=query.get("include_archived") == "true")}
             if method == "POST":
-                payload = self._json_body(body)
+                payload = json_body()
                 user_id, device_id = self._payload_owner(payload)
                 self.store.assert_active_device(user_id, device_id)
                 optional_string = lambda key: self._json_string(payload, key) if key in payload and payload[key] is not None else None
@@ -1012,7 +1638,7 @@ class RecorderService:
                 return 200, {}, self.store.get_project(user_id, project_id, include_archived=True)
             if len(segments) == 3 and method == "PATCH":
                 user_id, _device_id = self._authenticated_owner(query, headers)
-                payload = self._json_body(body)
+                payload = json_body()
                 expected_version = self._json_integer(payload, "expected_version")
                 assert expected_version is not None
                 patch = dict(payload)
@@ -1020,30 +1646,17 @@ class RecorderService:
                 return 200, {}, self.store.update_project(user_id, project_id, expected_version=expected_version, patch=patch)
             if len(segments) == 4 and segments[3] == "archive" and method == "POST":
                 user_id, _device_id = self._authenticated_owner(query, headers)
-                payload = self._json_body(body)
+                payload = json_body()
                 expected_version = self._json_integer(payload, "expected_version")
                 assert expected_version is not None
                 return 200, {}, self.store.archive_project(user_id, project_id, expected_version=expected_version)
         if segments[:2] == ["v1", "turns"] and len(segments) == 4 and segments[3] == "archive" and method == "POST":
             user_id, device_id = self._authenticated_owner(query, headers)
-            payload = self._json_body(body)
+            payload = json_body()
             source = payload.get("source", "api")
             if not isinstance(source, str) or not source:
                 raise ValidationError("source must be a non-empty string")
             return 200, {}, self.store.archive_turn(user_id, segments[2], source=source, device_id=device_id)
-        if segments[:3] == ["v1", "internal", "router"] and method == "POST":
-            payload = self._json_body(body)
-            owner = self._json_string(payload, "owner") if "owner" in payload else "router-1"
-            return 200, {}, self.route_next(self._json_string(payload, "user_id"), owner)
-        if segments[:3] == ["v1", "internal", "hermes"] and method == "POST":
-            payload = self._json_body(body)
-            owner = self._json_string(payload, "owner") if "owner" in payload else "hermes-1"
-            return 200, {}, self.process_next_hermes(self._json_string(payload, "session_id"), owner)
-        if segments[:3] == ["v1", "internal", "tts"] and method == "POST":
-            payload = self._json_body(body)
-            limit = self._json_integer(payload, "limit") if "limit" in payload else 50
-            assert limit is not None
-            return 200, {}, self.generate_pending_tts(limit=limit)
         raise NotFoundError("API route not found")
 
 
@@ -1052,7 +1665,7 @@ def create_service(db_path: str, storage_root: str, *, clock: Any | None = None,
     return RecorderService(RecorderStore(db_path, storage_root=storage_root, clock=clock), **kwargs)
 
 
-def create_configured_service(config: "RecorderConfig") -> RecorderService:
+def create_configured_service(config: "RecorderConfig", *, ingress_secret: str | None = None) -> RecorderService:
     from .config import ProviderConfig, RecorderConfig
 
     if not isinstance(config, RecorderConfig):
@@ -1106,8 +1719,18 @@ def create_configured_service(config: "RecorderConfig") -> RecorderService:
             if provider is None:
                 raise CredentialError(f"{kind} chain includes a disabled provider")
             declared = declaration.safe_dict()
-            if declaration.endpoint is None and kind in {"asr", "tts"} and config.hermes_base_url and declaration.adapter in {"hermes", "hermes-default"}:
-                declared["endpoint"] = config.hermes_base_url
+            if declaration.adapter in {"hermes", "hermes-default"}:
+                if declaration.endpoint is None and config.hermes_base_url:
+                    declared["endpoint"] = config.hermes_base_url
+                effective_profile = declaration.profile if declaration.profile != "default" else config.hermes_profile
+                declared["profile"] = effective_profile
+            effective_credential_file = declaration.credential_file
+            if effective_credential_file is None and declaration.adapter in {"hermes", "hermes-default"}:
+                effective_credential_file = config.hermes_api_key_file
+            if effective_credential_file:
+                # Bind the non-secret reference, never credential contents.
+                declared["credential_configured"] = True
+                declared["credential_ref_sha256"] = hashlib.sha256(str(effective_credential_file).encode("utf-8")).hexdigest()
             targets.append(ProviderTarget(name, kind, declaration.adapter, provider, retries=declaration.retries, timeout_seconds=declaration.timeout_seconds, declared=declared))
         return ProviderChain(kind, targets, overall_deadline_seconds=deadline)
 
@@ -1265,4 +1888,5 @@ def create_configured_service(config: "RecorderConfig") -> RecorderService:
         asr_fallback_order=config.asr_fallback_order,
         hermes_max_attempts=config.hermes_max_attempts,
         hermes_grace_seconds=config.hermes_grace_seconds,
+        ingress_secret=ingress_secret,
     )

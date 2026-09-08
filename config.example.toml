@@ -4,6 +4,9 @@
 [server]
 host = "127.0.0.1"
 port = 8643
+# Network API calls require RECORDER_INGRESS_SECRET and a trusted ingress
+# principal signature. Keep the secret in deployment environment/credential
+# plumbing; it is intentionally not represented in this file.
 
 [storage]
 database = "./state/recorder-next.sqlite3"
@@ -34,7 +37,13 @@ tts_source = "hermes"
 asr_chain = []
 tts_chain = []
 # hermes_base_url is intentionally omitted; set it only in deployment configuration.
-# The deployment unit uses LoadCredential= and this path is expanded at startup:
+# It is the Hermes Gateway/API listener. The installed Hermes dashboard exposes
+# the audio route on its separate loopback listener (default port 9120), so the
+# reviewed TTS endpoint is http://127.0.0.1:9120, not the Gateway port.
+# The dashboard wrapper must set HERMES_DASHBOARD_SESSION_TOKEN from the loaded
+# credential. Recorder sends both the in-memory `Authorization: Bearer example-token` header
+# and the preferred `X-Hermes-Session-Token` header. The deployment unit uses
+# LoadCredential= and this path is expanded at startup:
 # hermes_api_key_file = "$CREDENTIALS_DIRECTORY/recorder_api_key"
 # Credential rotation requires restarting Recorder Next only.
 

@@ -401,6 +401,14 @@
         ],
         "type": "string"
       }
+    },
+    "securitySchemes": {
+      "RecorderPrincipal": {
+        "description": "HMAC-SHA256 proof over X-Recorder-Principal-User, a NUL byte, and X-Recorder-Principal-Device. The deployment secret stays outside the API payload and logs.",
+        "in": "header",
+        "name": "X-Recorder-Principal-Signature",
+        "type": "apiKey"
+      }
     }
   },
   "info": {
@@ -416,7 +424,12 @@
           "201": {
             "description": "Registered device"
           }
-        }
+        },
+        "security": [
+          {
+            "RecorderPrincipal": []
+          }
+        ]
       }
     },
     "/v1/devices/{device_id}/revoke": {
@@ -440,7 +453,12 @@
           "200": {
             "description": "Revoked device"
           }
-        }
+        },
+        "security": [
+          {
+            "RecorderPrincipal": []
+          }
+        ]
       }
     },
     "/v1/diagnostics": {
@@ -459,7 +477,12 @@
           "200": {
             "description": "Deletion receipt and tombstones"
           }
-        }
+        },
+        "security": [
+          {
+            "RecorderPrincipal": []
+          }
+        ]
       },
       "get": {
         "parameters": [
@@ -474,7 +497,12 @@
           "200": {
             "description": "Diagnostic metadata"
           }
-        }
+        },
+        "security": [
+          {
+            "RecorderPrincipal": []
+          }
+        ]
       }
     },
     "/v1/diagnostics/bundles": {
@@ -483,7 +511,12 @@
           "201": {
             "description": "Bounded compressed diagnostic bundle"
           }
-        }
+        },
+        "security": [
+          {
+            "RecorderPrincipal": []
+          }
+        ]
       }
     },
     "/v1/diagnostics/delete": {
@@ -502,7 +535,12 @@
           "200": {
             "description": "Deletion receipt and tombstones"
           }
-        }
+        },
+        "security": [
+          {
+            "RecorderPrincipal": []
+          }
+        ]
       }
     },
     "/v1/diagnostics/events": {
@@ -511,7 +549,12 @@
           "201": {
             "description": "Redacted diagnostic event"
           }
-        }
+        },
+        "security": [
+          {
+            "RecorderPrincipal": []
+          }
+        ]
       }
     },
     "/v1/diagnostics/export": {
@@ -528,7 +571,12 @@
           "200": {
             "description": "Redacted diagnostic export"
           }
-        }
+        },
+        "security": [
+          {
+            "RecorderPrincipal": []
+          }
+        ]
       }
     },
     "/v1/diagnostics/opt-in": {
@@ -537,7 +585,12 @@
           "201": {
             "description": "Consent event"
           }
-        }
+        },
+        "security": [
+          {
+            "RecorderPrincipal": []
+          }
+        ]
       }
     },
     "/v1/eavesdrop": {
@@ -547,6 +600,11 @@
             "description": "Created session"
           }
         },
+        "security": [
+          {
+            "RecorderPrincipal": []
+          }
+        ],
         "summary": "Start a phone-mediated eavesdrop session"
       }
     },
@@ -556,7 +614,12 @@
           "200": {
             "description": "Session state"
           }
-        }
+        },
+        "security": [
+          {
+            "RecorderPrincipal": []
+          }
+        ]
       },
       "parameters": [
         {
@@ -570,7 +633,12 @@
           "200": {
             "description": "Eavesdrop routing decision ledger"
           }
-        }
+        },
+        "security": [
+          {
+            "RecorderPrincipal": []
+          }
+        ]
       },
       "parameters": [
         {
@@ -584,7 +652,12 @@
           "200": {
             "description": "Optional response receipts"
           }
-        }
+        },
+        "security": [
+          {
+            "RecorderPrincipal": []
+          }
+        ]
       },
       "parameters": [
         {
@@ -606,7 +679,12 @@
           "200": {
             "description": "Idempotent fixed-project routing decision"
           }
-        }
+        },
+        "security": [
+          {
+            "RecorderPrincipal": []
+          }
+        ]
       }
     },
     "/v1/eavesdrop/{session_id}/{action}": {
@@ -637,7 +715,12 @@
           "200": {
             "description": "State transition or segment receipt"
           }
-        }
+        },
+        "security": [
+          {
+            "RecorderPrincipal": []
+          }
+        ]
       }
     },
     "/v1/health": {
@@ -664,97 +747,12 @@
             "description": "Paired user/assistant messages"
           }
         },
+        "security": [
+          {
+            "RecorderPrincipal": []
+          }
+        ],
         "summary": "Project-scoped keyset history read model"
-      }
-    },
-    "/v1/internal/hermes": {
-      "post": {
-        "responses": {
-          "200": {
-            "description": "Internal Hermes worker step"
-          }
-        }
-      }
-    },
-    "/v1/internal/router": {
-      "post": {
-        "responses": {
-          "200": {
-            "description": "Internal router worker step"
-          }
-        }
-      }
-    },
-    "/v1/internal/schedule_create": {
-      "post": {
-        "responses": {
-          "201": {
-            "description": "Durably scheduled with atomic confirmation FINAL"
-          },
-          "401": {
-            "description": "Trusted adapter header required"
-          },
-          "409": {
-            "description": "Immutable schedule conflict"
-          }
-        },
-        "summary": "Trusted Recorder adapter schedule creation"
-      }
-    },
-    "/v1/internal/scheduler/fire": {
-      "post": {
-        "responses": {
-          "200": {
-            "description": "Scheduled FINAL readback"
-          }
-        },
-        "summary": "Claim and fire due server schedules"
-      }
-    },
-    "/v1/internal/scheduler/recover": {
-      "post": {
-        "responses": {
-          "200": {
-            "description": "Recovery counts"
-          }
-        },
-        "summary": "Requeue expired scheduler leases"
-      }
-    },
-    "/v1/internal/tts": {
-      "post": {
-        "responses": {
-          "200": {
-            "description": "Internal TTS worker step"
-          }
-        }
-      }
-    },
-    "/v1/internal/worker/claim": {
-      "post": {
-        "responses": {
-          "200": {
-            "description": "Claim one durable worker lease"
-          }
-        }
-      }
-    },
-    "/v1/internal/worker/complete": {
-      "post": {
-        "responses": {
-          "200": {
-            "description": "Complete one durable worker lease"
-          }
-        }
-      }
-    },
-    "/v1/internal/worker/fail": {
-      "post": {
-        "responses": {
-          "200": {
-            "description": "Record one durable worker failure"
-          }
-        }
       }
     },
     "/v1/internal/worker/health": {
@@ -763,25 +761,12 @@
           "200": {
             "description": "Bounded worker backlog and lease health"
           }
-        }
-      }
-    },
-    "/v1/internal/worker/recover": {
-      "post": {
-        "responses": {
-          "200": {
-            "description": "Recover expired worker leases"
+        },
+        "security": [
+          {
+            "RecorderPrincipal": []
           }
-        }
-      }
-    },
-    "/v1/internal/worker/run": {
-      "post": {
-        "responses": {
-          "200": {
-            "description": "Run one durable worker lease operation"
-          }
-        }
+        ]
       }
     },
     "/v1/openapi.json": {
@@ -807,7 +792,12 @@
           "200": {
             "description": "Origin-device ordered outbox"
           }
-        }
+        },
+        "security": [
+          {
+            "RecorderPrincipal": []
+          }
+        ]
       }
     },
     "/v1/projects": {
@@ -824,14 +814,24 @@
           "200": {
             "description": "Project registry"
           }
-        }
+        },
+        "security": [
+          {
+            "RecorderPrincipal": []
+          }
+        ]
       },
       "post": {
         "responses": {
           "201": {
             "description": "Project"
           }
-        }
+        },
+        "security": [
+          {
+            "RecorderPrincipal": []
+          }
+        ]
       }
     },
     "/v1/projects/search": {
@@ -848,7 +848,12 @@
           "200": {
             "description": "Project search"
           }
-        }
+        },
+        "security": [
+          {
+            "RecorderPrincipal": []
+          }
+        ]
       }
     },
     "/v1/projects/{project_id}": {
@@ -865,7 +870,12 @@
           "200": {
             "description": "Project"
           }
-        }
+        },
+        "security": [
+          {
+            "RecorderPrincipal": []
+          }
+        ]
       },
       "parameters": [
         {
@@ -885,7 +895,12 @@
           "200": {
             "description": "CAS update"
           }
-        }
+        },
+        "security": [
+          {
+            "RecorderPrincipal": []
+          }
+        ]
       }
     },
     "/v1/projects/{project_id}/archive": {
@@ -907,7 +922,12 @@
           "200": {
             "description": "Archive-only transition"
           }
-        }
+        },
+        "security": [
+          {
+            "RecorderPrincipal": []
+          }
+        ]
       }
     },
     "/v1/schedules/{schedule_id}": {
@@ -932,7 +952,12 @@
           "200": {
             "description": "Schedule and occurrence readback"
           }
-        }
+        },
+        "security": [
+          {
+            "RecorderPrincipal": []
+          }
+        ]
       }
     },
     "/v1/tts/{artifact_id}": {
@@ -959,6 +984,11 @@
             "description": "TTS payload is unavailable"
           }
         },
+        "security": [
+          {
+            "RecorderPrincipal": []
+          }
+        ],
         "summary": "Read target TTS or bridge it through an authenticated registered Phone"
       }
     },
@@ -986,6 +1016,11 @@
             "description": "TTS payload is unavailable"
           }
         },
+        "security": [
+          {
+            "RecorderPrincipal": []
+          }
+        ],
         "summary": "Read Watch-targeted TTS through an authenticated registered Phone bridge"
       }
     },
@@ -1020,6 +1055,11 @@
             "description": "Receipt does not match the stored artifact"
           }
         },
+        "security": [
+          {
+            "RecorderPrincipal": []
+          }
+        ],
         "summary": "Complete playback on the actual TTS delivery target"
       }
     },
@@ -1044,7 +1084,12 @@
           "200": {
             "description": "Non-origin relay receipt"
           }
-        }
+        },
+        "security": [
+          {
+            "RecorderPrincipal": []
+          }
+        ]
       }
     },
     "/v1/turns": {
@@ -1070,6 +1115,11 @@
             "description": "TURN_ID_CONFLICT"
           }
         },
+        "security": [
+          {
+            "RecorderPrincipal": []
+          }
+        ],
         "summary": "Create an immutable turn envelope or complete a text turn"
       }
     },
@@ -1090,7 +1140,12 @@
           "200": {
             "description": "Turn ledger"
           }
-        }
+        },
+        "security": [
+          {
+            "RecorderPrincipal": []
+          }
+        ]
       }
     },
     "/v1/turns/{turn_id}/accept": {
@@ -1117,7 +1172,12 @@
           "409": {
             "description": "Incomplete parts"
           }
-        }
+        },
+        "security": [
+          {
+            "RecorderPrincipal": []
+          }
+        ]
       }
     },
     "/v1/turns/{turn_id}/archive": {
@@ -1139,7 +1199,12 @@
           "200": {
             "description": "Archive-only turn retention"
           }
-        }
+        },
+        "security": [
+          {
+            "RecorderPrincipal": []
+          }
+        ]
       }
     },
     "/v1/turns/{turn_id}/events/{event_id}/ack": {
@@ -1166,7 +1231,12 @@
           "200": {
             "description": "Event ACK"
           }
-        }
+        },
+        "security": [
+          {
+            "RecorderPrincipal": []
+          }
+        ]
       }
     },
     "/v1/turns/{turn_id}/parts/{part_id}/chunks/{sequence}": {
@@ -1197,7 +1267,12 @@
           "409": {
             "description": "Chunk conflict"
           }
-        }
+        },
+        "security": [
+          {
+            "RecorderPrincipal": []
+          }
+        ]
       }
     },
     "/v1/turns/{turn_id}/parts/{part_id}/finish": {
@@ -1232,7 +1307,12 @@
           "200": {
             "description": "Verified part"
           }
-        }
+        },
+        "security": [
+          {
+            "RecorderPrincipal": []
+          }
+        ]
       }
     },
     "/v1/turns/{turn_id}/parts/{part_id}/missing": {
@@ -1249,7 +1329,12 @@
           "200": {
             "description": "Missing sequence list"
           }
-        }
+        },
+        "security": [
+          {
+            "RecorderPrincipal": []
+          }
+        ]
       },
       "parameters": [
         {

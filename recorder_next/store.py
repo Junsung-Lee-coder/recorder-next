@@ -11,7 +11,7 @@ import sqlite3
 import threading
 import uuid
 from pathlib import Path
-from typing import Any, Callable, Iterator, Mapping
+from typing import Any, Callable, Iterator, Mapping, Sequence
 from urllib.parse import quote
 
 from .canonical import canonical_json, hermes_content_hash, normalize_hermes_text, sha256_bytes, sha256_json
@@ -42,6 +42,7 @@ TERMINAL_TURN_STATES = {"DELIVERED", "FAILED_PERMANENT", "EXPIRED"}
 FINAL_ERROR_MESSAGES = {
     "routing": "요청을 처리할 프로젝트를 결정하지 못했습니다.",
     "asr": "음성을 인식하지 못했습니다. 원본은 보존되어 다시 시도할 수 있습니다.",
+    "no_speech": "음성이 감지되지 않았습니다.",
     "hermes": "요청 처리가 지연되고 있습니다. 잠시 후 프로젝트 세션에서 다시 확인해 주세요.",
     "schedule": "예약을 저장하지 못했습니다. 성공으로 처리하지 않고 다시 시도할 수 있도록 보존했습니다.",
 }
@@ -142,6 +143,12 @@ class RecorderStore:
                 self._apply_eavesdrop_migration(conn)
                 conn.execute("UPDATE schema_meta SET value='4' WHERE key='schema_version'")
                 version = 4
+            # Worker receipt fields are additive to the schema-4 worker
+            # tables. Keep startup compatible with an already-created schema
+            # without dropping rows or changing the schema version contract.
+            self._ensure_worker_receipt_columns(conn)
+            self._ensure_lease_token_columns(conn)
+            self._ensure_finish_columns(conn)
             conn.execute("INSERT OR IGNORE INTO schema_meta(key, value) VALUES ('schema_version', '4')")
         finally:
             conn.close()
@@ -257,6 +264,26 @@ class RecorderStore:
             statements.append(line)
         conn.executescript("\n".join(statements))
 
+
+    @staticmethod
+    def _ensure_worker_receipt_columns(conn: sqlite3.Connection) -> None:
+        for table, column in (("worker_jobs", "last_error_status_code"), ("worker_attempts", "error_status_code")):
+            columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+            if column not in columns:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} INTEGER")
+
+    @staticmethod
+    def _ensure_lease_token_columns(conn: sqlite3.Connection) -> None:
+        for table in ("session_ingress", "worker_jobs"):
+            columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+            if "lease_token" not in columns:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN lease_token TEXT")
+
+    @staticmethod
+    def _ensure_finish_columns(conn: sqlite3.Connection) -> None:
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(turn_parts)").fetchall()}
+        if "duration_ms" not in columns:
+            conn.execute("ALTER TABLE turn_parts ADD COLUMN duration_ms INTEGER")
 
     def _now(self) -> str:
         if self._clock is None:
@@ -442,6 +469,10 @@ class RecorderStore:
         with self._tx() as conn:
             self._complete_cleanup_receipt_tx(conn, receipt_id, now=now)
 
+    def _discard_cleanup_receipt(self, receipt_id: str) -> None:
+        with self._tx() as conn:
+            conn.execute("DELETE FROM storage_cleanup_receipts WHERE receipt_id=? AND status='PENDING'", (receipt_id,))
+
     def recover_cleanup_receipts(
         self,
         *,
@@ -602,7 +633,7 @@ class RecorderStore:
             raise QuotaExceeded("turn exceeds configured byte limit")
         if self.min_free_bytes and shutil.disk_usage(self.storage_root).free < self.min_free_bytes + known_total:
             raise QuotaExceeded("configured minimum free disk space is not available")
-        now = utc_now()
+        now = self._now()
         with self._tx() as conn:
             if require_registered_device:
                 self._assert_device(conn, manifest["user_id"], manifest["origin_device_id"])
@@ -658,7 +689,7 @@ class RecorderStore:
     def register_device(self, user_id: str, device_id: str, kind: str) -> dict[str, Any]:
         if not user_id or not device_id or kind not in {"phone", "watch", "other"}:
             raise ValidationError("user_id, device_id, and supported device kind are required")
-        now = utc_now()
+        now = self._now()
         with self._tx() as conn:
             conn.execute(
                 "INSERT INTO devices(user_id, device_id, kind, status, created_at) VALUES (?, ?, ?, 'active', ?) ON CONFLICT(user_id, device_id) DO UPDATE SET kind=excluded.kind, status='active', revoked_at=NULL",
@@ -679,7 +710,7 @@ class RecorderStore:
                 self._assert_device(conn, user_id, actor_device_id)
             updated = conn.execute(
                 "UPDATE devices SET status='revoked', revoked_at=? WHERE user_id=? AND device_id=? AND status='active'",
-                (utc_now(), user_id, device_id),
+                (self._now(), user_id, device_id),
             ).rowcount
             if not updated:
                 raise NotFoundError("active device not found")
@@ -747,15 +778,25 @@ class RecorderStore:
         digest = sha256_bytes(payload)
         if expected_sha256 is not None and expected_sha256 != digest:
             raise ConflictError("chunk sha256 does not match payload")
-        now = utc_now()
+        now = self._now()
         with self._read() as conn:
             turn = self._turn_row(conn, turn_id)
             self._assert_turn_owner_tx(conn, turn, user_id, device_id)
             part = conn.execute(
-                "SELECT part_id FROM turn_parts WHERE turn_id = ? AND part_id = ?", (turn_id, part_id)
+                "SELECT part_id, status FROM turn_parts WHERE turn_id = ? AND part_id = ?", (turn_id, part_id)
             ).fetchone()
             if part is None:
                 raise NotFoundError("part not found")
+            existing = conn.execute(
+                "SELECT * FROM turn_chunks WHERE turn_id=? AND part_id=? AND sequence=?",
+                (turn_id, part_id, sequence),
+            ).fetchone()
+            if existing is not None:
+                if existing["sha256"] == digest and existing["byte_length"] == len(payload):
+                    return {"duplicate": True, **(_row(existing) or {})}
+                raise ChunkConflict("same chunk sequence has a different hash")
+            if part["status"] == "COMPLETE" or turn["state"] != "RECEIVING":
+                raise ConflictError("completed or terminal turns accept only exact existing chunk replays")
             path = self._part_dir(turn["user_id"], turn_id, part_id) / f"{sequence:08d}.chunk"
         receipt_id = self._prepare_cleanup_receipt(
             operation="turn_chunk_rollback",
@@ -768,6 +809,7 @@ class RecorderStore:
             entity_id=f"{turn_id}:{part_id}:{sequence}",
             now=now,
         )
+        write_started = False
         try:
             with self._tx() as conn:
                 turn = self._turn_row(conn, turn_id)
@@ -786,6 +828,8 @@ class RecorderStore:
                         self._complete_cleanup_receipt_tx(conn, receipt_id, now=now)
                         return {"duplicate": True, **(_row(existing) or {})}
                     raise ChunkConflict("same chunk sequence has a different hash")
+                if part["status"] == "COMPLETE" or turn["state"] != "RECEIVING":
+                    raise ConflictError("completed or terminal turns accept only exact existing chunk replays")
                 previous_bytes = conn.execute(
                     "SELECT COALESCE(SUM(byte_length), 0) FROM turn_chunks WHERE turn_id=? AND part_id=?",
                     (turn_id, part_id),
@@ -809,7 +853,10 @@ class RecorderStore:
                     ).fetchone()[0]
                     if int(user_bytes) + len(payload) > self.max_user_storage_bytes:
                         raise QuotaExceeded("user storage quota would be exceeded")
+                if self.min_free_bytes and shutil.disk_usage(self.storage_root).free < self.min_free_bytes + len(payload):
+                    raise QuotaExceeded("configured minimum free disk space is not available")
                 path = self._part_dir(turn["user_id"], turn_id, part_id) / f"{sequence:08d}.chunk"
+                write_started = True
                 self._safe_write(path, payload)
                 conn.execute(
                     "INSERT INTO turn_chunks(turn_id, part_id, sequence, byte_length, sha256, storage_path, received_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -826,6 +873,9 @@ class RecorderStore:
                     "storage_path": str(path),
                 }
         except Exception as exc:
+            if not write_started:
+                self._discard_cleanup_receipt(receipt_id)
+                raise
             cleanup = self.recover_cleanup_receipts(receipt_ids=[receipt_id], now=now)
             if cleanup["pending"] or cleanup["blocked"]:
                 raise CleanupIncompleteError("chunk rollback cleanup is incomplete") from exc
@@ -1008,7 +1058,12 @@ class RecorderStore:
                 if duration_ms > self.max_audio_minutes * 60 * 1000:
                     raise QuotaExceeded("audio duration exceeds configured minute limit")
             if part["status"] == "COMPLETE":
-                if part["whole_stream_sha256"] == whole_stream_sha256 and part["total_chunks"] == total_chunks:
+                if (
+                    part["whole_stream_sha256"] == whole_stream_sha256
+                    and part["total_chunks"] == total_chunks
+                    and part["total_bytes"] == total_bytes
+                    and part["duration_ms"] == duration_ms
+                ):
                     return _row(part) or {}
                 raise ChunkConflict("completed part was finished with a different manifest")
             rows = conn.execute(
@@ -1041,8 +1096,8 @@ class RecorderStore:
             assembled_path = self._part_dir(turn["user_id"], turn_id, part_id) / "part.bin"
             self._safe_write(assembled_path, bytes(assembled))
             conn.execute(
-                "UPDATE turn_parts SET total_chunks=?, total_bytes=?, whole_stream_sha256=?, status='COMPLETE', source_path=? WHERE turn_id=? AND part_id=?",
-                (total_chunks, total_bytes, actual, str(assembled_path), turn_id, part_id),
+                "UPDATE turn_parts SET total_chunks=?, total_bytes=?, whole_stream_sha256=?, duration_ms=?, status='COMPLETE', source_path=? WHERE turn_id=? AND part_id=?",
+                (total_chunks, total_bytes, actual, duration_ms, str(assembled_path), turn_id, part_id),
             )
             return _row(
                 conn.execute(
@@ -1091,12 +1146,40 @@ class RecorderStore:
         now: str | None = None,
         user_id: str | None = None,
         device_id: str | None = None,
+        enqueue_worker_job: bool = False,
+        provider_chain: Any | None = None,
+        max_attempts: int = 3,
+        deadline_seconds: int = 300,
     ) -> dict[str, Any]:
-        now = now or utc_now()
+        now = now or self._now()
+        if not isinstance(enqueue_worker_job, bool):
+            raise ValidationError("enqueue_worker_job must be a boolean")
+        if not isinstance(max_attempts, int) or isinstance(max_attempts, bool) or not 1 <= max_attempts <= 100:
+            raise ValidationError("max_attempts must be between 1 and 100")
+        if not isinstance(deadline_seconds, int) or isinstance(deadline_seconds, bool) or not 1 <= deadline_seconds <= 1800:
+            raise ValidationError("deadline_seconds must be between 1 and 1800")
         with self._tx() as conn:
             turn = self._turn_row(conn, turn_id)
             self._assert_turn_owner_tx(conn, turn, user_id, device_id)
             if turn["state"] != "RECEIVING":
+                if enqueue_worker_job and turn["state"] in {"ACCEPTED", "ASR_PENDING"}:
+                    audio = conn.execute(
+                        "SELECT 1 FROM turn_parts WHERE turn_id=? AND kind='audio' LIMIT 1",
+                        (turn_id,),
+                    ).fetchone() is not None
+                    stage = "asr" if audio else "route"
+                    self._features._enqueue_worker_job_tx(
+                        conn,
+                        kind=stage,
+                        stage=stage,
+                        payload={"turn_id": turn_id, "user_id": turn["user_id"]},
+                        idempotency_key=f"turn:{turn_id}:{stage}",
+                        max_attempts=max_attempts,
+                        now=now,
+                        next_attempt_at=now,
+                        provider_chain=provider_chain.freeze() if hasattr(provider_chain, "freeze") else provider_chain,
+                        overall_deadline_at=(dt.datetime.fromisoformat(now) + dt.timedelta(seconds=deadline_seconds)).isoformat(timespec="milliseconds"),
+                    )
                 return self._turn_payload(conn, turn_id)
             if not self._all_parts_complete(conn, turn_id):
                 raise MissingParts("all declared parts must be complete before ACCEPTED")
@@ -1132,7 +1215,36 @@ class RecorderStore:
                 "INSERT INTO router_queue(turn_id, user_id, accepted_seq, state, updated_at) VALUES (?, ?, ?, 'QUEUED', ?)",
                 (turn_id, turn["user_id"], accepted_seq, now),
             )
+            if enqueue_worker_job:
+                audio = conn.execute(
+                    "SELECT 1 FROM turn_parts WHERE turn_id=? AND kind='audio' LIMIT 1",
+                    (turn_id,),
+                ).fetchone() is not None
+                stage = "asr" if audio else "route"
+                self._features._enqueue_worker_job_tx(
+                    conn,
+                    kind=stage,
+                    stage=stage,
+                    payload={"turn_id": turn_id, "user_id": turn["user_id"]},
+                    idempotency_key=f"turn:{turn_id}:{stage}",
+                    max_attempts=max_attempts,
+                    now=now,
+                    next_attempt_at=now,
+                    provider_chain=provider_chain.freeze() if hasattr(provider_chain, "freeze") else provider_chain,
+                    overall_deadline_at=(dt.datetime.fromisoformat(now) + dt.timedelta(seconds=deadline_seconds)).isoformat(timespec="milliseconds"),
+                )
             return self._turn_payload(conn, turn_id)
+
+    def list_accepted_turns(self, *, limit: int = 500) -> list[dict[str, Any]]:
+        """Return a bounded page for idempotent acceptance-job recovery."""
+        if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 5000:
+            raise ValidationError("accepted-turn recovery limit is invalid")
+        with self._read() as conn:
+            rows = conn.execute(
+                "SELECT turn_id FROM turns WHERE state IN ('ACCEPTED','ASR_PENDING') ORDER BY accepted_seq, turn_id LIMIT ?",
+                (limit,),
+            ).fetchall()
+            return [self._turn_payload(conn, row["turn_id"]) for row in rows]
 
     def _insert_event_tx(
         self,
@@ -1163,7 +1275,7 @@ class RecorderStore:
         event_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"recorder-next:event:{turn_id}:{event_kind}:{event_version}"))
         payload_json = _json(dict(payload))
         payload_sha = sha256_bytes(canonical_json(dict(payload)))
-        now = created_at or utc_now()
+        now = created_at or self._now()
         conn.execute(
             "INSERT INTO events(event_id, turn_id, event_kind, event_version, turn_event_seq, payload_sha256, required_device_id, outcome, error_kind, payload_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (event_id, turn_id, event_kind, event_version, turn_event_seq, payload_sha, required_device_id, outcome, error_kind, payload_json, now),
@@ -1209,7 +1321,7 @@ class RecorderStore:
             return _row(existing) or {}
         turn = self._turn_row(conn, turn_id)
         artifact_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"recorder-next:tts:{turn_id}:{event_kind}:{artifact_version}"))
-        now = created_at or utc_now()
+        now = created_at or self._now()
         expires_at = None
         if self.tts_artifact_ttl_seconds > 0:
             expires_at = (dt.datetime.fromisoformat(now.replace("Z", "+00:00")) + dt.timedelta(seconds=self.tts_artifact_ttl_seconds)).isoformat(timespec="milliseconds")
@@ -1256,14 +1368,24 @@ class RecorderStore:
             "manifest": manifest,
         }
 
-    def claim_router(self, user_id: str, owner: str, *, lease_seconds: int = 30, now: str | None = None) -> dict[str, Any] | None:
-        now = now or utc_now()
+    def claim_router(self, user_id: str, owner: str, *, turn_id: str | None = None, lease_seconds: int = 30, now: str | None = None) -> dict[str, Any] | None:
+        now = now or self._now()
         expires = (dt.datetime.fromisoformat(now) + dt.timedelta(seconds=lease_seconds)).isoformat(timespec="milliseconds")
         with self._tx() as conn:
-            row = conn.execute(
-                "SELECT q.* FROM router_queue q WHERE q.user_id=? AND q.state IN ('QUEUED','IN_PROGRESS') AND (q.state='QUEUED' OR q.lease_expires_at <= ?) ORDER BY q.accepted_seq LIMIT 1",
-                (user_id, now),
-            ).fetchone()
+            conn.execute(
+                "UPDATE router_queue SET state='DONE', lease_owner=NULL, lease_expires_at=NULL, updated_at=? WHERE user_id=? AND state IN ('QUEUED','IN_PROGRESS') AND EXISTS (SELECT 1 FROM turns t WHERE t.turn_id=router_queue.turn_id AND t.final_event_version > 0)",
+                (now, user_id),
+            )
+            if turn_id is None:
+                row = conn.execute(
+                    "SELECT q.* FROM router_queue q WHERE q.user_id=? AND q.state IN ('QUEUED','IN_PROGRESS') AND (q.state='QUEUED' OR q.lease_expires_at <= ?) ORDER BY q.accepted_seq LIMIT 1",
+                    (user_id, now),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT q.* FROM router_queue q WHERE q.user_id=? AND q.turn_id=? AND q.state IN ('QUEUED','IN_PROGRESS') AND (q.state='QUEUED' OR q.lease_expires_at <= ?)",
+                    (user_id, turn_id, now),
+                ).fetchone()
             if row is None:
                 return None
             # A lower sequence still pending blocks the candidate. DONE/FAILED rows are complete.
@@ -1284,7 +1406,7 @@ class RecorderStore:
             return result
 
     def renew_router_lease(self, turn_id: str, owner: str, *, lease_seconds: int = 30, now: str | None = None) -> bool:
-        now = now or utc_now()
+        now = now or self._now()
         expires = (dt.datetime.fromisoformat(now) + dt.timedelta(seconds=lease_seconds)).isoformat(timespec="milliseconds")
         with self._tx() as conn:
             return bool(
@@ -1301,11 +1423,13 @@ class RecorderStore:
         if row is None or row["state"] != "IN_PROGRESS" or row["lease_owner"] != owner or row["lease_expires_at"] <= now:
             raise LeaseConflict("router lease is not owned or has expired")
 
-    def commit_route(self, turn_id: str, decision: RouterDecision | Mapping[str, Any], *, owner: str | None = None, now: str | None = None) -> dict[str, Any]:
+    def commit_route(self, turn_id: str, decision: RouterDecision | Mapping[str, Any], *, owner: str | None = None, now: str | None = None, worker_claim: Mapping[str, Any] | None = None) -> dict[str, Any]:
         if not isinstance(decision, RouterDecision):
             decision = RouterDecision(**dict(decision))
-        now = now or utc_now()
+        now = now or self._now()
         with self._tx() as conn:
+            if worker_claim is not None and not self._features._assert_worker_effect_tx(conn, worker_claim, now=now, stage="route", turn_id=turn_id):
+                raise LeaseConflict("worker route effect deadline has expired")
             turn = self._turn_row(conn, turn_id)
             existing = conn.execute("SELECT * FROM route_receipts WHERE turn_id=?", (turn_id,)).fetchone()
             if existing is not None:
@@ -1325,6 +1449,10 @@ class RecorderStore:
             self._assert_router_lease_tx(conn, turn_id, owner, now)
             if turn["state"] not in {"ACCEPTED", "ROUTING", "RETRY_WAIT"}:
                 if turn["state"] in {"ROUTED", "HERMES_PENDING", "FINAL_READY", "DELIVERED"}:
+                    conn.execute(
+                        "UPDATE router_queue SET state='DONE', lease_owner=NULL, lease_expires_at=NULL, updated_at=? WHERE turn_id=? AND state='IN_PROGRESS' AND (lease_owner=? OR ? IS NULL)",
+                        (now, turn_id, owner, owner),
+                    )
                     return self._turn_payload(conn, turn_id)
                 raise ConflictError(f"turn cannot be routed from {turn['state']}")
             project = conn.execute(
@@ -1390,6 +1518,21 @@ class RecorderStore:
                 "UPDATE turns SET state='HERMES_PENDING', route_decision_id=?, project_id=?, session_key=?, updated_at=? WHERE turn_id=?",
                 (decision.route_decision_id, decision.project_id, decision.session_key, now, turn_id),
             )
+            self._features._enqueue_worker_job_tx(
+                conn,
+                kind="hermes",
+                stage="hermes",
+                payload={
+                    "turn_id": turn_id,
+                    "session_id": decision.project_id,
+                    "hermes_submission_id": submission_id,
+                },
+                idempotency_key=f"turn:{turn_id}:hermes",
+                max_attempts=2,
+                now=now,
+                next_attempt_at=now,
+                overall_deadline_at=(dt.datetime.fromisoformat(now) + dt.timedelta(seconds=300)).isoformat(timespec="milliseconds"),
+            )
             if owner is not None:
                 conn.execute(
                     "UPDATE router_queue SET state='DONE', lease_owner=NULL, lease_expires_at=NULL, updated_at=? WHERE turn_id=? AND state='IN_PROGRESS' AND lease_owner=?",
@@ -1402,9 +1545,11 @@ class RecorderStore:
                 )
             return self._turn_payload(conn, turn_id)
 
-    def commit_routing_error(self, turn_id: str, *, owner: str | None = None, now: str | None = None) -> dict[str, Any]:
-        now = now or utc_now()
+    def commit_routing_error(self, turn_id: str, *, owner: str | None = None, now: str | None = None, worker_claim: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        now = now or self._now()
         with self._tx() as conn:
+            if worker_claim is not None and not self._features._assert_worker_effect_tx(conn, worker_claim, now=now, stage="route", turn_id=turn_id):
+                raise LeaseConflict("worker routing error effect deadline has expired")
             turn = self._turn_row(conn, turn_id)
             self._assert_router_lease_tx(conn, turn_id, owner, now)
             if turn["final_event_version"]:
@@ -1434,6 +1579,7 @@ class RecorderStore:
         source_ref: str,
     ) -> dict[str, Any]:
         turn = self._turn_row(conn, turn_id)
+        timestamp = self._now()
         version = int(turn["final_event_version"]) + 1
         normalized = normalize_hermes_text(message)
         previous = turn["final_content"]
@@ -1445,7 +1591,7 @@ class RecorderStore:
         final_ref = source_ref
         conn.execute(
             "INSERT INTO final_versions(turn_id, event_version, source, outcome, error_kind, source_ref, content_hash, combined_content_hash, combined_content, committed_at) VALUES (?, ?, 'recorder_protocol', 'error', ?, ?, ?, ?, ?, ?)",
-            (turn_id, version, error_kind, final_ref, content_hash, combined_hash, None, utc_now()),
+            (turn_id, version, error_kind, final_ref, content_hash, combined_hash, None, timestamp),
         )
         payload = {
             "type": "FINAL",
@@ -1479,18 +1625,20 @@ class RecorderStore:
         grace_until = None
         state = "FINAL_READY"
         if grace_seconds:
-            grace_until = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=grace_seconds)).isoformat(timespec="milliseconds")
+            grace_until = (dt.datetime.fromisoformat(timestamp) + dt.timedelta(seconds=grace_seconds)).isoformat(timespec="milliseconds")
             state = "LATE_RESULT_GRACE"
         conn.execute(
             "UPDATE turns SET final_event_version=?, final_combined_hash=?, final_content=?, final_outcome='error', final_error_kind=?, grace_until=?, state=?, updated_at=? WHERE turn_id=?",
-            (version, combined_hash, combined, error_kind, grace_until, state, utc_now(), turn_id),
+            (version, combined_hash, combined, error_kind, grace_until, state, timestamp, turn_id),
         )
         return self._turn_payload(conn, turn_id)
 
-    def commit_protocol_error(self, turn_id: str, error_kind: str, *, grace_seconds: int = 0, message: str | None = None) -> dict[str, Any]:
+    def commit_protocol_error(self, turn_id: str, error_kind: str, *, grace_seconds: int = 0, message: str | None = None, worker_claim: Mapping[str, Any] | None = None) -> dict[str, Any]:
         if error_kind not in FINAL_ERROR_MESSAGES:
             raise ValidationError("unsupported protocol error kind")
         with self._tx() as conn:
+            if worker_claim is not None and not self._features._assert_worker_effect_tx(conn, worker_claim, now=self._now(), stage="asr", turn_id=turn_id):
+                raise LeaseConflict("worker protocol effect deadline has expired")
             turn = self._turn_row(conn, turn_id)
             if turn["final_event_version"] and error_kind != "hermes":
                 return self._turn_payload(conn, turn_id)
@@ -1503,14 +1651,28 @@ class RecorderStore:
                 source_ref=f"recorder_protocol:{error_kind}",
             )
 
-    def claim_session_ingress(self, target_session_id: str, owner: str, *, lease_seconds: int = 30, now: str | None = None) -> dict[str, Any] | None:
-        now = now or utc_now()
+    def claim_session_ingress(
+        self,
+        target_session_id: str,
+        owner: str,
+        *,
+        hermes_submission_id: str | None = None,
+        lease_seconds: int = 30,
+        now: str | None = None,
+    ) -> dict[str, Any] | None:
+        now = now or self._now()
         expires = (dt.datetime.fromisoformat(now) + dt.timedelta(seconds=lease_seconds)).isoformat(timespec="milliseconds")
         with self._tx() as conn:
-            row = conn.execute(
-                "SELECT * FROM session_ingress WHERE target_session_id=? AND status IN ('QUEUED','IN_PROGRESS') AND (status='QUEUED' OR lease_expires_at <= ?) ORDER BY accepted_seq LIMIT 1",
-                (target_session_id, now),
-            ).fetchone()
+            if hermes_submission_id is None:
+                row = conn.execute(
+                    "SELECT * FROM session_ingress WHERE target_session_id=? AND status IN ('QUEUED','IN_PROGRESS') AND (status='QUEUED' OR lease_expires_at <= ?) ORDER BY accepted_seq LIMIT 1",
+                    (target_session_id, now),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT * FROM session_ingress WHERE hermes_submission_id=? AND target_session_id=? AND status IN ('QUEUED','IN_PROGRESS') AND (status='QUEUED' OR lease_expires_at <= ?)",
+                    (hermes_submission_id, target_session_id, now),
+                ).fetchone()
             if row is None:
                 return None
             earlier = conn.execute(
@@ -1519,9 +1681,11 @@ class RecorderStore:
             ).fetchone()
             if earlier is not None:
                 return None
+            attempt = int(row["attempt_count"]) + 1
+            lease_token = str(uuid.uuid5(uuid.NAMESPACE_URL, f"recorder-next:hermes-lease:{row['hermes_submission_id']}:{attempt}"))
             updated = conn.execute(
-                "UPDATE session_ingress SET status='IN_PROGRESS', lease_owner=?, lease_expires_at=?, attempt_count=attempt_count+1, updated_at=? WHERE hermes_submission_id=? AND (status='QUEUED' OR (status='IN_PROGRESS' AND lease_expires_at <= ?))",
-                (owner, expires, now, row["hermes_submission_id"], now),
+                "UPDATE session_ingress SET status='IN_PROGRESS', lease_owner=?, lease_token=?, lease_expires_at=?, attempt_count=attempt_count+1, updated_at=? WHERE hermes_submission_id=? AND target_session_id=? AND (status='QUEUED' OR (status='IN_PROGRESS' AND lease_expires_at <= ?))",
+                (owner, lease_token, expires, now, row["hermes_submission_id"], target_session_id, now),
             ).rowcount
             if not updated:
                 return None
@@ -1538,19 +1702,55 @@ class RecorderStore:
             result["payload"] = _loads(result.pop("payload_json"), {})
             return result
 
+    def get_ingress_for_turn(self, turn_id: str) -> dict[str, Any] | None:
+        with self._read() as conn:
+            row = conn.execute("SELECT * FROM session_ingress WHERE turn_id=?", (turn_id,)).fetchone()
+            if row is None:
+                return None
+            result = _row(row) or {}
+            result["payload"] = _loads(result.pop("payload_json"), {})
+            return result
+
     def _get_submission_tx(self, conn: sqlite3.Connection, submission_id: str) -> sqlite3.Row:
         row = conn.execute("SELECT * FROM session_ingress WHERE hermes_submission_id=?", (submission_id,)).fetchone()
         if row is None:
             raise NotFoundError("session ingress not found")
         return row
 
-    def commit_hermes_result(self, submission_id: str, result: HermesResult | Mapping[str, Any], *, combined_content: str | None = None) -> dict[str, Any]:
+    def _assert_ingress_claim_tx(self, conn: sqlite3.Connection, submission_id: str, owner: str, lease_token: str, now: str) -> sqlite3.Row:
+        row = self._get_submission_tx(conn, submission_id)
+        if row["status"] != "IN_PROGRESS" or row["lease_owner"] != owner or row["lease_token"] != lease_token or not row["lease_expires_at"] or row["lease_expires_at"] <= now:
+            raise LeaseConflict("Hermes ingress lease is not owned or has expired")
+        return row
+
+    def commit_hermes_result(
+        self,
+        submission_id: str,
+        result: HermesResult | Mapping[str, Any],
+        *,
+        combined_content: str | None = None,
+        owner: str | None = None,
+        lease_token: str | None = None,
+        now: str | None = None,
+        worker_claim: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
         if not isinstance(result, HermesResult):
-            result = HermesResult(**dict(result))
-        if not result.terminal or not result.content:
+            try:
+                result = HermesResult(**dict(result))
+            except (TypeError, ValueError) as exc:
+                raise ValidationError("Hermes result envelope is malformed") from exc
+        if result.terminal is not True or not isinstance(result.assistant_message_id, str) or not result.assistant_message_id or not isinstance(result.content, str) or not normalize_hermes_text(result.content):
             raise ValidationError("only non-empty terminal Hermes assistant results are accepted")
+        timestamp = now or self._now()
         with self._tx() as conn:
-            ingress = self._get_submission_tx(conn, submission_id)
+            if worker_claim is not None and not self._features._assert_worker_effect_tx(conn, worker_claim, now=timestamp, stage="hermes"):
+                raise LeaseConflict("worker Hermes effect deadline has expired")
+            if owner is not None:
+                if not isinstance(lease_token, str) or not lease_token:
+                    raise LeaseConflict("Hermes ingress lease token is required")
+                ingress = self._assert_ingress_claim_tx(conn, submission_id, owner, lease_token, timestamp)
+            else:
+                ingress = self._get_submission_tx(conn, submission_id)
             return self._commit_hermes_result_tx(conn, ingress, result, combined_content=combined_content)
 
     def _commit_hermes_result_tx(self, conn: sqlite3.Connection, ingress: sqlite3.Row, result: HermesResult, *, combined_content: str | None = None) -> dict[str, Any]:
@@ -1560,7 +1760,7 @@ class RecorderStore:
         if turn["final_error_kind"] == "hermes" and turn["state"] in {"EXPIRED", "FAILED_PERMANENT"}:
             conn.execute(
                 "INSERT INTO audit_events(audit_id, user_id, turn_id, kind, details_json, created_at) VALUES (?, ?, ?, 'late_hermes_result_ignored', ?, ?)",
-                (str(uuid.uuid4()), turn["user_id"], turn["turn_id"], _json({"assistant_message_id": result.assistant_message_id, "content_hash": content_hash}), utc_now()),
+                (str(uuid.uuid4()), turn["user_id"], turn["turn_id"], _json({"assistant_message_id": result.assistant_message_id, "content_hash": content_hash}), self._now()),
             )
             return self._turn_payload(conn, turn["turn_id"])
         existing_result = conn.execute(
@@ -1573,7 +1773,7 @@ class RecorderStore:
         result_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"recorder-next:hermes-result:{ingress['hermes_submission_id']}:{content_hash}"))
         conn.execute(
             "INSERT INTO hermes_results(result_id, hermes_submission_id, attempt_seq, assistant_message_id, content_hash, normalized_content, source, committed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (result_id, ingress["hermes_submission_id"], attempt_seq, result.assistant_message_id, content_hash, None, result.source, utc_now()),
+            (result_id, ingress["hermes_submission_id"], attempt_seq, result.assistant_message_id, content_hash, None, result.source, self._now()),
         )
         version = int(turn["final_event_version"]) + 1
         if combined_content is not None:
@@ -1589,7 +1789,7 @@ class RecorderStore:
         recovered = turn["final_outcome"] == "error" and turn["final_error_kind"] == "hermes"
         conn.execute(
             "INSERT INTO final_versions(turn_id, event_version, source, outcome, error_kind, source_ref, content_hash, combined_content_hash, combined_content, committed_at) VALUES (?, ?, ?, 'success', NULL, ?, ?, ?, ?, ?)",
-            (turn["turn_id"], version, result.source, result.assistant_message_id, content_hash, combined_hash, None, utc_now()),
+            (turn["turn_id"], version, result.source, result.assistant_message_id, content_hash, combined_hash, None, self._now()),
         )
         payload = {
             "type": "FINAL",
@@ -1626,17 +1826,34 @@ class RecorderStore:
         state = turn["state"] if turn["state"] == "DELIVERED" else "FINAL_READY"
         conn.execute(
             "UPDATE turns SET final_event_version=?, final_combined_hash=?, final_content=?, final_outcome='success', final_error_kind=NULL, state=?, grace_until=NULL, updated_at=? WHERE turn_id=?",
-            (version, combined_hash, combined, state, utc_now(), turn["turn_id"]),
+            (version, combined_hash, combined, state, self._now(), turn["turn_id"]),
         )
         conn.execute(
-            "UPDATE session_ingress SET status='SUBMITTED', lease_owner=NULL, lease_expires_at=NULL, updated_at=? WHERE hermes_submission_id=?",
-            (utc_now(), ingress["hermes_submission_id"]),
+            "UPDATE session_ingress SET status='SUBMITTED', lease_owner=NULL, lease_token=NULL, lease_expires_at=NULL, updated_at=? WHERE hermes_submission_id=?",
+            (self._now(), ingress["hermes_submission_id"]),
         )
         return self._turn_payload(conn, turn["turn_id"])
 
-    def commit_hermes_error(self, submission_id: str, *, grace_seconds: int = 30) -> dict[str, Any]:
+    def commit_hermes_error(
+        self,
+        submission_id: str,
+        *,
+        grace_seconds: int = 30,
+        owner: str | None = None,
+        lease_token: str | None = None,
+        now: str | None = None,
+        worker_claim: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        timestamp = now or self._now()
         with self._tx() as conn:
-            ingress = self._get_submission_tx(conn, submission_id)
+            if worker_claim is not None and not self._features._assert_worker_effect_tx(conn, worker_claim, now=timestamp, stage="hermes"):
+                raise LeaseConflict("worker Hermes error effect deadline has expired")
+            if owner is not None:
+                if not isinstance(lease_token, str) or not lease_token:
+                    raise LeaseConflict("Hermes ingress lease token is required")
+                ingress = self._assert_ingress_claim_tx(conn, submission_id, owner, lease_token, timestamp)
+            else:
+                ingress = self._get_submission_tx(conn, submission_id)
             turn = self._turn_row(conn, ingress["turn_id"])
             if turn["final_outcome"] == "success":
                 return self._turn_payload(conn, turn["turn_id"])
@@ -1651,13 +1868,32 @@ class RecorderStore:
                 source_ref=f"recorder_protocol:hermes:{submission_id}",
             )
             conn.execute(
-                "UPDATE session_ingress SET status='FAILED', lease_owner=NULL, lease_expires_at=NULL, updated_at=? WHERE hermes_submission_id=?",
-                (utc_now(), submission_id),
+                "UPDATE session_ingress SET status='FAILED', lease_owner=NULL, lease_token=NULL, lease_expires_at=NULL, updated_at=? WHERE hermes_submission_id=?",
+                (timestamp, submission_id),
             )
+            if grace_seconds > 0:
+                history_deadline = (
+                    dt.datetime.fromisoformat(timestamp) + dt.timedelta(seconds=grace_seconds)
+                ).isoformat(timespec="milliseconds")
+                self._features._enqueue_worker_job_tx(
+                    conn,
+                    kind="hermes_history",
+                    stage="hermes",
+                    payload={
+                        "session_id": ingress["target_session_id"],
+                        "turn_id": ingress["turn_id"],
+                        "hermes_submission_id": submission_id,
+                    },
+                    idempotency_key=f"hermes-history:{submission_id}",
+                    max_attempts=100,
+                    now=timestamp,
+                    next_attempt_at=timestamp,
+                    overall_deadline_at=history_deadline,
+                )
             return result
 
     def expire_grace(self, turn_id: str, *, now: str | None = None) -> dict[str, Any]:
-        now = now or utc_now()
+        now = now or self._now()
         with self._tx() as conn:
             turn = self._turn_row(conn, turn_id)
             if turn["state"] != "LATE_RESULT_GRACE" or not turn["grace_until"] or turn["grace_until"] > now:
@@ -1677,7 +1913,7 @@ class RecorderStore:
         with self._read() as conn:
             ingress = self._get_submission_tx(conn, submission_id)
             turn = self._turn_row(conn, ingress["turn_id"])
-            return bool(turn["grace_until"] and turn["grace_until"] < utc_now() and turn["final_outcome"] == "error")
+            return bool(turn["grace_until"] and turn["grace_until"] < self._now() and turn["final_outcome"] == "error")
 
     def ack_event(
         self,
@@ -1690,7 +1926,7 @@ class RecorderStore:
         payload_sha256: str,
         now: str | None = None,
     ) -> dict[str, Any]:
-        now = now or utc_now()
+        now = now or self._now()
         with self._tx() as conn:
             turn = self._turn_row(conn, turn_id)
             self._assert_resource_owner_tx(conn, turn["user_id"], user_id, device_id)
@@ -1816,6 +2052,8 @@ class RecorderStore:
                     raise UnauthorizedError("TTS payload is bound to its delivery target or an authenticated Phone bridge")
             if row["status"] not in {"READY", "DELIVERY_PENDING"} or not row["storage_path"]:
                 raise NotReadyError("TTS artifact is not ready")
+            if row["expires_at"] is not None and row["expires_at"] <= self._now():
+                raise NotReadyError("TTS artifact has expired")
             path = Path(row["storage_path"])
             from .features import FeatureGroups
 
@@ -1861,7 +2099,15 @@ class RecorderStore:
             require_phone_bridge=True,
         )
 
-    def set_tts_result(self, artifact_id: str, result: TTSResult | Mapping[str, Any] | None, *, error: str | None = None) -> dict[str, Any]:
+    def set_tts_result(
+        self,
+        artifact_id: str,
+        result: TTSResult | Mapping[str, Any] | None,
+        *,
+        error: str | None = None,
+        error_metadata: Mapping[str, Any] | None = None,
+        worker_claim: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
         if result is not None and not isinstance(result, TTSResult):
             result = TTSResult(**dict(result))
         if result is not None:
@@ -1888,12 +2134,19 @@ class RecorderStore:
             artifact = conn.execute("SELECT * FROM tts_artifacts WHERE artifact_id=?", (artifact_id,)).fetchone()
             if artifact is None:
                 raise NotFoundError("TTS artifact not found")
+            if worker_claim is not None and not self._features._assert_worker_effect_tx(conn, worker_claim, now=self._now(), stage="tts", turn_id=artifact["turn_id"]):
+                return _row(artifact) or {}
             if artifact["status"] in {"READY", "DELIVERY_PENDING", "PLAYED", "EXPIRED"}:
                 return _row(artifact) or {}
             if error is not None or result is None:
-                now = utc_now()
+                now = self._now()
                 safe_error = error if isinstance(error, str) and re.fullmatch(r"[a-z][a-z0-9_.-]{0,63}", error) else "generation_failed"
-                conn.execute("UPDATE tts_artifacts SET status='FAILED_GENERATION', relay_state='PENDING', retention_outcome='generation_failed', provider_metadata_json=?, updated_at=? WHERE artifact_id=?", (_json({"error_kind": safe_error}), now, artifact_id))
+                safe_metadata: dict[str, Any] = {"error_kind": safe_error}
+                if isinstance(error_metadata, Mapping):
+                    status_code = error_metadata.get("status_code")
+                    if isinstance(status_code, int) and not isinstance(status_code, bool) and 100 <= status_code <= 599:
+                        safe_metadata["status_code"] = status_code
+                conn.execute("UPDATE tts_artifacts SET status='FAILED_GENERATION', relay_state='PENDING', retention_outcome='generation_failed', provider_metadata_json=?, updated_at=? WHERE artifact_id=?", (_json(safe_metadata), now, artifact_id))
                 return _row(conn.execute("SELECT * FROM tts_artifacts WHERE artifact_id=?", (artifact_id,)).fetchone()) or {}
             digest = sha256_bytes(result.audio)
             turn = self._turn_row(conn, artifact["turn_id"])
@@ -1920,20 +2173,84 @@ class RecorderStore:
             allowed_metadata["byte_size"] = len(result.audio)
             allowed_metadata["content_type"] = result.content_type
             provider_name = allowed_metadata.get("provider")
-            now = utc_now()
+            now = self._now()
             conn.execute(
                 "UPDATE tts_artifacts SET payload_sha256=?, byte_size=?, storage_path=?, source_text=NULL, content_type=?, provider_name=?, provider_metadata_json=?, hermes_profile=?, endpoint_contract=?, input_sha256=?, attempt_identity=?, relay_state='PENDING', retention_outcome=NULL, status='READY', mode=?, completed_at=?, updated_at=? WHERE artifact_id=?",
                 (digest, len(result.audio), str(path), result.content_type, provider_name, _json(allowed_metadata), allowed_metadata.get("hermes_profile"), allowed_metadata.get("endpoint_contract"), input_hash, allowed_metadata.get("attempt_identity"), result.mode, now, now, artifact_id),
             )
             return _row(conn.execute("SELECT * FROM tts_artifacts WHERE artifact_id=?", (artifact_id,)).fetchone()) or {}
 
-    def mark_tts_expired(self, artifact_id: str) -> dict[str, Any]:
+    def expire_tts_artifacts(
+        self,
+        *,
+        now: str | None = None,
+        artifact_ids: Sequence[str] | None = None,
+        force: bool = False,
+    ) -> dict[str, int]:
+        timestamp = now or self._now()
+        if not isinstance(force, bool):
+            raise ValidationError("force must be a boolean")
+        if artifact_ids is not None:
+            ids = [value for value in artifact_ids if isinstance(value, str) and value]
+            if len(ids) != len(set(ids)):
+                ids = list(dict.fromkeys(ids))
+        else:
+            ids = []
+        receipt_ids: list[str] = []
+        expired = 0
         with self._tx() as conn:
+            sql = "SELECT * FROM tts_artifacts WHERE status IN ('PENDING','READY','DELIVERY_PENDING','FAILED_GENERATION')"
+            args: list[Any] = []
+            if not force:
+                sql += " AND expires_at IS NOT NULL AND expires_at <= ?"
+                args.append(timestamp)
+            if ids:
+                placeholders = ",".join("?" for _ in ids)
+                sql += f" AND artifact_id IN ({placeholders})"
+                args.extend(ids)
+            rows = conn.execute(sql, tuple(args)).fetchall()
+            for row in rows:
+                receipt_id: str | None = None
+                if row["storage_path"] and row["payload_sha256"] and row["byte_size"] is not None:
+                    receipt_id = self._prepare_cleanup_receipt_tx(
+                        conn,
+                        operation="tts_expiry_cleanup",
+                        path=Path(row["storage_path"]),
+                        expected_sha256=row["payload_sha256"],
+                        expected_size=int(row["byte_size"]),
+                        user_id=row["user_id"] if "user_id" in row.keys() else None,
+                        entity_type="tts_artifact",
+                        entity_id=row["artifact_id"],
+                        now=timestamp,
+                    )
+                    receipt_ids.append(receipt_id)
+                outcome = "delete_pending" if receipt_id else "expired"
+                conn.execute(
+                    "UPDATE tts_artifacts SET source_text=NULL, status='EXPIRED', relay_state='EXPIRED', retention_outcome=?, updated_at=? WHERE artifact_id=? AND status IN ('PENDING','READY','DELIVERY_PENDING','FAILED_GENERATION')",
+                    (outcome, timestamp, row["artifact_id"]),
+                )
+                expired += 1
+        # Expiry is a durable logical transition, not permission to unlink
+        # the spool immediately.  Playback/cleanup recovery must retain the
+        # receipt and re-check the inode before deletion; this also preserves
+        # the origin spool for an in-flight client that learned of expiry
+        # concurrently with playback delivery.
+        cleanup = {"completed": 0, "pending": len(receipt_ids), "blocked": 0, "attempted": 0}
+        return {
+            "expired": expired,
+            "cleanup_receipts_attempted": cleanup["attempted"],
+            "cleanup_receipts_completed": cleanup["completed"],
+            "cleanup_receipts_pending": cleanup["pending"],
+            "cleanup_receipts_blocked": cleanup["blocked"],
+        }
+
+    def mark_tts_expired(self, artifact_id: str) -> dict[str, Any]:
+        with self._read() as conn:
             row = conn.execute("SELECT * FROM tts_artifacts WHERE artifact_id=?", (artifact_id,)).fetchone()
-            if row is None:
-                raise NotFoundError("TTS artifact not found")
-            now = utc_now()
-            conn.execute("UPDATE tts_artifacts SET source_text=NULL, status='EXPIRED', relay_state='EXPIRED', retention_outcome='expired', updated_at=? WHERE artifact_id=? AND status != 'PLAYED'", (now, artifact_id))
+        if row is None:
+            raise NotFoundError("TTS artifact not found")
+        self.expire_tts_artifacts(now=self._now(), artifact_ids=[artifact_id], force=True)
+        with self._read() as conn:
             return _row(conn.execute("SELECT * FROM tts_artifacts WHERE artifact_id=?", (artifact_id,)).fetchone()) or {}
 
     def relay_tts_received(
@@ -1971,9 +2288,9 @@ class RecorderStore:
                 raise NotReadyError("TTS artifact has no generated delivery receipt")
             conn.execute(
                 "INSERT OR REPLACE INTO playback_journal(artifact_id, device_id, payload_sha256, state, recorded_at) VALUES (?, ?, ?, 'RELAY_RECEIVED', ?)",
-                (artifact_id, device_id, payload_sha256, utc_now()),
+                (artifact_id, device_id, payload_sha256, self._now()),
             )
-            received_at = utc_now()
+            received_at = self._now()
             conn.execute("UPDATE tts_artifacts SET relay_state='RELAY_RECEIVED', status=CASE WHEN status='PENDING' THEN 'DELIVERY_PENDING' ELSE status END, updated_at=? WHERE artifact_id=?", (received_at, artifact_id))
             return _row(conn.execute("SELECT * FROM tts_artifacts WHERE artifact_id=?", (artifact_id,)).fetchone()) or {}
 
@@ -1994,6 +2311,8 @@ class RecorderStore:
         if not isinstance(payload_sha256, str) or not payload_sha256:
             raise ValidationError("payload_sha256 is required for playback completion")
         path: Path | None = None
+        cleanup_receipt_id: str | None = None
+        duplicate_playback = False
         with self._tx() as conn:
             artifact = conn.execute(
                 "SELECT a.*, t.user_id FROM tts_artifacts a JOIN turns t ON t.turn_id=a.turn_id WHERE a.artifact_id=?",
@@ -2015,24 +2334,60 @@ class RecorderStore:
                     raise NotReadyError("played TTS artifact has no generated payload hash")
                 if artifact["payload_sha256"] != payload_sha256:
                     raise ConflictError("playback payload hash does not match")
-                return _row(conn.execute("SELECT * FROM tts_artifacts WHERE artifact_id=?", (artifact_id,)).fetchone()) or {}
-            if artifact["status"] not in {"READY", "DELIVERY_PENDING"}:
-                raise NotReadyError("TTS artifact is not ready for playback completion")
-            if not artifact["payload_sha256"]:
-                raise NotReadyError("TTS artifact has no generated payload hash")
-            if artifact["payload_sha256"] != payload_sha256:
-                raise ConflictError("playback payload hash does not match")
-            conn.execute(
-                "INSERT OR REPLACE INTO playback_journal(artifact_id, device_id, payload_sha256, state, recorded_at) VALUES (?, ?, ?, 'PLAYED', ?)",
-                (artifact_id, device_id, payload_sha256, utc_now()),
-            )
-            played_at = utc_now()
-            conn.execute("UPDATE tts_artifacts SET status='PLAYED', relay_state='PLAYED', playback_ack_at=?, retention_outcome='deleted_after_playback', played_at=?, updated_at=? WHERE artifact_id=?", (played_at, played_at, played_at, artifact_id))
+                duplicate_playback = True
+            if not duplicate_playback:
+                if artifact["status"] not in {"READY", "DELIVERY_PENDING"}:
+                    raise NotReadyError("TTS artifact is not ready for playback completion")
+                if not artifact["payload_sha256"]:
+                    raise NotReadyError("TTS artifact has no generated payload hash")
+                if artifact["payload_sha256"] != payload_sha256:
+                    raise ConflictError("playback payload hash does not match")
+                cleanup_receipt_id = self._prepare_cleanup_receipt_tx(
+                    conn,
+                    operation="tts_playback_cleanup",
+                    path=Path(artifact["storage_path"]),
+                    expected_sha256=artifact["payload_sha256"],
+                    expected_size=int(artifact["byte_size"]),
+                    user_id=artifact["user_id"],
+                    device_id=device_id,
+                    entity_type="tts_artifact",
+                    entity_id=artifact_id,
+                    now=self._now(),
+                )
+                conn.execute(
+                    "INSERT OR REPLACE INTO playback_journal(artifact_id, device_id, payload_sha256, state, recorded_at) VALUES (?, ?, ?, 'PLAYED', ?)",
+                    (artifact_id, device_id, payload_sha256, self._now()),
+                )
+                played_at = self._now()
+                conn.execute("UPDATE tts_artifacts SET status='PLAYED', relay_state='PLAYED', playback_ack_at=?, retention_outcome='delete_pending', played_at=?, updated_at=? WHERE artifact_id=?", (played_at, played_at, played_at, artifact_id))
+            else:
+                receipt = conn.execute(
+                    "SELECT receipt_id FROM storage_cleanup_receipts WHERE operation='tts_playback_cleanup' AND entity_type='tts_artifact' AND entity_id=? ORDER BY created_at DESC LIMIT 1",
+                    (artifact_id,),
+                ).fetchone()
+                if receipt is None and artifact["storage_path"]:
+                    cleanup_receipt_id = self._prepare_cleanup_receipt_tx(
+                        conn,
+                        operation="tts_playback_cleanup",
+                        path=Path(artifact["storage_path"]),
+                        expected_sha256=artifact["payload_sha256"],
+                        expected_size=int(artifact["byte_size"]),
+                        user_id=artifact["user_id"],
+                        device_id=device_id,
+                        entity_type="tts_artifact",
+                        entity_id=artifact_id,
+                        now=self._now(),
+                    )
+                elif receipt is not None:
+                    cleanup_receipt_id = receipt["receipt_id"]
             path = Path(artifact["storage_path"]) if artifact["storage_path"] else None
             result = _row(conn.execute("SELECT * FROM tts_artifacts WHERE artifact_id=?", (artifact_id,)).fetchone()) or {}
         if path:
-            with contextlib.suppress(FileNotFoundError, OSError, RecorderError):
-                self._safe_unlink(path)
+            cleanup = self.recover_cleanup_receipts(receipt_ids=[cleanup_receipt_id], now=self._now()) if cleanup_receipt_id else {"completed": 0}
+            if cleanup.get("completed"):
+                with self._tx() as conn:
+                    conn.execute("UPDATE tts_artifacts SET retention_outcome='deleted_after_playback', updated_at=? WHERE artifact_id=? AND status='PLAYED'", (self._now(), artifact_id))
+                result["retention_outcome"] = "deleted_after_playback"
         return result
 
     @staticmethod
@@ -2623,15 +2978,17 @@ class RecorderStore:
                 (str(uuid.uuid4()), _json(detail), now),
             )
 
-    def set_asr_stage(self, turn_id: str, *, expected_generation: int, stage: str) -> int | None:
+    def set_asr_stage(self, turn_id: str, *, expected_generation: int, stage: str, worker_claim: Mapping[str, Any] | None = None) -> int | None:
         if stage not in {"realtime", "batch", "local", "provider-chain"}:
             raise ValidationError("unsupported ASR stage")
         with self._tx() as conn:
+            if worker_claim is not None and not self._features._assert_worker_effect_tx(conn, worker_claim, now=self._now(), stage="asr", turn_id=turn_id):
+                return None
             self._turn_row(conn, turn_id)
             new_generation = expected_generation + 1
             changed = conn.execute(
                 "UPDATE turns SET asr_stage=?, asr_generation=?, state=CASE WHEN state IN ('ACCEPTED','RETRY_WAIT') THEN 'PREPROCESSING' ELSE state END, updated_at=? WHERE turn_id=? AND asr_generation=? AND authoritative_asr_outcome IS NULL",
-                (stage, new_generation, utc_now(), turn_id, expected_generation),
+                (stage, new_generation, self._now(), turn_id, expected_generation),
             ).rowcount
             return new_generation if changed else None
 
@@ -2643,9 +3000,12 @@ class RecorderStore:
         stage: str,
         result: AsrResult,
         authoritative: bool = True,
+        worker_claim: Mapping[str, Any] | None = None,
     ) -> bool:
         paths: list[Path] = []
         with self._tx() as conn:
+            if worker_claim is not None and not self._features._assert_worker_effect_tx(conn, worker_claim, now=self._now(), stage="asr", turn_id=turn_id):
+                return False
             turn = self._turn_row(conn, turn_id)
             if turn["asr_generation"] != expected_generation or turn["asr_stage"] != stage:
                 return False
@@ -2659,7 +3019,7 @@ class RecorderStore:
             content_type = receipt.get("content_type") if isinstance(receipt.get("content_type"), str) else None
             byte_size = receipt.get("byte_size") if isinstance(receipt.get("byte_size"), int) else None
             attempt_identity = receipt.get("attempt_identity") if isinstance(receipt.get("attempt_identity"), str) else str(uuid.uuid4())
-            completion = utc_now()
+            completion = self._now()
             safe_detail = result.detail if isinstance(result.detail, str) and re.fullmatch(r"[a-z][a-z0-9_.-]{0,63}", result.detail) else None
             conn.execute(
                 "INSERT INTO asr_attempts(attempt_id, turn_id, generation, stage, outcome, detail, transcript, mode, provider_name, hermes_profile, endpoint_contract, input_sha256, output_sha256, content_type, byte_size, attempt_identity, completed_at, committed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -2675,16 +3035,65 @@ class RecorderStore:
                     paths.append(Path(chunk["storage_path"]))
                 conn.execute(
                     "UPDATE turns SET transcript=?, authoritative_asr_outcome='VALID_TRANSCRIPT', source_deleted=0, state=CASE WHEN state IN ('ACCEPTED','PREPROCESSING','RETRY_WAIT') THEN 'ACCEPTED' ELSE state END, updated_at=? WHERE turn_id=?",
-                    (result.transcript, utc_now(), turn_id),
+                    (result.transcript, self._now(), turn_id),
+                )
+                self._features._enqueue_worker_job_tx(
+                    conn,
+                    kind="route",
+                    stage="route",
+                    payload={"turn_id": turn_id, "user_id": turn["user_id"]},
+                    idempotency_key=f"turn:{turn_id}:route",
+                    max_attempts=3,
+                    now=completion,
+                    next_attempt_at=completion,
+                    overall_deadline_at=(dt.datetime.fromisoformat(completion) + dt.timedelta(seconds=300)).isoformat(timespec="milliseconds"),
                 )
             elif result.outcome in {"NO_SPEECH", "PROVIDER_ERROR"}:
                 conn.execute(
                     "UPDATE turns SET authoritative_asr_outcome=?, state=CASE WHEN ?='NO_SPEECH' THEN 'FINAL_READY' ELSE 'RETRY_WAIT' END, updated_at=? WHERE turn_id=?",
-                    (result.outcome, result.outcome, utc_now(), turn_id),
+                    (result.outcome, result.outcome, self._now(), turn_id),
                 )
+                if result.outcome == "NO_SPEECH":
+                    self._commit_protocol_final_tx(
+                        conn,
+                        turn_id=turn_id,
+                        error_kind="no_speech",
+                        message=FINAL_ERROR_MESSAGES["no_speech"],
+                        grace_seconds=0,
+                        source_ref="recorder_protocol:asr:no_speech",
+                    )
+                    conn.execute(
+                        "UPDATE router_queue SET state='DONE', lease_owner=NULL, lease_expires_at=NULL, updated_at=? WHERE turn_id=?",
+                        (self._now(), turn_id),
+                    )
+                elif result.outcome == "PROVIDER_ERROR" and authoritative:
+                    self._commit_protocol_final_tx(
+                        conn,
+                        turn_id=turn_id,
+                        error_kind="asr",
+                        message=FINAL_ERROR_MESSAGES["asr"],
+                        grace_seconds=0,
+                        source_ref="recorder_protocol:asr:provider_error",
+                    )
+                    conn.execute(
+                        "UPDATE router_queue SET state='FAILED', lease_owner=NULL, lease_expires_at=NULL, updated_at=? WHERE turn_id=?",
+                        (self._now(), turn_id),
+                    )
         if result.outcome == "VALID_TRANSCRIPT":
             deletion_complete = True
+            if worker_claim is not None:
+                try:
+                    if not self.assert_worker_effect_authority(worker_claim, stage="asr", turn_id=turn_id):
+                        return True
+                except LeaseConflict:
+                    return True
             for path in paths:
+                if worker_claim is not None:
+                    try:
+                        if not self.assert_worker_effect_authority(worker_claim, stage="asr", turn_id=turn_id):
+                            return True
+                    except LeaseConflict:
+                        return True
                 try:
                     self._safe_unlink(path)
                 except FileNotFoundError:
@@ -2693,7 +3102,9 @@ class RecorderStore:
                     deletion_complete = False
             if deletion_complete:
                 with self._tx() as conn:
-                    conn.execute("UPDATE turns SET source_deleted=1, updated_at=? WHERE turn_id=? AND authoritative_asr_outcome='VALID_TRANSCRIPT'", (utc_now(), turn_id))
+                    if worker_claim is not None and not self._features._assert_worker_effect_tx(conn, worker_claim, now=self._now(), stage="asr", turn_id=turn_id):
+                        return True
+                    conn.execute("UPDATE turns SET source_deleted=1, updated_at=? WHERE turn_id=? AND authoritative_asr_outcome='VALID_TRANSCRIPT'", (self._now(), turn_id))
         return True
 
     def retry_source_deletion(self, turn_id: str) -> bool:
@@ -2713,7 +3124,7 @@ class RecorderStore:
                 complete = False
         if complete:
             with self._tx() as conn:
-                conn.execute("UPDATE turns SET source_deleted=1, updated_at=? WHERE turn_id=? AND authoritative_asr_outcome='VALID_TRANSCRIPT'", (utc_now(), turn_id))
+                conn.execute("UPDATE turns SET source_deleted=1, updated_at=? WHERE turn_id=? AND authoritative_asr_outcome='VALID_TRANSCRIPT'", (self._now(), turn_id))
         return complete
 
     def recover(self, *, now: str | None = None) -> dict[str, int]:
@@ -2725,7 +3136,7 @@ class RecorderStore:
                 (now, now),
             ).rowcount
             ingress_count = conn.execute(
-                "UPDATE session_ingress SET status='QUEUED', lease_owner=NULL, lease_expires_at=NULL, updated_at=? WHERE status='IN_PROGRESS' AND lease_expires_at <= ?",
+                "UPDATE session_ingress SET status='QUEUED', lease_owner=NULL, lease_token=NULL, lease_expires_at=NULL, updated_at=? WHERE status='IN_PROGRESS' AND lease_expires_at <= ?",
                 (now, now),
             ).rowcount
             grace_failed = conn.execute(
@@ -2756,6 +3167,14 @@ class RecorderStore:
         for pending_turn_id in source_pending:
             if self.retry_source_deletion(pending_turn_id):
                 result["source_deletions_retried"] += 1
+        expiry = self.expire_tts_artifacts(now=now)
+        result.update(
+            {
+                "tts_artifacts_expired": expiry["expired"],
+                "tts_expiry_cleanup_attempted": expiry["cleanup_receipts_attempted"],
+                "tts_expiry_cleanup_completed": expiry["cleanup_receipts_completed"],
+            }
+        )
         cleanup = self.recover_cleanup_receipts(now=now)
         result.update(
             {
@@ -2767,19 +3186,73 @@ class RecorderStore:
         )
         return result
 
-    def release_session_ingress(self, submission_id: str, *, owner: str) -> bool:
+    def release_session_ingress(
+        self,
+        submission_id: str,
+        *,
+        owner: str,
+        lease_token: str,
+        now: str | None = None,
+        worker_claim: Mapping[str, Any] | None = None,
+    ) -> bool:
+        timestamp = self._now() if now is None else now
         with self._tx() as conn:
+            if worker_claim is not None:
+                ingress = conn.execute(
+                    "SELECT turn_id FROM session_ingress WHERE hermes_submission_id=?",
+                    (submission_id,),
+                ).fetchone()
+                if ingress is None:
+                    return False
+                self._features._assert_worker_effect_tx(
+                    conn,
+                    worker_claim,
+                    stage="hermes",
+                    turn_id=str(ingress["turn_id"]),
+                    now=timestamp,
+                )
             updated = conn.execute(
-                "UPDATE session_ingress SET status='QUEUED', lease_owner=NULL, lease_expires_at=NULL, updated_at=? WHERE hermes_submission_id=? AND status='IN_PROGRESS' AND lease_owner=?",
-                (utc_now(), submission_id, owner),
+                "UPDATE session_ingress SET status='QUEUED', lease_owner=NULL, lease_token=NULL, lease_expires_at=NULL, updated_at=? WHERE hermes_submission_id=? AND status='IN_PROGRESS' AND lease_owner=? AND lease_token=?",
+                (timestamp, submission_id, owner, lease_token),
             ).rowcount
             return bool(updated)
 
-    def pending_tts(self, *, limit: int = 50) -> list[dict[str, Any]]:
+    def renew_session_ingress(self, submission_id: str, *, owner: str, lease_token: str, lease_seconds: int = 30, now: str | None = None) -> bool:
+        timestamp = now or self._now()
+        expires = (dt.datetime.fromisoformat(timestamp.replace("Z", "+00:00")) + dt.timedelta(seconds=lease_seconds)).isoformat(timespec="milliseconds")
+        with self._tx() as conn:
+            return bool(conn.execute(
+                "UPDATE session_ingress SET lease_expires_at=?, updated_at=? WHERE hermes_submission_id=? AND status='IN_PROGRESS' AND lease_owner=? AND lease_token=? AND lease_expires_at > ?",
+                (expires, timestamp, submission_id, owner, lease_token, timestamp),
+            ).rowcount)
+
+    def pending_tts(
+        self,
+        *,
+        limit: int = 50,
+        turn_source: str | None = None,
+        unprojected_only: bool = False,
+        include_recording_active: bool = False,
+    ) -> list[dict[str, Any]]:
+        if turn_source not in {None, "client", "server_schedule"}:
+            raise ValidationError("unsupported TTS turn source")
+        if not isinstance(unprojected_only, bool):
+            raise ValidationError("unprojected_only must be a boolean")
+        if not isinstance(include_recording_active, bool):
+            raise ValidationError("include_recording_active must be a boolean")
+        projection_filter = ""
+        if unprojected_only:
+            projection_filter = " AND NOT EXISTS (SELECT 1 FROM worker_jobs w WHERE w.stage='tts' AND w.idempotency_key=('artifact:' || t.artifact_id || ':tts'))"
         with self._read() as conn:
+            timestamp = self._now()
+            recording_filter = "" if include_recording_active else " AND (r.device_id IS NULL OR r.active=0 OR r.lease_expires_at <= ?)"
+            args: list[Any] = [timestamp]
+            if not include_recording_active:
+                args.append(timestamp)
+            args.extend([turn_source, turn_source, limit])
             rows = conn.execute(
-                "SELECT t.* FROM tts_artifacts t LEFT JOIN recording_leases r ON r.device_id=COALESCE(t.delivery_target_device_id, t.origin_device_id) WHERE t.status IN ('PENDING','DELIVERY_PENDING','FAILED_GENERATION') AND (r.device_id IS NULL OR r.active=0 OR r.lease_expires_at <= ?) ORDER BY COALESCE(t.delivery_target_device_id, t.origin_device_id), t.delivery_seq LIMIT ?",
-                (self._now(), limit),
+                "SELECT t.* FROM tts_artifacts t JOIN turns u ON u.turn_id=t.turn_id LEFT JOIN recording_leases r ON r.device_id=COALESCE(t.delivery_target_device_id, t.origin_device_id) WHERE t.status IN ('PENDING','DELIVERY_PENDING','FAILED_GENERATION') AND (t.expires_at IS NULL OR t.expires_at > ?)" + recording_filter + " AND (? IS NULL OR u.turn_source=?)" + projection_filter + " ORDER BY COALESCE(t.delivery_target_device_id, t.origin_device_id), t.delivery_seq LIMIT ?",
+                args,
             ).fetchall()
             return [_row(row) or {} for row in rows]
 
@@ -2800,13 +3273,19 @@ class RecorderStore:
         description: str = "",
         idempotency_key: str | None = None,
         stable_project_id: str | None = None,
+        worker_claim: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         if not user_id or not project_number or not name:
             raise ValidationError("project_number and name are required")
         stable_project_id = stable_project_id or str(uuid.uuid5(uuid.NAMESPACE_URL, f"recorder-next:project:{user_id}:{idempotency_key or project_number}"))
         session_key = f"project:{stable_project_id}:default"
-        now = utc_now()
+        now = self._now()
         with self._tx() as conn:
+            if worker_claim is not None:
+                payload = worker_claim.get("payload")
+                turn_id = payload.get("turn_id") if isinstance(payload, Mapping) else None
+                if not self._features._assert_worker_effect_tx(conn, worker_claim, now=now, stage="route", turn_id=turn_id):
+                    raise LeaseConflict("worker project effect deadline has expired")
             existing = conn.execute("SELECT * FROM projects WHERE stable_project_id=?", (stable_project_id,)).fetchone()
             if existing:
                 if existing["user_id"] != user_id:
@@ -2866,7 +3345,7 @@ class RecorderStore:
                 fields["aliases_json"] = _json(patch["aliases"])
             if "description" in patch:
                 fields["description"] = patch["description"]
-            now = utc_now()
+            now = self._now()
             updated = conn.execute(
                 "UPDATE projects SET name=?, aliases_json=?, description=?, record_version=record_version+1, updated_at=? WHERE stable_project_id=? AND user_id=? AND record_version=?",
                 (fields["name"], fields["aliases_json"], fields["description"], now, project_id, user_id, expected_version),
@@ -2877,7 +3356,7 @@ class RecorderStore:
 
     def archive_project(self, user_id: str, project_id: str, *, expected_version: int) -> dict[str, Any]:
         with self._tx() as conn:
-            now = utc_now()
+            now = self._now()
             updated = conn.execute(
                 "UPDATE projects SET status='archived', archived_at=?, record_version=record_version+1, updated_at=? WHERE stable_project_id=? AND user_id=? AND status='active' AND record_version=?",
                 (now, now, project_id, user_id, expected_version),
@@ -2900,7 +3379,7 @@ class RecorderStore:
                 raise UnauthorizedError("turn belongs to another user")
             if device_id is not None:
                 self._assert_turn_owner_tx(conn, turn, user_id, device_id)
-            now = utc_now()
+            now = self._now()
             conn.execute("UPDATE turns SET archived_at=?, updated_at=? WHERE turn_id=?", (now, now, turn_id))
             conn.execute(
                 "INSERT INTO audit_events(audit_id, user_id, turn_id, kind, details_json, created_at) VALUES (?, ?, ?, 'archive_turn', ?, ?)",
@@ -2928,6 +3407,9 @@ class RecorderStore:
     def renew_worker_lease(self, job_id: str, owner: str, **kwargs: Any) -> bool:
         return self._features.renew_worker_lease(job_id, owner, **kwargs)
 
+    def assert_worker_effect_authority(self, claim: Mapping[str, Any], **kwargs: Any) -> bool:
+        return self._features.assert_worker_effect_authority(claim, **kwargs)
+
     def complete_worker_job(self, job_id: str, owner: str, receipt: Mapping[str, Any], **kwargs: Any) -> dict[str, Any]:
         return self._features.complete_worker_job(job_id, owner, receipt, **kwargs)
 
@@ -2936,6 +3418,9 @@ class RecorderStore:
 
     def recover_worker_jobs(self, **kwargs: Any) -> dict[str, int]:
         return self._features.recover_worker_jobs(**kwargs)
+
+    def reconcile_terminal_tts_jobs(self, **kwargs: Any) -> dict[str, int]:
+        return self._features.reconcile_terminal_tts_jobs(**kwargs)
 
     def list_worker_attempts(self, job_id: str, **kwargs: Any) -> list[dict[str, Any]]:
         return self._features.list_worker_attempts(job_id, **kwargs)

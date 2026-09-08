@@ -56,12 +56,6 @@ OPENAPI = {
         "/v1/projects/{project_id}": {"get": {"responses": {"200": {"description": "Project"}}}, "patch": {"responses": {"200": {"description": "CAS update"}}}},
         "/v1/turns/{turn_id}/archive": {"post": {"responses": {"200": {"description": "Archive-only turn retention"}}}},
         "/v1/projects/{project_id}/archive": {"post": {"responses": {"200": {"description": "Archive-only transition"}}}},
-        "/v1/internal/router": {"post": {"responses": {"200": {"description": "Internal router worker step"}}}},
-        "/v1/internal/hermes": {"post": {"responses": {"200": {"description": "Internal Hermes worker step"}}}},
-        "/v1/internal/tts": {"post": {"responses": {"200": {"description": "Internal TTS worker step"}}}},
-        "/v1/internal/schedule_create": {"post": {"summary": "Trusted Recorder adapter schedule creation", "responses": {"201": {"description": "Durably scheduled with atomic confirmation FINAL"}, "401": {"description": "Trusted adapter header required"}, "409": {"description": "Immutable schedule conflict"}}}},
-        "/v1/internal/scheduler/fire": {"post": {"summary": "Claim and fire due server schedules", "responses": {"200": {"description": "Scheduled FINAL readback"}}}},
-        "/v1/internal/scheduler/recover": {"post": {"summary": "Requeue expired scheduler leases", "responses": {"200": {"description": "Recovery counts"}}}},
         "/v1/schedules/{schedule_id}": {"get": {"parameters": [{"name": "schedule_id", "in": "path", "required": True, "schema": {"type": "string"}}], "responses": {"200": {"description": "Schedule and occurrence readback"}}}},
         "/v1/updates/{channel}/manifest": {"get": {"responses": {"200": {"description": "Current immutable channel manifest"}}}},
         "/v1/updates/{channel}/{generation}/{artifact_name}": {"get": {"responses": {"200": {"description": "Hash-bound APK bytes"}, "206": {"description": "Byte range"}, "304": {"description": "ETag matched"}, "416": {"description": "Unsatisfiable range"}}}, "head": {"responses": {"200": {"description": "APK metadata"}}}},
@@ -75,17 +69,20 @@ OPENAPI = {
         "/v1/diagnostics/bundles": {"post": {"responses": {"201": {"description": "Bounded compressed diagnostic bundle"}}}},
         "/v1/diagnostics": {"get": {"responses": {"200": {"description": "Diagnostic metadata"}}}, "delete": {"responses": {"200": {"description": "Deletion receipt and tombstones"}}}},
         "/v1/diagnostics/delete": {"post": {"responses": {"200": {"description": "Deletion receipt and tombstones"}}}},
-        "/v1/internal/worker/claim": {"post": {"responses": {"200": {"description": "Claim one durable worker lease"}}}},
-        "/v1/internal/worker/recover": {"post": {"responses": {"200": {"description": "Recover expired worker leases"}}}},
-        "/v1/internal/worker/complete": {"post": {"responses": {"200": {"description": "Complete one durable worker lease"}}}},
-        "/v1/internal/worker/fail": {"post": {"responses": {"200": {"description": "Record one durable worker failure"}}}},
-        "/v1/internal/worker/run": {"post": {"responses": {"200": {"description": "Run one durable worker lease operation"}}}},
         "/v1/internal/worker/health": {"get": {"responses": {"200": {"description": "Bounded worker backlog and lease health"}}}},
         "/v1/eavesdrop/{session_id}/segments/{segment_sequence}/route": {"post": {"responses": {"200": {"description": "Idempotent fixed-project routing decision"}}}},
         "/v1/eavesdrop/{session_id}/decisions": {"get": {"responses": {"200": {"description": "Eavesdrop routing decision ledger"}}}},
         "/v1/diagnostics/export": {"get": {"responses": {"200": {"description": "Redacted diagnostic export"}}}},
     },
     "components": {
+        "securitySchemes": {
+            "RecorderPrincipal": {
+                "type": "apiKey",
+                "in": "header",
+                "name": "X-Recorder-Principal-Signature",
+                "description": "HMAC-SHA256 proof over X-Recorder-Principal-User, a NUL byte, and X-Recorder-Principal-Device. The deployment secret stays outside the API payload and logs.",
+            }
+        },
         "parameters": {
             "TurnId": {"name": "turn_id", "in": "path", "required": True, "schema": {"type": "string", "format": "uuid"}},
             "ArtifactId": {"name": "artifact_id", "in": "path", "required": True, "schema": {"type": "string"}},
@@ -342,6 +339,18 @@ def _add_owner_contract(document: dict) -> None:
                 operation["requestBody"] = {"required": True, "content": {"application/json": {"schema": {"$ref": f"#/components/schemas/{schema}"}}}}
 
 
+def _add_security_contract(document: dict) -> None:
+    public_paths = {"/v1/health", "/v1/openapi.json"}
+    for path, item in document.get("paths", {}).items():
+        if path in public_paths or path.startswith("/v1/updates/"):
+            continue
+        if not isinstance(item, dict):
+            continue
+        for method, operation in item.items():
+            if method in _OPENAPI_METHODS and isinstance(operation, dict):
+                operation["security"] = [{"RecorderPrincipal": []}]
+
+
 def validate_openapi_contract(document: dict | None = None) -> bool:
     """Validate resolved path parameters and the exact worker operation set."""
 
@@ -350,15 +359,20 @@ def validate_openapi_contract(document: dict | None = None) -> bool:
         raise ValueError("OpenAPI document must contain an object-valued paths member")
     if "/v1/internal/worker/{action}" in document["paths"]:
         raise ValueError("generic worker action route is not part of the contract")
-    required_worker_paths = {
+    forbidden_internal_control_paths = {
         "/v1/internal/worker/claim",
         "/v1/internal/worker/recover",
         "/v1/internal/worker/complete",
         "/v1/internal/worker/fail",
         "/v1/internal/worker/run",
+        "/v1/internal/scheduler/fire",
+        "/v1/internal/scheduler/recover",
+        "/v1/internal/router",
+        "/v1/internal/hermes",
+        "/v1/internal/tts",
     }
-    if not required_worker_paths.issubset(document["paths"]):
-        raise ValueError("OpenAPI worker contract is incomplete")
+    if forbidden_internal_control_paths.intersection(document["paths"]):
+        raise ValueError("state-changing worker and scheduler controls are not part of the production contract")
     for path, item in document["paths"].items():
         variables = set(_PATH_VARIABLE.findall(path))
         declared: dict[str, int] = {}
@@ -390,4 +404,5 @@ def validate_openapi_contract(document: dict | None = None) -> bool:
 
 _add_path_parameters(OPENAPI)
 _add_owner_contract(OPENAPI)
+_add_security_contract(OPENAPI)
 validate_openapi_contract(OPENAPI)

@@ -540,6 +540,7 @@ voice = "ko-KR-SunHiNeural"
                     job["job_id"],
                     "worker",
                     {"effect_id": "effect-1", "status": "accepted", "transcript": "private"},
+                    lease_token=claim["lease_token"],
                     now="2026-09-03T00:00:02+00:00",
                 )
 

@@ -20,6 +20,9 @@ class HermesResult:
     content: str
     terminal: bool = True
     source: str = "hermes"
+    submission_id: str | None = None
+    turn_id: str | None = None
+    marker: str | None = None
 
 
 @dataclass(frozen=True)

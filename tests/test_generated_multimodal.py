@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import math
 import struct
@@ -10,6 +11,7 @@ import urllib.error
 import urllib.request
 import wave
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 import unittest
 
 from recorder_next.adapters import StaticASRProvider
@@ -22,6 +24,7 @@ from recorder_next.store import RecorderStore
 ROOT = Path(__file__).parents[1]
 FIXTURE_ROOT = ROOT / "fixtures" / "generated"
 FIXTURE_MANIFEST = FIXTURE_ROOT / "manifest.json"
+INGRESS_SECRET = "generated-fixture-ingress-secret"
 
 
 class EchoHermesGateway:
@@ -78,6 +81,19 @@ def _request(server, method: str, path: str, payload=None, *, raw: bytes | None 
     if payload is not None or raw is not None:
         request_headers["Content-Type"] = "application/json" if raw is None else "application/octet-stream"
     request_headers.update(headers or {})
+    query = parse_qs(urlsplit(path).query)
+    body_mapping = payload if isinstance(payload, dict) else {}
+    user = query.get("user_id", [None])[0] or body_mapping.get("user_id") or body_mapping.get("origin_user_id")
+    device = query.get("device_id", [None])[0] or body_mapping.get("device_id") or body_mapping.get("origin_device_id")
+    if user is not None and "X-Recorder-Principal-User" not in request_headers:
+        request_headers["X-Recorder-Principal-User"] = user
+        request_headers["X-Recorder-Principal-Signature"] = hmac.new(
+            INGRESS_SECRET.encode("utf-8"),
+            f"{user}\x00{device or ''}".encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+        if device is not None:
+            request_headers["X-Recorder-Principal-Device"] = device
     request = urllib.request.Request(url, data=body, method=method, headers=request_headers)
     try:
         with urllib.request.urlopen(request, timeout=5) as response:
@@ -132,6 +148,7 @@ def _start_isolated_server(tmp: str, metadata: dict[str, object], *, asr=None):
         hermes=gateway,
         asr_providers=asr or {},
         tts=FixtureTTSProvider(audio),
+        ingress_secret=INGRESS_SECRET,
     )
     server = create_http_server(service, host="127.0.0.1", port=0)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -192,7 +209,9 @@ def _upload_and_accept(test: unittest.TestCase, server, manifest: dict[str, obje
 
 
 def _route_hermes_and_ack(test: unittest.TestCase, server, *, user: str, device: str, project_id: str, turn_id: str):
-    routed = _assert_status(test, _request(server, "POST", "/v1/internal/router", {"user_id": user, "owner": "fixture-router"}), 200)
+    service = server.service
+    routed = service.route_next(user, owner="fixture-router", expected_turn_id=turn_id)
+    test.assertIsNotNone(routed)
     test.assertEqual(routed["state"], "HERMES_PENDING")
     route_items = _assert_status(test, _request(server, "GET", f"/v1/outbox?user_id={user}&device_id={device}"), 200)["items"]
     route_event = next(item for item in route_items if item["event_kind"] == "ROUTED")
@@ -211,11 +230,15 @@ def _route_hermes_and_ack(test: unittest.TestCase, server, *, user: str, device:
         ),
         200,
     )
-    final_ready = _assert_status(
-        test,
-        _request(server, "POST", "/v1/internal/hermes", {"session_id": project_id, "owner": "fixture-hermes"}),
-        200,
+    ingress = service.get_ingress_for_turn(turn_id)
+    test.assertIsNotNone(ingress)
+    final_ready = service.process_next_hermes(
+        project_id,
+        owner="fixture-hermes",
+        hermes_submission_id=ingress["hermes_submission_id"],
+        expected_turn_id=turn_id,
     )
+    test.assertIsNotNone(final_ready)
     test.assertEqual(final_ready["state"], "FINAL_READY")
     final_items = _assert_status(test, _request(server, "GET", f"/v1/outbox?user_id={user}&device_id={device}"), 200)["items"]
     final_event = next(item for item in final_items if item["event_kind"] == "FINAL")
@@ -235,7 +258,7 @@ def _route_hermes_and_ack(test: unittest.TestCase, server, *, user: str, device:
         200,
     )
     test.assertEqual(delivered["state"], "DELIVERED")
-    generated = _assert_status(test, _request(server, "POST", "/v1/internal/tts", {"limit": 50}), 200)
+    generated = service.generate_pending_tts(limit=50)
     for artifact in generated:
         ready = _assert_status(test, _request(server, "GET", f"/v1/tts/{artifact['artifact_id']}?user_id={user}&device_id={device}"), 200)
         test.assertEqual(ready["status"], "READY")

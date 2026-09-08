@@ -676,7 +676,7 @@ class ScheduledFinalStoreTests(unittest.TestCase):
 
 
 class ScheduledFinalHTTPAndMigrationTests(unittest.TestCase):
-    def test_trusted_adapter_http_and_readback_surfaces(self):
+    def test_schedule_create_is_in_process_only_and_http_authority_attempts_are_noops(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             clock = DeterministicClock("2026-08-26T00:00:00+00:00")
@@ -688,34 +688,31 @@ class ScheduledFinalHTTPAndMigrationTests(unittest.TestCase):
             finally:
                 server.server_close()
             command = _schedule_command(project, fire_at="2026-08-26T00:00:10+00:00")
-            status, _, body = service.handle_http(
-                "POST",
-                "/v1/internal/schedule_create",
-                {"X-Recorder-Internal-Trusted": "1"},
-                json.dumps(command).encode(),
-            )
-            self.assertEqual(status, 201)
-            self.assertEqual(body["schedule_id"], "schedule-1")
+            before = store.db_snapshot()
+            for index, headers in enumerate(
+                (
+                    {},
+                    {"X-Recorder-Internal-Trusted": "0"},
+                    {"X-Recorder-Internal-Trusted": "1"},
+                )
+            ):
+                denied, _, _ = service.handle_http(
+                    "POST",
+                    "/v1/internal/schedule_create",
+                    headers,
+                    json.dumps({**command, "schedule_id": f"schedule-denied-{index}"}).encode(),
+                )
+                self.assertEqual(denied, 404)
+                self.assertEqual(store.db_snapshot(), before)
+
+            scheduled = service.schedule_create(command)
+            self.assertEqual(scheduled["schedule_id"], "schedule-1")
             status, _, readback = service.handle_http("GET", "/v1/schedules/schedule-1?user_id=schedule-user&device_id=watch-1", {}, b"")
             self.assertEqual(status, 200)
             self.assertEqual(readback["fire_at_utc"], "2026-08-26T00:00:10.000+00:00")
             clock.advance(seconds=10)
-            status, _, fired = service.handle_http(
-                "POST",
-                "/v1/internal/scheduler/fire",
-                {},
-                json.dumps({"owner": "http-scheduler"}).encode(),
-            )
-            self.assertEqual(status, 200)
-            self.assertEqual(len(fired["items"]), 1)
-
-            denied, _, _ = service.handle_http(
-                "POST",
-                "/v1/internal/schedule_create",
-                {},
-                json.dumps({**command, "schedule_id": "schedule-denied"}).encode(),
-            )
-            self.assertEqual(denied, 401)
+            fired = service.run_scheduler(owner="in-process-scheduler", now=clock.now())
+            self.assertEqual(len(fired), 1)
 
     def test_r4_database_upgrades_additively_to_scheduled_schema(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -746,8 +743,8 @@ class ScheduledFinalHTTPAndMigrationTests(unittest.TestCase):
     def test_openapi_exposes_scheduled_protocol_and_migration_is_additive(self):
         from recorder_next.openapi import OPENAPI
 
-        self.assertIn("/v1/internal/schedule_create", OPENAPI["paths"])
-        self.assertIn("/v1/internal/scheduler/fire", OPENAPI["paths"])
+        self.assertNotIn("/v1/internal/schedule_create", OPENAPI["paths"])
+        self.assertNotIn("/v1/internal/scheduler/fire", OPENAPI["paths"])
         self.assertIn("/v1/schedules/{schedule_id}", OPENAPI["paths"])
         self.assertIn("/v1/tts/{artifact_id}/bridge-read", OPENAPI["paths"])
         ack_schema = OPENAPI["components"]["schemas"]["PlaybackAck"]

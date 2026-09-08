@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import hmac
 import json
 import sqlite3
 import tempfile
@@ -89,6 +90,7 @@ class DurableWorkerFeatureTests(unittest.TestCase):
                 claim["job_id"],
                 "worker-b",
                 {"effect_id": "hermes-effect-1", "status": "accepted"},
+                lease_token=claim["lease_token"],
                 now="2026-09-03T00:00:07+00:00",
             )
             self.assertEqual(done["status"], "SUCCEEDED")
@@ -100,12 +102,86 @@ class DurableWorkerFeatureTests(unittest.TestCase):
             job = store.enqueue_worker_job(kind="hermes", stage="submit", payload={"turn_id": TURN_ID}, idempotency_key="receipt-binding", now="2026-09-03T00:00:00+00:00")
             claim = store.claim_worker_job("worker", now="2026-09-03T00:00:00+00:00")
             receipt = {"effect_id": "effect-1", "status": "accepted"}
-            first = store.complete_worker_job(claim["job_id"], "worker", receipt, now="2026-09-03T00:00:01+00:00")
-            second = store.complete_worker_job(claim["job_id"], "worker", receipt, now="2026-09-03T00:00:02+00:00")
+            first = store.complete_worker_job(claim["job_id"], "worker", receipt, lease_token=claim["lease_token"], now="2026-09-03T00:00:01+00:00")
+            second = store.complete_worker_job(claim["job_id"], "worker", receipt, lease_token=claim["lease_token"], now="2026-09-03T00:00:02+00:00")
             self.assertEqual(second["status"], "SUCCEEDED")
             self.assertEqual(second["effect_receipt"], first["effect_receipt"])
             self.assertEqual(second["effect_receipt"]["job_id"], job["job_id"])
             self.assertEqual(second["effect_receipt"]["idempotency_key"], "receipt-binding")
+
+    def test_expired_takeover_enforces_max_attempts_in_claim_transaction(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = RecorderStore(Path(tmp) / "db.sqlite3", storage_root=Path(tmp) / "data")
+            job = store.enqueue_worker_job(
+                kind="asr", stage="asr", payload={}, idempotency_key="bounded-attempts",
+                max_attempts=1, now="2026-09-03T00:00:00+00:00",
+            )
+            first = store.claim_worker_job("owner", now="2026-09-03T00:00:00+00:00", lease_seconds=1)
+            second = store.claim_worker_job("owner", now="2026-09-03T00:00:02+00:00", lease_seconds=1)
+            self.assertEqual(first["attempt_count"], 1)
+            self.assertIsNone(second)
+            row = store.get_worker_job(job["job_id"])
+            self.assertEqual(row["status"], "FAILED_PERMANENT")
+            self.assertEqual(row["last_error_kind"], "max_attempts")
+
+    def test_overall_deadline_blocks_renewal_and_late_completion(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = RecorderStore(Path(tmp) / "db.sqlite3", storage_root=Path(tmp) / "data")
+            job = store.enqueue_worker_job(
+                kind="asr", stage="asr", payload={}, idempotency_key="bounded-deadline",
+                deadline_seconds=1, now="2026-09-03T00:00:00+00:00",
+            )
+            claim = store.claim_worker_job("owner", now="2026-09-03T00:00:00+00:00", lease_seconds=30)
+            self.assertFalse(store.renew_worker_lease(
+                job["job_id"], "owner", lease_token=claim["lease_token"],
+                now="2026-09-03T00:00:02+00:00", lease_seconds=30,
+            ))
+            done = store.complete_worker_job(
+                job["job_id"], "owner", {"effect_id": "late", "status": "succeeded"},
+                lease_token=claim["lease_token"], now="2026-09-03T00:00:02+00:00",
+            )
+            self.assertEqual(done["status"], "FAILED_PERMANENT")
+            self.assertEqual(done["last_error_kind"], "deadline")
+            self.assertIsNone(done["effect_receipt"])
+
+    def test_accepted_turn_recovery_reconciles_missing_initial_job(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = RecorderStore(root / "db.sqlite3", storage_root=root / "data")
+            complete_turn(store)
+            self.assertEqual(store.get_turn(TURN_ID)["state"], "ACCEPTED")
+            with store._read() as conn:
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM worker_jobs").fetchone()[0], 0)
+            result = RecorderService(store).recover_scheduler(now="2026-09-03T00:00:01+00:00")
+            self.assertEqual(result["accepted_turns_reconciled"], 1)
+            with store._read() as conn:
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM worker_jobs").fetchone()[0], 1)
+
+    def test_network_principal_and_consent_apply_to_json_routes_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = RecorderStore(root / "db.sqlite3", storage_root=root / "data")
+            store.register_device("attacker", "a-phone", "phone")
+            store.register_device("victim", "v-phone", "phone")
+            secret = "synthetic-ingress"
+            proof = hmac.new(secret.encode(), b"attacker\0a-phone", hashlib.sha256).hexdigest()
+            headers = {
+                "X-Recorder-Principal-User": "attacker",
+                "X-Recorder-Principal-Device": "a-phone",
+                "X-Recorder-Principal-Signature": proof,
+            }
+            service = RecorderService(store, ingress_secret=secret)
+            body = json.dumps({"user_id": "victim", "device_id": "v-phone", "project_number": "P", "name": "victim"}).encode()
+            status, _, _ = service.handle_http("POST", "/v1/projects", {**headers, "Content-Type": "application/json"}, body, peer_addr=("127.0.0.1", 1))
+            self.assertEqual(status, 401)
+            status, _, _ = service.handle_http("POST", "/v1/projects", headers, body, peer_addr=("127.0.0.1", 1))
+            self.assertEqual(status, 415)
+            store.record_diagnostics_opt_in("attacker", "a-phone", event_id="consent", expires_at="2026-01-01T00:00:00+00:00")
+            event = json.dumps({"user_id": "attacker", "device_id": "a-phone", "event_id": "event", "idempotency_key": "event", "payload": {"category": "network"}}).encode()
+            status, _, _ = service.handle_http("POST", "/v1/diagnostics/events", {**headers, "Content-Type": "application/json"}, event, peer_addr=("127.0.0.1", 1))
+            self.assertEqual(status, 400)
+            with store._read() as conn:
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM diagnostic_events").fetchone()[0], 0)
 
     def test_background_worker_runs_route_hermes_and_tts_stages(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -171,6 +247,49 @@ class ProviderFeatureTests(unittest.TestCase):
         self.assertEqual(asr.name, "http-asr")
         self.assertEqual(tts.name, "http-tts")
         self.assertEqual(tts.language, "ko-KR")
+
+    def test_history_fallback_stops_at_the_next_user_turn(self):
+        class HistoryGateway(HttpHermesGateway):
+            def __init__(self):
+                super().__init__("http://example.invalid")
+
+            def _request(self, method, path, payload=None, *, extra_headers=None):
+                return [
+                    {"role": "user", "content": "marker-A request"},
+                    {"role": "assistant", "content": "reply-A", "terminal": True, "assistant_message_id": "a"},
+                    {"role": "user", "content": "marker-B request"},
+                    {"role": "assistant", "content": "reply-B", "terminal": True, "assistant_message_id": "b"},
+                ]
+
+        result = HistoryGateway().history_messages(session_key="session", marker="marker-A")
+        self.assertEqual([item.content for item in result], ["reply-A"])
+
+    def test_tts_controls_and_effective_hermes_profile_are_frozen(self):
+        chains = []
+        for rate, pitch, volume in ((1.0, 0.0, 1.0), (2.0, 5.0, 0.0)):
+            config = ProviderConfig.from_spec("voice", "tts", {"adapter": "http-tts", "endpoint": "https://example.invalid/tts", "model": "m", "voice": "v", "rate": rate, "pitch": pitch, "volume": volume})
+            provider = HttpTTSProvider(config.endpoint, model=config.model, voice=config.voice, credential_file=None, rate=rate, pitch=pitch, volume=volume)
+            chains.append(ProviderChain("tts", [ProviderTarget("voice", "tts", "http-tts", provider, declared=config.safe_dict())]))
+        self.assertNotEqual(chains[0].freeze(), chains[1].freeze())
+        with self.assertRaises(ChainFailure):
+            chains[1].validate_frozen(chains[0].freeze())
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            credential = root / "credential"
+            credential.write_text("API_SERVER_KEY=fixture-token\n", encoding="utf-8")
+            credential.chmod(0o600)
+            declaration = ProviderConfig.from_spec("voice", "asr", {"adapter": "hermes", "profile": "default"})
+            configured = []
+            for profile in ("profile-a", "profile-b"):
+                config = RecorderConfig(
+                    database=str(root / f"{profile}.sqlite3"), storage_root=str(root / profile),
+                    hermes_base_url="http://example.invalid", hermes_api_key_file=str(credential),
+                    hermes_profile=profile, asr_providers=(declaration,), asr_chain=("voice",),
+                    tts_source="disabled", tts_provider="disabled",
+                )
+                configured.append(create_configured_service(config).asr_chain)
+            self.assertEqual([chain.targets[0].provider.profile for chain in configured], ["profile-a", "profile-b"])
+            self.assertNotEqual(configured[0].freeze(), configured[1].freeze())
 
     def test_configured_service_rejects_fixture_and_defaults_to_explicit_disabled_tts(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -535,6 +654,49 @@ class AttachmentEavesdropDiagnosticsFeatureTests(unittest.TestCase):
             store.record_diagnostics_opt_in("feature-user", "feature-phone", event_id="opt-out-new", enabled=False, now="2026-09-03T00:00:01Z")
             with self.assertRaises(UnauthorizedError):
                 store.ingest_diagnostic_event("feature-user", "feature-phone", event_id="diag-revoked", idempotency_key="diag-revoked", payload={"category": "voice", "stage": "upload"}, now="2026-09-03T00:00:02Z")
+
+    def test_diagnostics_opt_out_invalidates_historical_bundle_event_id(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = RecorderStore(root / "db.sqlite3", storage_root=root / "data")
+            store.register_device("bundle-user", "bundle-phone", "phone")
+            opt_in = store.record_diagnostics_opt_in("bundle-user", "bundle-phone", event_id="bundle-opt-in", now="2026-09-03T00:00:00Z")
+            store.record_diagnostics_opt_in("bundle-user", "bundle-phone", event_id="bundle-opt-out", enabled=False, now="2026-09-03T00:00:01Z")
+            with self.assertRaises(UnauthorizedError):
+                store.ingest_diagnostic_bundle(
+                    "bundle-user",
+                    "bundle-phone",
+                    "bundle-after-opt-out",
+                    zlib.compress(b'{"category":"voice","stage":"upload"}'),
+                    opt_in_event_id=opt_in["event_id"],
+                    now="2026-09-03T00:00:02Z",
+                )
+            self.assertFalse(list((root / "data" / "diagnostics").rglob("bundle-after-opt-out.z")))
+
+    def test_diagnostics_bundle_rechecks_consent_after_concurrent_revocation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = RecorderStore(root / "db.sqlite3", storage_root=root / "data")
+            store.register_device("race-user", "race-phone", "phone")
+            opt_in = store.record_diagnostics_opt_in("race-user", "race-phone", event_id="race-opt-in", now="2026-09-03T00:00:00Z")
+            original_prepare = store._prepare_cleanup_receipt
+
+            def revoke_after_prepare(*args, **kwargs):
+                receipt = original_prepare(*args, **kwargs)
+                store.record_diagnostics_opt_in("race-user", "race-phone", event_id="race-opt-out", enabled=False, now="2026-09-03T00:00:01Z")
+                return receipt
+
+            with patch.object(store, "_prepare_cleanup_receipt", side_effect=revoke_after_prepare):
+                with self.assertRaises(UnauthorizedError):
+                    store.ingest_diagnostic_bundle(
+                        "race-user",
+                        "race-phone",
+                        "bundle-race",
+                        zlib.compress(b'{"category":"voice","stage":"upload"}'),
+                        opt_in_event_id=opt_in["event_id"],
+                        now="2026-09-03T00:00:02Z",
+                    )
+            self.assertFalse(list((root / "data" / "diagnostics").rglob("bundle-race.z")))
 
     def test_failed_chunk_insert_keeps_cleanup_receipt_until_restart_retry(self):
         with tempfile.TemporaryDirectory() as tmp:

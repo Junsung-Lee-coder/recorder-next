@@ -54,7 +54,13 @@ class RecorderRequestHandler(BaseHTTPRequestHandler):
             self._send_framing_error(400, "INVALID_FRAMING", "request body is shorter than Content-Length")
             return
         try:
-            status, headers, payload = self.server.service.handle_http(method, self.path, self.headers, body)
+            status, headers, payload = self.server.service.handle_http(
+                method,
+                self.path,
+                self.headers,
+                body,
+                peer_addr=self.client_address,
+            )
         except RecorderError as exc:
             status, headers, payload = exc.status, {}, {"error": {"code": exc.code, "message": exc.message}}
         except (KeyError, TypeError, ValueError):

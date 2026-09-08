@@ -75,27 +75,38 @@ The machine-readable contract is `api/openapi.json` and is also served at `GET /
 2. `PUT /v1/turns/{turn_id}/parts/{part_id}/chunks/{sequence}` for ordered bytes.
 3. `POST /v1/turns/{turn_id}/parts/{part_id}/finish` with totals and whole hash.
 4. `POST /v1/turns/{turn_id}/accept` after all parts verify.
-5. A separately owned Router worker uses `POST /v1/internal/router` and the project registry.
-6. An Hermes worker uses `POST /v1/internal/hermes`; the server stores only delivery references and bounded delivery payloads.
-7. Origin-device outbox polling uses `GET /v1/outbox?device_id=...`.
-8. Exact event ACK uses `POST /v1/turns/{turn_id}/events/{event_id}/ack`.
-9. Target TTS playback completion uses `POST /v1/tts/{artifact_id}/playback-ack`; its JSON body must include the target `device_id`, non-empty exact `payload_sha256`, exact `turn_id`, and positive `artifact_version`. A relay receipt cannot complete playback.
-10. An active registered Phone can bridge-read Watch-targeted audio with `GET /v1/tts/{artifact_id}/bridge-read?device_id=...`; bridge reads never authorize playback completion or spool deletion.
-11. `GET /v1/updates/{channel}/manifest` and `GET /v1/updates/{channel}/{generation}/{artifact_name}` serve immutable, hash-verified Phone/Wear APK candidates with `Range`, `If-Range`, and `If-None-Match` support.
-12. `GET /v1/history?user_id=...&project_id=...&cursor=...` returns the path-free project read model with filter-bound keyset cursors.
-13. Phone-owned eavesdrop controls use `POST /v1/eavesdrop`, `POST /v1/eavesdrop/{id}/activate|pause|resume|stop`, `POST /v1/eavesdrop/{id}/segments`, and `POST /v1/eavesdrop/{id}/segments/{sequence}/route`; readback requires the registered Phone owner tuple.
-14. Opt-in diagnostics use `POST /v1/diagnostics/opt-in`, `POST /v1/diagnostics/events`, `POST /v1/diagnostics/bundles`, `GET /v1/diagnostics`, `GET /v1/diagnostics/export`, and `DELETE /v1/diagnostics`.
-15. The autonomous worker is driven by `POST /v1/internal/worker/run` and read through `GET /v1/internal/worker/health`; each completed job has a bound effect receipt.
+5. Origin-device outbox polling uses `GET /v1/outbox?device_id=...`.
+6. Exact event ACK uses `POST /v1/turns/{turn_id}/events/{event_id}/ack`.
+7. Target TTS playback completion uses `POST /v1/tts/{artifact_id}/playback-ack`; its JSON body must include the target `device_id`, non-empty exact `payload_sha256`, exact `turn_id`, and positive `artifact_version`. A relay receipt cannot complete playback.
+8. An active registered Phone can bridge-read Watch-targeted audio with `GET /v1/tts/{artifact_id}/bridge-read?device_id=...`; bridge reads never authorize playback completion or spool deletion.
+9. `GET /v1/updates/{channel}/manifest` and `GET /v1/updates/{channel}/{generation}/{artifact_name}` serve immutable, hash-verified Phone/Wear APK candidates with `Range`, `If-Range`, and `If-None-Match` support.
+10. `GET /v1/history?user_id=...&project_id=...&cursor=...` returns the path-free project read model with filter-bound keyset cursors.
+11. Phone-owned eavesdrop controls use `POST /v1/eavesdrop`, `POST /v1/eavesdrop/{id}/activate|pause|resume|stop`, `POST /v1/eavesdrop/{id}/segments`, and `POST /v1/eavesdrop/{id}/segments/{sequence}/route`; readback requires the registered Phone owner tuple.
+12. Opt-in diagnostics use `POST /v1/diagnostics/opt-in`, `POST /v1/diagnostics/events`, `POST /v1/diagnostics/bundles`, `GET /v1/diagnostics`, `GET /v1/diagnostics/export`, and `DELETE /v1/diagnostics`.
+13. Router, Hermes, scheduler, and durable worker execution are in-process lifecycle components; no state-changing `/v1/internal/*` worker-pump route is part of the production API. Worker health is read-only and background workers are started by the service entry point.
 
-Authentication/key management is intentionally a deployment seam in this standalone candidate. The event, bridge-read, eavesdrop read, diagnostics, and artifact handlers enforce registered active device identity; playback completion remains bound to the frozen delivery target and exact artifact receipt.
+Network requests other than health, OpenAPI, and immutable update reads require a verified principal. Configure the deployment-only `RECORDER_INGRESS_SECRET`; the trusted ingress signs `X-Recorder-Principal-User` plus `X-Recorder-Principal-Device` with HMAC-SHA256 and sends the signature in `X-Recorder-Principal-Signature`. The principal identity must match all user/device fields in the query or JSON body. Direct in-process calls are not a network authorization boundary.
+
+The event, bridge-read, eavesdrop read, diagnostics, and artifact handlers also enforce registered active device identity; playback completion remains bound to the frozen delivery target and exact artifact receipt.
 
 When the configured Hermes provider is enabled, `hermes_api_key_file` must name
 one owner-only credential file containing exactly one ASCII
 `API_SERVER_KEY=<value>` entry. The adapter reads it once during startup and
-sends an in-memory `Authorization: Bearer <value>` header alongside the existing `X-Hermes-Session-Key`; the value is never logged or persisted.
-template uses `LoadCredential=recorder_api_key:...` and
+sends an in-memory `Authorization: Bearer example-token` header and the preferred
+`X-Hermes-Session-Token` header; the value is never logged or persisted. The
+systemd template uses
+`LoadCredential=recorder_api_key:...` and
 `$CREDENTIALS_DIRECTORY/recorder_api_key`. Rotate the source only with a
 Recorder Next restart; do not restart Hermes Gateway.
+
+The Hermes Gateway API listener is not the dashboard audio listener: its
+capability document may report `audio_api=false`, and it does not serve
+`POST /api/audio/speak`. A server-side `HermesAudioTTSProvider` declaration
+must therefore point its `endpoint` at a separately configured audio-capable
+Hermes web endpoint. A 404 from the API-only listener is recorded as
+`provider_unavailable` (with only the bounded HTTP status), not as a generic
+client error; the authenticated 2xx contract is covered by the isolated TTS
+fixture tests.
 
 ## Layout
 
@@ -108,4 +119,4 @@ Recorder Next restart; do not restart Hermes Gateway.
 
 ## Release-control binding
 
-This candidate-only activation and rollback packet is an exact ordered argv contract. Fresh preflight revalidates the packet and binds every manifest, freeze, runtime-preimage, test-ID, and test-source referent by canonical path, size, SHA-256, and semantic fields; any drift is a fail-closed hold.
+This candidate-only activation packet is an exact ordered argv contract. Fresh preflight revalidates every manifest, freeze, runtime-preimage, test-ID, and test-source referent by canonical path, size, SHA-256, and semantic fields; any drift is a fail-closed hold. Live apply remains owned by the root orchestrator; migration, rollback, and predecessor continuity are out of scope for this repair.

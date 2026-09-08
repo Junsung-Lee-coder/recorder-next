@@ -40,6 +40,16 @@ def _urlopen_no_redirect(request: urllib.request.Request, *, timeout: float):
     return _NO_REDIRECT_OPENER.open(request, timeout=timeout)
 
 
+def _close_http_error(exc: urllib.error.HTTPError) -> None:
+    """Close an HTTP error and the response body it owns."""
+    body = getattr(exc, "fp", None)
+    try:
+        exc.close()
+    finally:
+        if body is not None:
+            body.close()
+
+
 class CredentialError(ValueError):
     """Raised when the configured Hermes credential is unsafe or malformed."""
 
@@ -135,7 +145,7 @@ def _read_api_key_file(path: str | os.PathLike[str]) -> str:
                 raise CredentialError("credential file permissions are unsafe")
         with os.fdopen(descriptor, "rb") as handle:
             descriptor = -1
-            raw = handle.read(4097)
+            raw = handle.read(4113)
     except CredentialError:
         raise
     except (OSError, ValueError):
@@ -144,26 +154,17 @@ def _read_api_key_file(path: str | os.PathLike[str]) -> str:
         if descriptor >= 0:
             os.close(descriptor)
 
-    if not raw or len(raw) > 4096:
+    return _parse_credential_record(raw)
+
+
+def _parse_credential_record(raw: bytes) -> str:
+    """One ASCII record, at most 4096 token bytes and one optional final LF."""
+    if len(raw) > 4112:
         raise CredentialError("credential file format is invalid")
-    if raw.endswith(b"\r\n"):
-        line_bytes = raw[:-2]
-    elif raw.endswith(b"\n"):
-        line_bytes = raw[:-1]
-    else:
-        line_bytes = raw
-    if b"\r" in line_bytes or b"\n" in line_bytes:
+    match = re.fullmatch(rb"API_SERVER_KEY=([A-Za-z0-9._~+/=-]{1,4096})\n?", raw)
+    if match is None:
         raise CredentialError("credential file format is invalid")
-    try:
-        line = line_bytes.decode("ascii")
-    except UnicodeDecodeError:
-        raise CredentialError("credential file format is invalid") from None
-    if not line.startswith("API_SERVER_KEY="):
-        raise CredentialError("credential file format is invalid")
-    token = line[len("API_SERVER_KEY=") :]
-    if not token or any(not 0x21 <= ord(character) <= 0x7E for character in token):
-        raise CredentialError("credential file format is invalid")
-    return token
+    return match[1].decode("ascii")
 
 
 class RouterAdapter(Protocol):
@@ -423,7 +424,9 @@ class HttpHermesGateway:
         try:
             result = self._request("POST", chat_path, body, extra_headers=headers)
         except urllib.error.HTTPError as exc:
-            if exc.code != 404:
+            status_code = exc.code
+            _close_http_error(exc)
+            if status_code != 404:
                 return None
             try:
                 self._request(
@@ -436,17 +439,29 @@ class HttpHermesGateway:
                     extra_headers=self._session_headers(session_key),
                 )
             except urllib.error.HTTPError as create_exc:
-                if create_exc.code != 409:
+                status_code = create_exc.code
+                _close_http_error(create_exc)
+                if status_code != 409:
                     return None
             except (urllib.error.URLError, TimeoutError):
                 return None
             try:
                 result = self._request("POST", chat_path, body, extra_headers=headers)
+            except urllib.error.HTTPError as retry_exc:
+                _close_http_error(retry_exc)
+                return None
             except (urllib.error.URLError, TimeoutError):
                 return None
         except (urllib.error.URLError, TimeoutError):
             return None
-        return self._parse_result(result)
+        parsed = self._parse_result(result)
+        if parsed is None:
+            return None
+        if parsed.marker is not None and parsed.marker != marker:
+            return None
+        if parsed.submission_id is not None and parsed.submission_id != submission_id:
+            return None
+        return parsed
 
     def history(self, *, session_key: str, marker: str) -> HermesResult | None:
         values = self.history_messages(session_key=session_key, marker=marker)
@@ -456,6 +471,9 @@ class HttpHermesGateway:
         encoded_session = quote(session_key, safe="")
         try:
             result = self._request("GET", f"/api/sessions/{encoded_session}/messages", extra_headers=self._session_headers(session_key))
+        except urllib.error.HTTPError as exc:
+            _close_http_error(exc)
+            return []
         except (urllib.error.URLError, TimeoutError):
             return []
         if isinstance(result, Mapping):
@@ -464,53 +482,241 @@ class HttpHermesGateway:
             messages = result if isinstance(result, list) else []
         if not isinstance(messages, list):
             return []
-        marker_index = -1
+        marker_indices: list[int] = []
         for index, message in enumerate(messages):
-            if marker in json.dumps(message, ensure_ascii=False, sort_keys=True):
-                marker_index = index
-        if marker_index < 0:
-            return []
-        parsed: list[HermesResult] = []
-        for message in messages[marker_index + 1 :]:
             if not isinstance(message, Mapping):
                 continue
-            role = str(message.get("role") or message.get("author_role") or "assistant")
+            role = self._message_role(message)
+            if role in {"user", "human", "client"} and self._message_matches_marker(message, marker):
+                marker_indices.append(index)
+        # A marker is a correlation token, not a substring search across the
+        # entire conversation.  Multiple matching user messages are ambiguous
+        # and must not produce a late result for the wrong turn.
+        if len(marker_indices) != 1:
+            return []
+        marker_index = marker_indices[0]
+        next_user = len(messages)
+        for index in range(marker_index + 1, len(messages)):
+            message = messages[index]
+            if not isinstance(message, Mapping):
+                continue
+            role = self._message_role(message)
+            if role in {"user", "human", "client"}:
+                next_user = index
+                break
+        parsed: list[HermesResult] = []
+        for message in messages[marker_index + 1 : next_user]:
+            if not isinstance(message, Mapping):
+                continue
+            role = self._message_role(message)
+            if role is not None and not isinstance(role, str):
+                continue
+            role = role or "assistant"
             if role not in {"assistant", "model", "bot"}:
                 continue
-            content = message.get("content") or message.get("assistant_content")
-            if isinstance(content, list):
-                content = "".join(str(item.get("text", "")) for item in content if isinstance(item, Mapping))
-            if content:
-                parsed.append(HermesResult(str(message.get("id") or marker), str(content), True, "hermes-history"))
+            parsed_result = self._parse_result(message, source="hermes-history")
+            if parsed_result is not None and parsed_result.terminal is True and (parsed_result.marker is None or parsed_result.marker == marker):
+                parsed.append(parsed_result)
         return parsed
 
+    @classmethod
+    def _message_role(cls, message: Mapping[str, Any]) -> Any:
+        role = cls._first_present(message, ("role", "author_role"))
+        if role is None and isinstance(message.get("message"), Mapping):
+            role = cls._first_present(message["message"], ("role", "author_role"))
+        return role
+
+    @classmethod
+    def _message_matches_marker(cls, message: Mapping[str, Any], marker: str) -> bool:
+        """Match a user turn by structured correlation before text fallback."""
+        containers: list[Mapping[str, Any]] = [message]
+        nested = message.get("message")
+        if isinstance(nested, Mapping):
+            containers.append(nested)
+        for container in tuple(containers):
+            metadata = container.get("metadata")
+            if isinstance(metadata, Mapping):
+                containers.append(metadata)
+        structured: list[str] = []
+        for container in containers:
+            for key in ("marker", "correlation_id"):
+                if key not in container:
+                    continue
+                value = container[key]
+                if not isinstance(value, str) or not value.strip():
+                    return False
+                structured.append(value.strip())
+        if structured:
+            return len(set(structured)) == 1 and structured[0] == marker
+        for container in containers:
+            for key in ("content", "text", "input", "prompt"):
+                value = container.get(key)
+                if isinstance(value, str) and marker in value:
+                    return True
+                if isinstance(value, list) and any(isinstance(item, str) and marker in item for item in value):
+                    return True
+        return False
+
     @staticmethod
-    def _parse_result(result: Any) -> HermesResult | None:
+    def _first_present(source: Mapping[str, Any], keys: tuple[str, ...]) -> Any:
+        for key in keys:
+            if key in source:
+                return source[key]
+        return None
+
+    @classmethod
+    def _envelope_containers(cls, result: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+        """Return the bounded envelope containers used for consistency checks."""
+        containers: list[Mapping[str, Any]] = []
+        pending: list[Mapping[str, Any]] = [result]
+        seen: set[int] = set()
+        while pending and len(containers) < 16:
+            container = pending.pop(0)
+            marker = id(container)
+            if marker in seen:
+                continue
+            seen.add(marker)
+            containers.append(container)
+            for key in ("message", "data", "result", "metadata"):
+                nested = container.get(key)
+                if isinstance(nested, Mapping):
+                    pending.append(nested)
+        return containers
+
+    @staticmethod
+    def _consistent_values(containers: Sequence[Mapping[str, Any]], keys: tuple[str, ...]) -> tuple[bool, list[Any]]:
+        values: list[Any] = []
+        for container in containers:
+            for key in keys:
+                if key in container:
+                    values.append(container[key])
+        if not values:
+            return True, []
+        first = values[0]
+        return all(value == first for value in values[1:]), values
+
+    @staticmethod
+    def _normalized_state(value: Any) -> str | None:
+        if not isinstance(value, str) or not value.strip():
+            return None
+        return value.strip().lower().replace("-", "_").replace(".", "_").replace(" ", "_")
+
+    @classmethod
+    def _parse_result(cls, result: Any, *, source: str = "hermes-chat") -> HermesResult | None:
         if not isinstance(result, Mapping):
             return None
+        containers = cls._envelope_containers(result)
         message = result.get("message")
         nested_message = message if isinstance(message, Mapping) else {}
-        text = (
-            result.get("text")
-            or result.get("content")
-            or result.get("assistant_content")
-            or nested_message.get("content")
-        )
-        if isinstance(text, list):
-            text = "".join(str(item.get("text", "")) for item in text if isinstance(item, Mapping))
-        if not text:
+        object_type = result.get("object")
+        if object_type is not None and (not isinstance(object_type, str) or object_type not in {"hermes.session.chat.completion", "assistant_message", "message"}):
             return None
+
+        role_values: list[Any] = []
+        for container in containers:
+            for key in ("role", "author_role"):
+                if key in container:
+                    role_values.append(container[key])
+        if role_values and (any(not isinstance(value, str) or value not in {"assistant", "model", "bot"} for value in role_values) or any(value != role_values[0] for value in role_values[1:])):
+            return None
+
+        state: bool | None = None
+        progress_states = {"progress", "in_progress", "pending", "queued", "running", "started", "streaming", "partial", "incomplete", "working"}
+        terminal_states = {"completed", "complete", "success", "succeeded", "final", "done", "terminal"}
+        failure_states = {"failed", "failure", "error", "errors", "unsuccessful", "not_completed", "cancelled", "canceled", "rejected", "denied"}
+        envelope_types = {"assistant_message", "message", "hermes_session_chat_completion", "chat_completion"}
+        for container in containers:
+            explicit = container.get("terminal")
+            if explicit is not None:
+                if not isinstance(explicit, bool):
+                    return None
+                if state is not None and state is not explicit:
+                    return None
+                state = explicit
+            for key in ("status", "state", "outcome", "event", "type"):
+                value = container.get(key)
+                if value is None:
+                    continue
+                normalized = cls._normalized_state(value)
+                if normalized is None:
+                    return None
+                if key == "type" and normalized in envelope_types:
+                    continue
+                if normalized in failure_states or normalized.startswith(("fail", "error", "unsuccess", "not_completed", "cancel", "reject")):
+                    return None
+                if normalized in progress_states or any(token in normalized for token in ("progress", "streaming", "partial", "in_progress")):
+                    candidate_state = False
+                elif normalized in terminal_states or any(token in normalized for token in ("completed", "complete", "final", "succeeded", "success")):
+                    candidate_state = True
+                else:
+                    return None
+                if state is not None and state is not candidate_state:
+                    return None
+                state = candidate_state
+            if "error" in container and container["error"] not in (None, False, ""):
+                return None
+        text_values: list[Any] = []
+        for container in containers:
+            for key in ("text", "content", "assistant_content", "response"):
+                if key in container and container[key] is not None:
+                    text_values.append(container[key])
+        text: Any = next((value for value in text_values if isinstance(value, str) and value.strip()), None)
+        if text_values and any(not isinstance(value, (str, list)) for value in text_values):
+            return None
+        if len([value for value in text_values if isinstance(value, str) and value.strip()]) > 1:
+            nonempty = [value.strip() for value in text_values if isinstance(value, str) and value.strip()]
+            if any(value != nonempty[0] for value in nonempty[1:]):
+                return None
+        if isinstance(text, list):
+            pieces: list[str] = []
+            for item in text:
+                if isinstance(item, str):
+                    pieces.append(item)
+                elif isinstance(item, Mapping) and isinstance(item.get("text"), str):
+                    pieces.append(item["text"])
+                else:
+                    return None
+            text = "".join(pieces) if pieces else None
+        if not isinstance(text, str) or not text.strip():
+            text = None
+
+        if state is None:
+            # The current Hermes chat endpoint uses a completion object or a
+            # compact assistant-message envelope without a status field.
+            # Preserve those known legacy success envelopes, but do not infer
+            # terminality from an unknown status-bearing object.
+            state = True
+        if text is None:
+            return None
+        consistent, ids = cls._consistent_values(containers, ("assistant_message_id", "message_id", "id"))
+        if not consistent:
+            return None
+        assistant_message_id = ids[0] if ids else "hermes-response"
+        if not isinstance(assistant_message_id, str) or not assistant_message_id.strip():
+            return None
+        consistent, values = cls._consistent_values(containers, ("submission_id", "hermes_submission_id"))
+        if not consistent:
+            return None
+        submission_id = values[0] if values else None
+        consistent, values = cls._consistent_values(containers, ("turn_id", "recorder_turn_id"))
+        if not consistent:
+            return None
+        turn_id = values[0] if values else None
+        consistent, values = cls._consistent_values(containers, ("marker", "correlation_id"))
+        if not consistent:
+            return None
+        result_marker = values[0] if values else None
+        for label, value in (("submission_id", submission_id), ("turn_id", turn_id), ("marker", result_marker)):
+            if value is not None and (not isinstance(value, str) or not value.strip()):
+                return None
         return HermesResult(
-            str(
-                result.get("assistant_message_id")
-                or result.get("message_id")
-                or nested_message.get("id")
-                or result.get("id")
-                or "hermes-response"
-            ),
-            str(text),
-            True,
-            "hermes-chat",
+            assistant_message_id.strip(),
+            text,
+            state,
+            source,
+            submission_id.strip() if isinstance(submission_id, str) else None,
+            turn_id.strip() if isinstance(turn_id, str) else None,
+            result_marker.strip() if isinstance(result_marker, str) else None,
         )
 
 
@@ -571,7 +777,7 @@ def _read_provider_credential(path: str | os.PathLike[str]) -> str:
             raise CredentialError("provider credential metadata is unsafe")
         with os.fdopen(descriptor, "rb") as handle:
             descriptor = -1
-            raw = handle.read(4097)
+            raw = handle.read(4113)
     except CredentialError:
         raise
     except (OSError, ValueError):
@@ -579,22 +785,7 @@ def _read_provider_credential(path: str | os.PathLike[str]) -> str:
     finally:
         if descriptor >= 0:
             os.close(descriptor)
-    if not raw or len(raw) > 4096:
-        raise CredentialError("provider credential format is invalid")
-    line_bytes = raw[:-2] if raw.endswith(b"\r\n") else raw[:-1] if raw.endswith(b"\n") else raw
-    if b"\r" in line_bytes or b"\n" in line_bytes:
-        raise CredentialError("provider credential format is invalid")
-    try:
-        line = line_bytes.decode("ascii")
-    except UnicodeDecodeError:
-        raise CredentialError("provider credential format is invalid") from None
-    for prefix in ("API_SERVER_KEY=", "API_KEY=", "TOKEN="):
-        if line.startswith(prefix):
-            line = line[len(prefix) :]
-            break
-    if not line or any(not 0x21 <= ord(character) <= 0x7E for character in line):
-        raise CredentialError("provider credential format is invalid")
-    return line
+    return _parse_credential_record(raw)
 
 
 def _provider_failure_for_http(status_code: int) -> ProviderFailure:
@@ -650,22 +841,37 @@ class _HTTPProvider:
             raise ValueError("provider probe path must be an origin-relative path")
         return path
 
-    def _request(self, payload: Mapping[str, Any], *, max_response_bytes: int = 16 * 1024 * 1024) -> tuple[str, bytes]:
+    def _auth_headers(self) -> dict[str, str]:
+        if self._credential is None:
+            return {}
+        return {"Authorization": f"Bearer {self._credential}"}
+
+    def _request(
+        self,
+        payload: Mapping[str, Any],
+        *,
+        max_response_bytes: int = 16 * 1024 * 1024,
+        timeout_seconds: float | None = None,
+    ) -> tuple[str, bytes]:
         if not isinstance(max_response_bytes, int) or max_response_bytes < 1:
             raise ValueError("provider response limit is invalid")
         body = json.dumps(dict(payload), ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
         headers = {"Accept": "application/json, audio/mpeg", "Content-Type": "application/json"}
-        if self._credential is not None:
-            headers["Authorization"] = f"Bearer {self._credential}"
+        headers.update(self._auth_headers())
+        timeout = self.timeout if timeout_seconds is None else min(self.timeout, float(timeout_seconds))
+        if timeout <= 0:
+            raise ProviderFailure("timeout", retryable=True)
         request = urllib.request.Request(self.endpoint, data=body, method="POST", headers=headers)
         try:
-            with _urlopen_no_redirect(request, timeout=self.timeout) as response:
+            with _urlopen_no_redirect(request, timeout=timeout) as response:
                 raw = response.read(max_response_bytes + 1)
                 if len(raw) > max_response_bytes:
                     raise ProviderFailure("response_too_large", retryable=False)
                 return response.headers.get("Content-Type", ""), raw
         except urllib.error.HTTPError as exc:
-            raise _provider_failure_for_http(exc.code) from None
+            status_code = exc.code
+            exc.close()
+            raise _provider_failure_for_http(status_code) from None
         except (socket.timeout, TimeoutError):
             raise ProviderFailure("timeout", retryable=True) from None
         except urllib.error.URLError:
@@ -677,15 +883,16 @@ class _HTTPProvider:
         parsed = urllib.parse.urlsplit(self.endpoint)
         url = urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, path, "", ""))
         headers = {"Accept": "application/json"}
-        if self._credential is not None:
-            headers["Authorization"] = f"Bearer {self._credential}"
+        headers.update(self._auth_headers())
         request = urllib.request.Request(url, method="GET", headers=headers)
         try:
             with _urlopen_no_redirect(request, timeout=self.timeout) as response:
                 raw = response.read(64 * 1024 + 1)
                 status_code = int(getattr(response, "status", 200))
         except urllib.error.HTTPError as exc:
-            raise _provider_failure_for_http(exc.code) from None
+            status_code = exc.code
+            exc.close()
+            raise _provider_failure_for_http(status_code) from None
         except (socket.timeout, TimeoutError):
             raise ProviderFailure("timeout", retryable=True) from None
         except urllib.error.URLError:
@@ -718,6 +925,139 @@ class _HTTPProvider:
         return self._probe(self.capability_path)
 
 
+_ASR_FAILURE_STATES = {
+    "failed",
+    "failure",
+    "error",
+    "errors",
+    "provider_error",
+    "unsuccessful",
+    "not_completed",
+    "cancelled",
+    "canceled",
+    "rejected",
+    "denied",
+}
+_ASR_PROGRESS_STATES = {
+    "progress",
+    "in_progress",
+    "pending",
+    "queued",
+    "running",
+    "started",
+    "streaming",
+    "partial",
+    "incomplete",
+    "working",
+}
+_ASR_SUCCESS_STATES = {
+    "ok",
+    "accepted",
+    "ready",
+    "completed",
+    "complete",
+    "success",
+    "succeeded",
+    "final",
+    "done",
+    "terminal",
+    "valid_transcript",
+    "no_speech",
+    "empty",
+    "silence",
+    "no_audio",
+}
+
+
+def _asr_payload_containers(payload: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    """Return a bounded set of nested ASR envelope objects."""
+    containers: list[Mapping[str, Any]] = []
+    pending: list[Mapping[str, Any]] = [payload]
+    seen: set[int] = set()
+    while pending and len(containers) < 16:
+        container = pending.pop(0)
+        identity = id(container)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        containers.append(container)
+        for key in ("data", "result", "response", "message", "output", "metadata"):
+            nested = container.get(key)
+            if isinstance(nested, Mapping):
+                pending.append(nested)
+    return containers
+
+
+def _asr_payload_details(payload: Mapping[str, Any]) -> tuple[str, str | None, str | None]:
+    """Validate an ASR envelope before accepting transcript text.
+
+    Status, outcome, error, and boolean success markers are authoritative even
+    when a response also contains a non-empty diagnostic string.  Text-only
+    responses remain supported for the documented legacy endpoint contract.
+    """
+    containers = _asr_payload_containers(payload)
+    states: list[str] = []
+    for container in containers:
+        for key in ("status", "state", "outcome"):
+            if key not in container or container[key] is None:
+                continue
+            value = container[key]
+            if not isinstance(value, str) or not value.strip():
+                raise ProviderFailure("malformed_success", retryable=False)
+            normalized = value.strip().lower().replace("-", "_").replace(" ", "_")
+            if normalized in _ASR_FAILURE_STATES or normalized.startswith(("fail", "error", "unsuccess", "not_completed", "cancel", "reject", "den")):
+                raise ProviderFailure("provider_error", retryable=False)
+            if normalized in _ASR_PROGRESS_STATES or any(token in normalized for token in ("progress", "streaming", "partial", "in_progress")):
+                raise ProviderFailure("malformed_success", retryable=False)
+            if normalized not in _ASR_SUCCESS_STATES:
+                raise ProviderFailure("malformed_success", retryable=False)
+            states.append(normalized)
+        for key in ("ok", "success", "completed", "terminal"):
+            if key not in container or container[key] is None:
+                continue
+            value = container[key]
+            if not isinstance(value, bool):
+                raise ProviderFailure("malformed_success", retryable=False)
+            if not value:
+                raise ProviderFailure("provider_error", retryable=False)
+        error = container.get("error")
+        if error not in (None, False, "", {}, []):
+            raise ProviderFailure("provider_error", retryable=False)
+
+    text_values: list[str] = []
+    for container in containers:
+        for key in ("transcript", "text", "transcription"):
+            value = container.get(key)
+            if value is None:
+                continue
+            if not isinstance(value, str):
+                raise ProviderFailure("malformed_success", retryable=False)
+            if value.strip():
+                text_values.append(value.strip())
+    if len(set(text_values)) > 1:
+        raise ProviderFailure("malformed_success", retryable=False)
+    text = text_values[0] if text_values else None
+    no_speech = any(state in {"no_speech", "empty", "silence", "no_audio"} for state in states)
+    if no_speech:
+        if text is not None:
+            raise ProviderFailure("malformed_success", retryable=False)
+        outcome = "NO_SPEECH"
+    else:
+        if text is None:
+            raise ProviderFailure("malformed_success", retryable=False)
+        outcome = "VALID_TRANSCRIPT"
+    provider: str | None = None
+    for container in containers:
+        value = container.get("provider")
+        if value is not None:
+            if not isinstance(value, str) or not value.strip():
+                raise ProviderFailure("malformed_success", retryable=False)
+            if provider is not None and provider != value.strip():
+                raise ProviderFailure("malformed_success", retryable=False)
+            provider = value.strip()
+    return outcome, text, provider
+
+
 class HttpASRProvider(_HTTPProvider):
     """Production HTTP ASR adapter with fail-closed response parsing."""
 
@@ -747,7 +1087,7 @@ class HttpASRProvider(_HTTPProvider):
             raise ValueError("ASR media types must be audio MIME types")
         super().__init__(endpoint, timeout=timeout, credential_file=credential_file, health_path=health_path, capability_path=capability_path)
 
-    def transcribe(self, audio: bytes, *, turn_id: str, generation: int) -> AsrResult:
+    def transcribe(self, audio: bytes, *, turn_id: str, generation: int, timeout_seconds: float | None = None) -> AsrResult:
         if not isinstance(audio, bytes) or not audio or (self.max_bytes is not None and len(audio) > self.max_bytes):
             raise ProviderFailure("unsupported_media", retryable=False)
         content_type, raw = self._request(
@@ -759,6 +1099,7 @@ class HttpASRProvider(_HTTPProvider):
                 "generation": generation,
             },
             max_response_bytes=16 * 1024 * 1024,
+            timeout_seconds=timeout_seconds,
         )
         del content_type
         try:
@@ -767,8 +1108,8 @@ class HttpASRProvider(_HTTPProvider):
             raise ProviderFailure("malformed_success", retryable=False) from None
         if not isinstance(payload, Mapping):
             raise ProviderFailure("malformed_success", retryable=False)
-        outcome = payload.get("outcome")
-        if outcome in {"NO_SPEECH", "no_speech", "empty"}:
+        outcome, text, _provider = _asr_payload_details(payload)
+        if outcome == "NO_SPEECH":
             return AsrResult(
                 "NO_SPEECH",
                 metadata={
@@ -782,25 +1123,22 @@ class HttpASRProvider(_HTTPProvider):
                     "attempt_identity": f"{turn_id}:{generation}",
                 },
             )
-        text = payload.get("transcript") or payload.get("text")
-        if isinstance(text, str) and text.strip():
-            normalized = text.strip()
-            return AsrResult(
-                "VALID_TRANSCRIPT",
-                transcript=normalized,
-                metadata={
-                    "mode": self.mode,
-                    "endpoint_contract": self.endpoint,
-                    "provider": self.name,
-                    "model": self.model,
-                    "input_sha256": sha256_bytes(audio),
-                    "output_sha256": sha256_bytes(normalized.encode("utf-8")),
-                    "content_type": "audio/wav",
-                    "byte_size": len(audio),
-                    "attempt_identity": f"{turn_id}:{generation}",
-                },
-            )
-        raise ProviderFailure("malformed_success", retryable=False)
+        assert text is not None
+        return AsrResult(
+            "VALID_TRANSCRIPT",
+            transcript=text,
+            metadata={
+                "mode": self.mode,
+                "endpoint_contract": self.endpoint,
+                "provider": self.name,
+                "model": self.model,
+                "input_sha256": sha256_bytes(audio),
+                "output_sha256": sha256_bytes(text.encode("utf-8")),
+                "content_type": "audio/wav",
+                "byte_size": len(audio),
+                "attempt_identity": f"{turn_id}:{generation}",
+            },
+        )
 
 
 class NemotronASRProvider(HttpASRProvider):
@@ -821,6 +1159,18 @@ PROFILE_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 
 
 def _hermes_profile_endpoint(base_url: str, path: str, profile: str) -> str:
+    if not isinstance(base_url, str):
+        raise ValueError("Hermes base URL must be a string")
+    parsed = urllib.parse.urlsplit(base_url)
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.netloc
+        or parsed.username
+        or parsed.password
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError("Hermes base URL must not contain query or credentials")
     if not PROFILE_RE.fullmatch(profile):
         raise ValueError("Hermes profile must be a bounded identifier")
     return f"{base_url.rstrip('/')}{path}?profile={quote(profile, safe='')}"
@@ -860,25 +1210,31 @@ class HermesAudioASRProvider(_HTTPProvider):
             capability_path=capability_path,
         )
 
-    def transcribe(self, audio: bytes, *, turn_id: str, generation: int) -> AsrResult:
+    def transcribe(
+        self,
+        audio: bytes,
+        *,
+        turn_id: str,
+        generation: int,
+        timeout_seconds: float | None = None,
+    ) -> AsrResult:
         if not isinstance(audio, bytes) or not audio or (self.max_bytes is not None and len(audio) > self.max_bytes):
             raise ProviderFailure("oversized_or_empty_media", retryable=False)
         data_url = "data:audio/wav;base64," + base64.b64encode(audio).decode("ascii")
-        _content_type, raw = self._request({"audio": data_url}, max_response_bytes=16 * 1024 * 1024)
+        request_kwargs: dict[str, Any] = {"max_response_bytes": 16 * 1024 * 1024}
+        if timeout_seconds is not None:
+            request_kwargs["timeout_seconds"] = timeout_seconds
+        _content_type, raw = self._request({"audio": data_url}, **request_kwargs)
         try:
             payload = json.loads(raw.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError):
             raise ProviderFailure("malformed_response", retryable=False) from None
         if not isinstance(payload, Mapping):
             raise ProviderFailure("malformed_response", retryable=False)
-        nested = payload.get("result") if isinstance(payload.get("result"), Mapping) else payload
-        outcome = nested.get("outcome") or nested.get("status") if isinstance(nested, Mapping) else None
-        provider_value = nested.get("provider") if isinstance(nested, Mapping) else None
-        if isinstance(outcome, str) and outcome.lower().replace("-", "_") in {"no_speech", "empty", "no_audio"}:
+        outcome, text, provider_value = _asr_payload_details(payload)
+        if outcome == "NO_SPEECH":
             return AsrResult("NO_SPEECH", metadata={"mode": self.mode, "provider": _safe_provider_name(provider_value or payload.get("provider")), "hermes_profile": self.profile, "endpoint_contract": self.endpoint_contract, "input_sha256": sha256_bytes(audio), "content_type": "audio/wav", "byte_size": len(audio), "attempt_identity": f"{turn_id}:{generation}"})
-        text = nested.get("text") or nested.get("transcript") or nested.get("transcription") if isinstance(nested, Mapping) else None
-        if not isinstance(text, str) or not text.strip():
-            raise ProviderFailure("malformed_response", retryable=False)
+        assert text is not None
         normalized = text.strip()
         return AsrResult(
             "VALID_TRANSCRIPT",
@@ -936,9 +1292,11 @@ class HttpTTSProvider(_HTTPProvider):
         self.options = dict(options or {})
         if any(str(key).lower() in {"api_key", "authorization", "credential", "password", "secret", "token"} for key in self.options):
             raise ValueError("TTS options cannot contain credentials")
+        if any(str(key).lower() in {"text", "model", "voice", "language", "artifact_id", "response_format", "output_format", "format", "rate", "pitch", "volume"} for key in self.options):
+            raise ValueError("TTS option is reserved by the provider contract")
         super().__init__(endpoint, timeout=timeout, credential_file=credential_file, health_path=health_path, capability_path=capability_path)
 
-    def synthesize(self, text: str, *, artifact_id: str) -> TTSResult:
+    def synthesize(self, text: str, *, artifact_id: str, timeout_seconds: float | None = None) -> TTSResult:
         if not isinstance(text, str) or not text:
             raise ProviderFailure("malformed_request", retryable=False)
         request_payload: dict[str, Any] = {
@@ -955,7 +1313,8 @@ class HttpTTSProvider(_HTTPProvider):
         request_payload.update(self.options)
         content_type, raw = self._request(
             request_payload,
-            max_response_bytes=self.max_bytes or 16 * 1024 * 1024,
+            max_response_bytes=min(16 * 1024 * 1024, max(64 * 1024, (self.max_bytes or 0) * 2 + 4096)),
+            timeout_seconds=timeout_seconds,
         )
         returned_http_type = _audio_content_type(content_type)
         if returned_http_type is not None:
@@ -1065,10 +1424,46 @@ class HermesAudioTTSProvider(_HTTPProvider):
             capability_path=capability_path,
         )
 
-    def synthesize(self, text: str, *, artifact_id: str) -> TTSResult:
+    def _auth_headers(self) -> dict[str, str]:
+        headers = super()._auth_headers()
+        if self._credential is not None:
+            # Hermes' dashboard audio route prefers its dedicated session
+            # header; Authorization remains present for legacy clients and
+            # authenticated protocol fixtures.
+            headers["X-Hermes-Session-Token"] = self._credential
+        return headers
+
+    def _request(
+        self,
+        payload: Mapping[str, Any],
+        *,
+        max_response_bytes: int = 16 * 1024 * 1024,
+        timeout_seconds: float | None = None,
+    ) -> tuple[str, bytes]:
+        """Classify an API-only Hermes listener as unavailable for TTS.
+
+        The Gateway API and the dashboard web server are separate Hermes
+        surfaces.  The former can be healthy while not exposing the desktop
+        ``/api/audio/speak`` route, which otherwise becomes a misleading
+        generic client failure after the HTTP 404 mapping in ``_HTTPProvider``.
+        Keep the status code for a redaction-safe operator receipt, but make
+        the capability mismatch explicit to provider-chain fallback logic.
+        """
+        try:
+            return super()._request(payload, max_response_bytes=max_response_bytes, timeout_seconds=timeout_seconds)
+        except ProviderFailure as exc:
+            if exc.status_code == 404:
+                raise ProviderFailure("provider_unavailable", retryable=False, status_code=404) from None
+            raise
+
+    def synthesize(self, text: str, *, artifact_id: str, timeout_seconds: float | None = None) -> TTSResult:
         if not isinstance(text, str) or not text.strip():
             raise ProviderFailure("malformed_request", retryable=False)
-        content_type, raw = self._request({"text": text}, max_response_bytes=self.max_bytes or 16 * 1024 * 1024)
+        content_type, raw = self._request(
+            {"text": text},
+            max_response_bytes=min(16 * 1024 * 1024, max(64 * 1024, (self.max_bytes or 0) * 2 + 4096)),
+            timeout_seconds=timeout_seconds,
+        )
         returned_http_type = _audio_content_type(content_type)
         if returned_http_type is not None:
             audio, returned_type = raw, returned_http_type
@@ -1166,7 +1561,7 @@ class ProviderTarget:
             "timeout_seconds": float(self.timeout_seconds),
             "credential_configured": bool(declared.get("credential_file") or declared.get("credential_configured")),
         }
-        for key in ("profile", "model", "voice", "language", "endpoint_contract", "fallback_of", "health_path", "capability_path", "output_format", "credential_ref_sha256"):
+        for key in ("profile", "model", "voice", "language", "endpoint_contract", "fallback_of", "health_path", "capability_path", "output_format", "rate", "pitch", "volume", "credential_ref_sha256"):
             value = declared.get(key)
             if value is not None:
                 if not isinstance(value, (str, int, float, bool)):
@@ -1275,8 +1670,24 @@ class ProviderChain:
                 if time.monotonic() >= deadline:
                     raise ChainFailure("deadline", statuses, retryable=False)
                 try:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise ChainFailure("deadline", statuses, retryable=False)
+                    request_timeout = min(remaining, target.timeout_seconds)
+                    if request_timeout <= 0:
+                        raise ChainFailure("deadline", statuses, retryable=False)
                     request_generation = index * 100 + attempt
-                    result = target.provider.transcribe(value, turn_id=identifier, generation=request_generation) if operation == "asr" else target.provider.synthesize(value, artifact_id=identifier)
+                    provider: Any = target.provider
+                    if operation == "asr":
+                        if isinstance(provider, _HTTPProvider):
+                            result = getattr(provider, "transcribe")(value, turn_id=identifier, generation=request_generation, timeout_seconds=request_timeout)
+                        else:
+                            result = provider.transcribe(value, turn_id=identifier, generation=request_generation)
+                    else:
+                        if isinstance(provider, _HTTPProvider):
+                            result = getattr(provider, "synthesize")(value, artifact_id=identifier, timeout_seconds=request_timeout)
+                        else:
+                            result = provider.synthesize(value, artifact_id=identifier)
                     if time.monotonic() >= deadline:
                         statuses.append(self._safe_status(target, status="deadline", retry_count=attempt))
                         raise ChainFailure("deadline", statuses, retryable=False)
@@ -1309,7 +1720,15 @@ class ProviderChain:
                     # failure, or when the provider explicitly reports that it
                     # is unavailable/capacity constrained.  Permanent server
                     # and auth failures must not silently switch providers.
-                    eligible = (exc.retryable and exc.kind in self._eligible) or exc.kind in {"provider_unavailable", "unavailable", "capacity"}
+                    client_terminal = (
+                        isinstance(exc.status_code, int)
+                        and 400 <= exc.status_code < 500
+                        and exc.status_code not in {408, 429}
+                    )
+                    eligible = not client_terminal and (
+                        (exc.retryable and exc.kind in self._eligible)
+                        or exc.kind in {"provider_unavailable", "unavailable", "capacity"}
+                    )
                     target_status = self._safe_status(target, status="retryable_failure" if eligible else "permanent_failure", retry_count=attempt, error=exc)
                     if not eligible:
                         statuses.append(target_status)
@@ -1327,7 +1746,14 @@ class ProviderChain:
                     failure = ProviderFailure("provider_error", retryable=False)
                     statuses.append(self._safe_status(target, status="permanent_failure", retry_count=attempt, error=failure))
                     raise ChainFailure("provider_error", statuses, retryable=False)
-        raise ChainFailure("all_targets_failed", statuses, retryable=False)
+        terminal_kind = "all_targets_failed"
+        if statuses and all(
+            item.get("error_kind") in {"provider_unavailable", "unavailable", "capacity"}
+            for item in statuses
+        ):
+            terminal_kind = "provider_unavailable"
+        retryable = bool(statuses) and all(item.get("status") == "retryable_failure" for item in statuses)
+        raise ChainFailure(terminal_kind, statuses, retryable=retryable)
 
     def execute_asr(self, audio: bytes, *, turn_id: str, frozen: Mapping[str, Any] | None = None) -> AsrResult:
         return self._execute("asr", audio, turn_id, frozen=frozen)

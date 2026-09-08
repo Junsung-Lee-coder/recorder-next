@@ -1,4 +1,5 @@
 import hashlib
+import hmac
 import http.client
 import json
 import os
@@ -24,6 +25,7 @@ BASE_TURN = {
     "current_project_number": None,
     "prefer_current_project": False,
 }
+INGRESS_SECRET = "r1-fixture-ingress-secret"
 
 
 def manifest(turn_id, parts):
@@ -425,7 +427,7 @@ class RecorderR1RepairTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             store = RecorderStore(root / "db.sqlite3", storage_root=root / "data")
-            service = RecorderService(store)
+            service = RecorderService(store, ingress_secret=INGRESS_SECRET)
             store.register_device("diag-user", "diag-phone", "phone")
             store.record_diagnostics_opt_in("diag-user", "diag-phone", event_id="consent-g2")
             store.ingest_diagnostic_event(
@@ -441,12 +443,19 @@ class RecorderR1RepairTests(unittest.TestCase):
             try:
                 host, port = server.server_address
                 connection = http.client.HTTPConnection(host, port, timeout=2)
-                connection.request("DELETE", "/v1/diagnostics?user_id=diag-user&device_id=diag-phone")
+                auth_headers = {
+                    "X-Recorder-Principal-User": "diag-user",
+                    "X-Recorder-Principal-Device": "diag-phone",
+                    "X-Recorder-Principal-Signature": hmac.new(
+                        INGRESS_SECRET.encode("utf-8"), b"diag-user\x00diag-phone", hashlib.sha256
+                    ).hexdigest(),
+                }
+                connection.request("DELETE", "/v1/diagnostics?user_id=diag-user&device_id=diag-phone", headers=auth_headers)
                 response = connection.getresponse()
                 payload = json.loads(response.read().decode())
                 self.assertEqual(response.status, 200, payload)
                 self.assertEqual(payload, {"events": 1, "bundles": 0, "tombstones": 1})
-                connection.request("GET", "/v1/diagnostics/export?user_id=diag-user&device_id=diag-phone")
+                connection.request("GET", "/v1/diagnostics/export?user_id=diag-user&device_id=diag-phone", headers=auth_headers)
                 readback = json.loads(connection.getresponse().read().decode())
                 self.assertEqual(readback["items"], [])
                 self.assertEqual(len(readback["tombstones"]), 1)
@@ -471,12 +480,13 @@ class RecorderR1RepairTests(unittest.TestCase):
             self.assertEqual(status, 401)
             self.assertEqual(service.store.get_device("revoke-user", "target")["status"], "active")
 
-    def test_openapi_declares_all_path_variables_and_exact_worker_run_contract(self):
+    def test_openapi_declares_all_path_variables_and_hides_mutating_worker_controls(self):
         from recorder_next.openapi import OPENAPI, validate_openapi_contract
 
         validate_openapi_contract(OPENAPI)
         self.assertNotIn("/v1/internal/worker/{action}", OPENAPI["paths"])
-        self.assertIn("/v1/internal/worker/run", OPENAPI["paths"])
+        self.assertNotIn("/v1/internal/worker/run", OPENAPI["paths"])
+        self.assertNotIn("/v1/internal/scheduler/fire", OPENAPI["paths"])
 
     def test_raw_socket_rejects_ambiguous_content_length_and_closes_connection(self):
         with tempfile.TemporaryDirectory() as tmp:

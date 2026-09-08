@@ -16,6 +16,11 @@ class ValidationError(RecorderError):
     status = 400
 
 
+class UnsupportedMediaType(RecorderError):
+    code = "UNSUPPORTED_MEDIA_TYPE"
+    status = 415
+
+
 class NotFoundError(RecorderError):
     code = "NOT_FOUND"
     status = 404

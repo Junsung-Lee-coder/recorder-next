@@ -57,6 +57,19 @@ TTS_ADAPTERS = {
     "test",
 }
 DISABLED_ADAPTERS = {"", "disabled", "none", "off"}
+TTS_RESERVED_OPTIONS = {
+    "text",
+    "model",
+    "voice",
+    "language",
+    "artifact_id",
+    "response_format",
+    "output_format",
+    "format",
+    "rate",
+    "pitch",
+    "volume",
+}
 
 
 @dataclass(frozen=True)
@@ -113,6 +126,8 @@ class ProviderConfig:
             if len(endpoint) > 512 or not endpoint.startswith(("http://", "https://")):
                 raise ValueError("provider endpoint must use HTTP or HTTPS")
             parsed = endpoint.split("?", 1)
+            if adapter in {"hermes", "hermes-default"} and len(parsed) == 2:
+                raise ValueError("Hermes provider base URL must not contain a query")
             if len(parsed) == 2 and any(part.split("=", 1)[0].lower() in {"key", "token", "secret", "password", "authorization"} for part in parsed[1].split("&") if "=" in part):
                 raise ValueError("provider endpoint contains credentials")
         credential_file = spec.get("credential_file")
@@ -164,6 +179,8 @@ class ProviderConfig:
         for option_key, option_value in options_raw.items():
             if not isinstance(option_key, str) or not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", option_key) or str(option_key).lower() in forbidden:
                 raise ValueError("provider option name is invalid")
+            if kind == "tts" and option_key.lower() in TTS_RESERVED_OPTIONS:
+                raise ValueError("TTS option is reserved by the provider contract")
             if not isinstance(option_value, (str, int, float, bool)) or isinstance(option_value, (bytes, bytearray)):
                 raise ValueError("provider option must be scalar")
             options.append((option_key, str(option_value)))
@@ -261,6 +278,8 @@ class ProviderConfig:
                         if "=" in item
                     ) or any(item.split("=", 1)[0].lower() != "profile" for item in parsed_endpoint.query.split("&") if item):
                         raise ValueError("provider endpoint contains credentials")
+                    if self.adapter in {"hermes", "hermes-default"} and parsed_endpoint.query:
+                        raise ValueError("Hermes provider base URL must not contain a query")
                 if key in {"health_path", "capability_path"} and (
                     not value.startswith("/")
                     or urlsplit(value).scheme
@@ -365,7 +384,7 @@ class RecorderConfig:
         object.__setattr__(self, "asr_overrides", normalize_overrides(self.asr_overrides, "asr"))
         object.__setattr__(self, "tts_overrides", normalize_overrides(self.tts_overrides, "tts"))
 
-        def materialize_primary(kind: str, source: str, endpoint: str | None, model: str | None, voice: str | None, credential: str | None) -> None:
+        def materialize_primary(kind: str, source: str, endpoint: str | None, model: str | None, voice: str | None, credential: str | None, timeout_seconds: float) -> None:
             providers_field = "asr_providers" if kind == "asr" else "tts_providers"
             chain_field = "asr_chain" if kind == "asr" else "tts_chain"
             if getattr(self, providers_field) or getattr(self, chain_field) or not endpoint:
@@ -375,6 +394,7 @@ class RecorderConfig:
             if source.lower() not in (ASR_ADAPTERS if kind == "asr" else TTS_ADAPTERS):
                 return
             spec: dict[str, Any] = {"adapter": source, "endpoint": endpoint, "enabled": True}
+            spec["timeout_seconds"] = timeout_seconds
             if model is not None:
                 spec["model"] = model
             if voice is not None:
@@ -388,11 +408,11 @@ class RecorderConfig:
         asr_primary_source = self.asr_mode or (self.asr_source if str(self.asr_source).lower() != "hermes" or self.realtime_asr_provider.strip().lower() == "hermes" else self.realtime_asr_provider)
         asr_primary_endpoint = self.hermes_base_url if str(asr_primary_source).lower() == "hermes" else self.realtime_asr_endpoint
         asr_primary_credential = self.hermes_api_key_file if str(asr_primary_source).lower() == "hermes" else self.realtime_asr_credential_file
-        materialize_primary("asr", str(asr_primary_source), asr_primary_endpoint, self.realtime_asr_model, None, asr_primary_credential)
+        materialize_primary("asr", str(asr_primary_source), asr_primary_endpoint, self.realtime_asr_model, None, asr_primary_credential, self.asr_provider_timeout_seconds)
         tts_primary_source = self.tts_mode or (self.tts_source if str(self.tts_source).lower() != "hermes" or self.tts_provider.strip().lower() == "hermes" else self.tts_provider)
         tts_primary_endpoint = self.hermes_base_url if str(tts_primary_source).lower() == "hermes" else self.tts_endpoint
         tts_primary_credential = self.hermes_api_key_file if str(tts_primary_source).lower() == "hermes" else self.tts_credential_file
-        materialize_primary("tts", str(tts_primary_source), tts_primary_endpoint, self.tts_model, self.tts_voice, tts_primary_credential)
+        materialize_primary("tts", str(tts_primary_source), tts_primary_endpoint, self.tts_model, self.tts_voice, tts_primary_credential, self.tts_timeout_seconds)
 
     @staticmethod
     def _registry(providers: Mapping[str, Any], kind: str) -> tuple[tuple[ProviderConfig, ...], tuple[str, ...], float]:
@@ -656,8 +676,8 @@ class RecorderConfig:
             if not isinstance(self.hermes_base_url, str) or len(self.hermes_base_url) > 512 or not self.hermes_base_url.startswith(("http://", "https://")):
                 raise ValueError("Hermes endpoint is invalid")
             parsed = urlsplit(self.hermes_base_url)
-            if parsed.username or parsed.password or parsed.fragment or any(part.split("=", 1)[0].lower() in {"key", "token", "secret", "password", "authorization"} for part in parsed.query.split("&") if "=" in part) or any(part.split("=", 1)[0].lower() != "profile" for part in parsed.query.split("&") if part):
-                raise ValueError("Hermes endpoint contains credentials")
+            if parsed.username or parsed.password or parsed.fragment or parsed.query:
+                raise ValueError("Hermes base endpoint must not contain query or credentials")
         for credential in (self.hermes_api_key_file, self.realtime_asr_credential_file, self.batch_asr_credential_file, self.local_asr_credential_file, self.tts_credential_file):
             if credential is not None and (not isinstance(credential, str) or not credential or any(ord(char) < 0x20 for char in credential) or re.search(r"(?:api[_-]?key|token|secret|password|authorization)\s*=", credential, re.I)):
                 raise ValueError("credential configuration must be a file reference")

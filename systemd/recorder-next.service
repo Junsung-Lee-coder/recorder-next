@@ -6,11 +6,14 @@ After=network.target
 Type=simple
 WorkingDirectory=/opt/recorder-next
 LoadCredential=recorder_api_key:/home/rumi/.hermes/profiles/default/recorder-worker-api-key.env
+LoadCredential=recorder_ingress_secret:/etc/recorder-next/ingress-secret
+Environment=RECORDER_INGRESS_SECRET_FILE=%d/recorder_ingress_secret
 ExecStart=/usr/bin/python3 -m recorder_next --config /etc/recorder-next/recorder-next.toml
 Restart=on-failure
 RestartSec=3
-User=recorder-next
-Group=recorder-next
+TimeoutStopSec=15s
+User=rumi
+Group=rumi
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict

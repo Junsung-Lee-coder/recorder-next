@@ -17,6 +17,7 @@ import json
 import os
 import re
 import stat
+import threading
 import uuid
 import zlib
 from pathlib import Path
@@ -292,6 +293,67 @@ class FeatureGroups:
             raise ConflictError("managed artifact hash does not match its receipt")
         return content
 
+    @classmethod
+    def _read_managed_range(
+        cls,
+        root: Path,
+        path: Path,
+        *,
+        expected_size: int,
+        start: int,
+        end: int,
+    ) -> bytes:
+        if any(isinstance(value, bool) or not isinstance(value, int) for value in (expected_size, start, end)) or expected_size < 0 or start < 0 or end < start:
+            raise ValidationError("managed artifact range is invalid")
+        cls._ensure_no_symlink_path(root, path, allow_missing_leaf=False)
+        root = cls._lexical_absolute(root)
+        path = cls._lexical_absolute(path, reject_parent=True)
+        try:
+            relative = path.relative_to(root)
+        except ValueError as exc:
+            raise UnauthorizedError("managed path escapes the storage root") from exc
+        if not relative.parts or end >= expected_size:
+            raise ConflictError("managed artifact range is outside its immutable receipt")
+        directory_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        file_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        root_descriptor: int | None = None
+        directory_descriptor: int | None = None
+        descriptor: int | None = None
+        try:
+            root_descriptor = os.open(root, directory_flags)
+            directory_descriptor = root_descriptor
+            for component in relative.parts[:-1]:
+                next_descriptor = os.open(component, directory_flags, dir_fd=directory_descriptor)
+                if directory_descriptor != root_descriptor:
+                    os.close(directory_descriptor)
+                directory_descriptor = next_descriptor
+            descriptor = os.open(relative.parts[-1], file_flags, dir_fd=directory_descriptor)
+            info = os.fstat(descriptor)
+            if not stat.S_ISREG(info.st_mode) or info.st_size != expected_size:
+                raise ConflictError("managed artifact size does not match its immutable receipt")
+            remaining = end - start + 1
+            chunks: list[bytes] = []
+            offset = start
+            while remaining:
+                chunk = os.pread(descriptor, min(1024 * 1024, remaining), offset)
+                if not chunk:
+                    raise ConflictError("managed artifact changed while reading its range")
+                chunks.append(chunk)
+                offset += len(chunk)
+                remaining -= len(chunk)
+            if os.fstat(descriptor).st_size != expected_size:
+                raise ConflictError("managed artifact changed while reading its range")
+            return b"".join(chunks)
+        except OSError as exc:
+            raise NotReadyError("managed artifact is unavailable") from exc
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+            if directory_descriptor is not None and directory_descriptor != root_descriptor:
+                os.close(directory_descriptor)
+            if root_descriptor is not None:
+                os.close(root_descriptor)
+
     @staticmethod
     def _read_source_bytes(path: Path) -> bytes:
         path = FeatureGroups._lexical_absolute(path, reject_parent=True)
@@ -437,7 +499,10 @@ class FeatureGroups:
             for row in conn.execute("SELECT source_path, whole_stream_sha256, total_bytes FROM turn_parts WHERE source_path IS NOT NULL").fetchall():
                 if canonical_reference(row["source_path"]) == target:
                     references.append((str(row["source_path"]), str(row["whole_stream_sha256"]), "turn_part", row["total_bytes"]))
-            for row in conn.execute("SELECT storage_path, payload_sha256, byte_size FROM tts_artifacts WHERE storage_path IS NOT NULL").fetchall():
+            tts_rows = conn.execute("SELECT artifact_id, storage_path, payload_sha256, byte_size FROM tts_artifacts WHERE storage_path IS NOT NULL").fetchall()
+            for row in tts_rows:
+                if receipt.get("entity_type") == "tts_artifact" and receipt.get("entity_id") == row["artifact_id"]:
+                    continue
                 if canonical_reference(row["storage_path"]) == target:
                     references.append((str(row["storage_path"]), str(row["payload_sha256"]), "tts_artifact", row["byte_size"]))
             for row in conn.execute("SELECT storage_path, audio_sha256, byte_length FROM eavesdrop_segments").fetchall():
@@ -561,6 +626,120 @@ class FeatureGroups:
         result.pop("chain_json", None)
         return result
 
+    def _project_terminal_tts_artifact_tx(self, conn: Any, job: Any, *, error_kind: str, now: str) -> bool:
+        """Terminalize an unstarted TTS artifact with its worker job."""
+        if job["stage"] != "tts":
+            return False
+        try:
+            payload = json.loads(job["payload_json"])
+        except (TypeError, json.JSONDecodeError):
+            return False
+        if not isinstance(payload, Mapping):
+            return False
+        artifact_id = payload.get("artifact_id")
+        turn_id = payload.get("turn_id")
+        if not isinstance(artifact_id, str) or not FEATURE_ID_RE.fullmatch(artifact_id):
+            return False
+        if turn_id is not None and not isinstance(turn_id, str):
+            return False
+        artifact = conn.execute(
+            "SELECT turn_id, status FROM tts_artifacts WHERE artifact_id=?",
+            (artifact_id,),
+        ).fetchone()
+        if artifact is None or artifact["status"] != "PENDING":
+            return False
+        if turn_id is not None and artifact["turn_id"] != turn_id:
+            return False
+        safe_error = error_kind if isinstance(error_kind, str) and SAFE_ERROR_RE.fullmatch(error_kind) else "worker_terminal"
+        changed = conn.execute(
+            "UPDATE tts_artifacts SET source_text=NULL, status='EXPIRED', relay_state='EXPIRED', retention_outcome='expired', provider_metadata_json=?, updated_at=? WHERE artifact_id=? AND status='PENDING'",
+            (json.dumps({"error_kind": safe_error}, separators=(",", ":")), now, artifact_id),
+        ).rowcount
+        return bool(changed)
+
+    def _project_terminal_job_tx(self, conn: Any, job: Any, *, error_kind: str, now: str) -> bool:
+        """Project terminal worker state into its owning protocol queue."""
+        if job["stage"] == "tts":
+            return self._project_terminal_tts_artifact_tx(conn, job, error_kind=error_kind, now=now)
+        try:
+            payload = json.loads(job["payload_json"])
+        except (TypeError, json.JSONDecodeError):
+            return False
+        if not isinstance(payload, Mapping):
+            return False
+        if job["kind"] == "eavesdrop" or ("segment_sequence" in payload and "session_id" in payload):
+            changed = conn.execute(
+                "UPDATE eavesdrop_decisions SET result_state='FAILED', reason=?, effect_receipt_json=NULL WHERE session_id=? AND segment_sequence=? AND result_state IN ('QUEUED','IN_PROGRESS','PENDING')",
+                ("worker_terminal", payload.get("session_id"), payload.get("segment_sequence")),
+            ).rowcount
+            return bool(changed)
+        turn_id = payload.get("turn_id")
+        if not isinstance(turn_id, str):
+            return False
+        turn = conn.execute("SELECT * FROM turns WHERE turn_id=?", (turn_id,)).fetchone()
+        if turn is None or turn["final_outcome"] is not None or job["kind"] == "hermes_history":
+            return False
+        if job["stage"] == "hermes":
+            self.store._commit_protocol_final_tx(
+                conn,
+                turn_id=turn_id,
+                error_kind="hermes",
+                message="요청 처리가 지연되고 있습니다. 잠시 후 프로젝트 세션에서 다시 확인해 주세요.",
+                grace_seconds=30,
+                source_ref=f"recorder_protocol:hermes:worker:{job['job_id']}",
+            )
+            ingress = conn.execute("SELECT hermes_submission_id, target_session_id FROM session_ingress WHERE turn_id=?", (turn_id,)).fetchone()
+            if ingress is not None:
+                conn.execute(
+                    "UPDATE session_ingress SET status='FAILED', lease_owner=NULL, lease_token=NULL, lease_expires_at=NULL, updated_at=? WHERE hermes_submission_id=?",
+                    (now, ingress["hermes_submission_id"]),
+                )
+                self._enqueue_worker_job_tx(
+                    conn,
+                    kind="hermes_history",
+                    stage="hermes",
+                    payload={"session_id": ingress["target_session_id"], "turn_id": turn_id, "hermes_submission_id": ingress["hermes_submission_id"]},
+                    idempotency_key=f"hermes-history:{ingress['hermes_submission_id']}",
+                    max_attempts=100,
+                    now=now,
+                    next_attempt_at=now,
+                    overall_deadline_at=self._plus_seconds(now, 30),
+                )
+            return True
+        protocol_kind = "asr" if job["stage"] == "asr" else "routing"
+        self.store._commit_protocol_final_tx(
+            conn,
+            turn_id=turn_id,
+            error_kind=protocol_kind,
+            message=("음성을 인식하지 못했습니다. 원본은 보존되어 다시 시도할 수 있습니다." if protocol_kind == "asr" else "요청을 처리할 프로젝트를 결정하지 못했습니다."),
+            grace_seconds=0,
+            source_ref=f"recorder_protocol:{protocol_kind}:worker:{job['job_id']}",
+        )
+        if protocol_kind == "asr":
+            conn.execute("UPDATE turns SET authoritative_asr_outcome='PROVIDER_ERROR', state='FINAL_READY', updated_at=? WHERE turn_id=?", (now, turn_id))
+        conn.execute(
+            "UPDATE router_queue SET state='FAILED', lease_owner=NULL, lease_expires_at=NULL, updated_at=? WHERE turn_id=? AND state IN ('QUEUED','IN_PROGRESS')",
+            (now, turn_id),
+        )
+        return True
+
+    def reconcile_terminal_tts_jobs(self, *, now: str | None = None, limit: int = 500) -> dict[str, int]:
+        """Repair terminal TTS worker rows left by an older worker version."""
+        if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 1000:
+            raise ValidationError("terminal TTS reconciliation limit must be between 1 and 1000")
+        timestamp = self._time(now, self.store)
+        with self.store._tx() as conn:
+            rows = conn.execute(
+                "SELECT j.* FROM worker_jobs j WHERE j.stage='tts' AND j.status='FAILED_PERMANENT' AND EXISTS (SELECT 1 FROM tts_artifacts a WHERE a.status='PENDING' AND a.artifact_id=json_extract(CASE WHEN json_valid(j.payload_json) THEN j.payload_json ELSE '{}' END, '$.artifact_id')) ORDER BY j.completed_at, j.created_at, j.job_id LIMIT ?",
+                (limit,),
+            ).fetchall()
+            expired = 0
+            for row in rows:
+                error_kind = row["last_error_kind"] or "worker_terminal"
+                if self._project_terminal_tts_artifact_tx(conn, row, error_kind=error_kind, now=timestamp):
+                    expired += 1
+            return {"jobs_scanned": len(rows), "artifacts_expired": expired}
+
     def _enqueue_worker_job_tx(
         self,
         conn: Any,
@@ -604,6 +783,8 @@ class FeatureGroups:
         next_attempt_at: str | None = None,
         provider_chain: Any | None = None,
         deadline_seconds: int | None = None,
+        worker_claim: Mapping[str, Any] | None = None,
+        worker_stage: str | None = None,
     ) -> dict[str, Any]:
         self._identifier(kind, "kind")
         self._identifier(stage, "stage")
@@ -637,6 +818,11 @@ class FeatureGroups:
         else:
             deadline_at = None
         with self.store._tx() as conn:
+            if worker_claim is not None:
+                claim_turn_id = payload.get("turn_id") if isinstance(payload, Mapping) else None
+                claim_stage = worker_stage or stage
+                if not self._assert_worker_effect_tx(conn, worker_claim, now=timestamp, stage=claim_stage, turn_id=claim_turn_id if isinstance(claim_turn_id, str) else None):
+                    raise LeaseConflict("worker enqueue effect deadline has expired")
             return self._enqueue_worker_job_tx(
                 conn,
                 kind=kind,
@@ -691,20 +877,62 @@ class FeatureGroups:
         timestamp = self._time(now, self.store)
         expires = self._plus_seconds(timestamp, lease_seconds)
         with self.store._tx() as conn:
-            conn.execute(
-                "UPDATE worker_jobs SET status='FAILED_PERMANENT', owner=NULL, lease_expires_at=NULL, last_error_kind='deadline', updated_at=?, completed_at=? WHERE status IN ('PENDING','RETRY_WAIT','CLAIMED') AND overall_deadline_at IS NOT NULL AND overall_deadline_at <= ?",
+            expired_jobs = conn.execute(
+                "SELECT * FROM worker_jobs WHERE status IN ('PENDING','RETRY_WAIT','CLAIMED') AND overall_deadline_at IS NOT NULL AND overall_deadline_at <= ? ORDER BY overall_deadline_at, created_at, job_id",
+                (timestamp,),
+            ).fetchall()
+            for expired_job in expired_jobs:
+                changed = conn.execute(
+                    "UPDATE worker_jobs SET status='FAILED_PERMANENT', owner=NULL, lease_token=NULL, lease_expires_at=NULL, last_error_kind='deadline', updated_at=?, completed_at=? WHERE job_id=? AND status IN ('PENDING','RETRY_WAIT','CLAIMED') AND overall_deadline_at IS NOT NULL AND overall_deadline_at <= ?",
+                    (timestamp, timestamp, expired_job["job_id"], timestamp),
+                ).rowcount
+                if changed:
+                    conn.execute(
+                        "UPDATE worker_attempts SET outcome='FAILED_PERMANENT', error_kind='deadline', finished_at=? WHERE job_id=? AND outcome='RUNNING'",
+                        (timestamp, expired_job["job_id"]),
+                    )
+                    self._project_terminal_job_tx(conn, expired_job, error_kind="deadline", now=timestamp)
+            expired_tts = conn.execute(
+                "SELECT j.* FROM worker_jobs j WHERE j.stage='tts' AND j.status IN ('PENDING','RETRY_WAIT','CLAIMED') AND EXISTS (SELECT 1 FROM tts_artifacts a WHERE a.artifact_id=json_extract(CASE WHEN json_valid(j.payload_json) THEN j.payload_json ELSE '{}' END, '$.artifact_id') AND (a.status='EXPIRED' OR (a.expires_at IS NOT NULL AND a.expires_at <= ?)))",
+                (timestamp,),
+            ).fetchall()
+            for expired_job in expired_tts:
+                changed = conn.execute(
+                    "UPDATE worker_jobs SET status='FAILED_PERMANENT', owner=NULL, lease_token=NULL, lease_expires_at=NULL, last_error_kind='deadline', updated_at=?, completed_at=? WHERE job_id=? AND status IN ('PENDING','RETRY_WAIT','CLAIMED')",
+                    (timestamp, timestamp, expired_job["job_id"]),
+                ).rowcount
+                if changed:
+                    conn.execute(
+                        "UPDATE worker_attempts SET outcome='FAILED_PERMANENT', error_kind='deadline', finished_at=? WHERE job_id=? AND outcome='RUNNING'",
+                        (timestamp, expired_job["job_id"]),
+                    )
+                    self._project_terminal_job_tx(conn, expired_job, error_kind="deadline", now=timestamp)
+            exhausted_jobs = conn.execute(
+                "SELECT * FROM worker_jobs WHERE ((status IN ('PENDING','RETRY_WAIT') AND next_attempt_at <= ?) OR (status='CLAIMED' AND lease_expires_at <= ?)) AND (overall_deadline_at IS NULL OR overall_deadline_at > ?) AND attempt_count >= max_attempts ORDER BY next_attempt_at, created_at, job_id",
                 (timestamp, timestamp, timestamp),
-            )
+            ).fetchall()
+            for exhausted_job in exhausted_jobs:
+                changed = conn.execute(
+                    "UPDATE worker_jobs SET status='FAILED_PERMANENT', owner=NULL, lease_token=NULL, lease_expires_at=NULL, last_error_kind='max_attempts', updated_at=?, completed_at=? WHERE job_id=? AND status IN ('PENDING','RETRY_WAIT','CLAIMED') AND attempt_count >= max_attempts",
+                    (timestamp, timestamp, exhausted_job["job_id"]),
+                ).rowcount
+                if changed:
+                    conn.execute(
+                        "UPDATE worker_attempts SET outcome='FAILED_PERMANENT', error_kind='max_attempts', finished_at=? WHERE job_id=? AND outcome='RUNNING'",
+                        (timestamp, exhausted_job["job_id"]),
+                    )
+                    self._project_terminal_job_tx(conn, exhausted_job, error_kind="max_attempts", now=timestamp)
             row = conn.execute(
-                "SELECT * FROM worker_jobs WHERE ((status IN ('PENDING','RETRY_WAIT') AND next_attempt_at <= ?) OR (status='CLAIMED' AND lease_expires_at <= ?)) AND (overall_deadline_at IS NULL OR overall_deadline_at > ?) ORDER BY next_attempt_at, created_at, job_id LIMIT 1",
+                "SELECT * FROM worker_jobs WHERE ((status IN ('PENDING','RETRY_WAIT') AND next_attempt_at <= ?) OR (status='CLAIMED' AND lease_expires_at <= ?)) AND (overall_deadline_at IS NULL OR overall_deadline_at > ?) AND attempt_count < max_attempts ORDER BY next_attempt_at, created_at, job_id LIMIT 1",
                 (timestamp, timestamp, timestamp),
             ).fetchone()
             if row is None:
                 return None
             attempt = int(row["attempt_count"]) + 1
+            attempt_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"recorder-next:worker-attempt:{row['job_id']}:{attempt}"))
             changed = conn.execute(
-                "UPDATE worker_jobs SET status='CLAIMED', owner=?, lease_expires_at=?, attempt_count=?, updated_at=? WHERE job_id=? AND ((status IN ('PENDING','RETRY_WAIT') AND next_attempt_at <= ?) OR (status='CLAIMED' AND lease_expires_at <= ?)) AND (overall_deadline_at IS NULL OR overall_deadline_at > ?)",
-                (owner, expires, attempt, timestamp, row["job_id"], timestamp, timestamp, timestamp),
+                "UPDATE worker_jobs SET status='CLAIMED', owner=?, lease_token=?, lease_expires_at=?, attempt_count=?, updated_at=? WHERE job_id=? AND ((status IN ('PENDING','RETRY_WAIT') AND next_attempt_at <= ?) OR (status='CLAIMED' AND lease_expires_at <= ?)) AND (overall_deadline_at IS NULL OR overall_deadline_at > ?) AND attempt_count < max_attempts",
+                (owner, attempt_id, expires, attempt, timestamp, row["job_id"], timestamp, timestamp, timestamp),
             ).rowcount
             if changed != 1:
                 return None
@@ -713,35 +941,78 @@ class FeatureGroups:
                     "UPDATE worker_attempts SET outcome='RECLAIMED', finished_at=? WHERE job_id=? AND outcome='RUNNING'",
                     (timestamp, row["job_id"]),
                 )
-            attempt_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"recorder-next:worker-attempt:{row['job_id']}:{attempt}"))
             conn.execute(
                 "INSERT OR REPLACE INTO worker_attempts(attempt_id, job_id, attempt_number, owner, stage, started_at, outcome) VALUES (?, ?, ?, ?, ?, ?, 'RUNNING')",
                 (attempt_id, row["job_id"], attempt, owner, row["stage"], timestamp),
             )
             return self._job_payload(conn.execute("SELECT * FROM worker_jobs WHERE job_id=?", (row["job_id"],)).fetchone())
 
-    def renew_worker_lease(self, job_id: str, owner: str, *, now: str | None = None, lease_seconds: int = 30) -> bool:
+    def renew_worker_lease(self, job_id: str, owner: str, *, lease_token: str, now: str | None = None, lease_seconds: int = 30) -> bool:
         self._identifier(job_id, "job_id")
         self._identifier(owner, "owner")
+        self._identifier(lease_token, "lease_token")
         if not isinstance(lease_seconds, int) or isinstance(lease_seconds, bool) or not 1 <= lease_seconds <= 86400:
             raise ValidationError("worker lease_seconds must be between 1 and 86400")
         timestamp = self._time(now, self.store)
-        expires = self._plus_seconds(timestamp, lease_seconds)
         with self.store._tx() as conn:
-            return bool(
-                conn.execute(
-                    "UPDATE worker_jobs SET lease_expires_at=?, updated_at=? WHERE job_id=? AND status='CLAIMED' AND owner=? AND lease_expires_at > ?",
-                    (expires, timestamp, job_id, owner, timestamp),
-                ).rowcount
-            )
+            row = conn.execute("SELECT * FROM worker_jobs WHERE job_id=?", (job_id,)).fetchone()
+            if row is None or row["status"] != "CLAIMED" or row["owner"] != owner or row["lease_token"] != lease_token:
+                return False
+            if row["overall_deadline_at"] is not None and row["overall_deadline_at"] <= timestamp:
+                self._terminalize_claimed_deadline_tx(conn, row, timestamp)
+                return False
+            if not row["lease_expires_at"] or row["lease_expires_at"] <= timestamp:
+                return False
+            expires = self._plus_seconds(timestamp, lease_seconds)
+            if row["overall_deadline_at"] is not None and expires > row["overall_deadline_at"]:
+                expires = row["overall_deadline_at"]
+            return bool(conn.execute("UPDATE worker_jobs SET lease_expires_at=?, updated_at=? WHERE job_id=? AND status='CLAIMED' AND owner=? AND lease_token=? AND lease_expires_at > ? AND (overall_deadline_at IS NULL OR overall_deadline_at > ?)", (expires, timestamp, job_id, owner, lease_token, timestamp, timestamp)).rowcount)
 
-    def _assert_worker_claim(self, conn: Any, job_id: str, owner: str, now: str) -> Any:
+    def _terminalize_claimed_deadline_tx(self, conn: Any, row: Any, timestamp: str) -> None:
+        changed = conn.execute(
+            "UPDATE worker_jobs SET status='FAILED_PERMANENT', owner=NULL, lease_token=NULL, lease_expires_at=NULL, last_error_kind='deadline', updated_at=?, completed_at=? WHERE job_id=? AND status='CLAIMED' AND owner IS NOT NULL",
+            (timestamp, timestamp, row["job_id"]),
+        ).rowcount
+        if changed:
+            conn.execute("UPDATE worker_attempts SET outcome='FAILED_PERMANENT', error_kind='deadline', finished_at=? WHERE job_id=? AND outcome='RUNNING'", (timestamp, row["job_id"]))
+            self._project_terminal_job_tx(conn, row, error_kind="deadline", now=timestamp)
+
+    def _assert_worker_claim(self, conn: Any, job_id: str, owner: str, lease_token: str, now: str) -> Any:
+        self._identifier(lease_token, "lease_token")
         row = conn.execute("SELECT * FROM worker_jobs WHERE job_id=?", (job_id,)).fetchone()
         if row is None:
             raise NotFoundError("worker job not found")
-        if row["status"] != "CLAIMED" or row["owner"] != owner or not row["lease_expires_at"] or row["lease_expires_at"] <= now:
+        if row["status"] != "CLAIMED" or row["owner"] != owner or row["lease_token"] != lease_token or not row["lease_expires_at"] or row["lease_expires_at"] <= now:
             raise LeaseConflict("worker job lease is not owned or has expired")
         return row
+
+    def _assert_worker_effect_tx(self, conn: Any, claim: Mapping[str, Any], *, now: str, stage: str | None = None, turn_id: str | None = None) -> bool:
+        """Fence every durable worker effect with the live claim and deadline."""
+        if not isinstance(claim, Mapping):
+            raise LeaseConflict("worker effect claim is missing")
+        job_id = claim.get("job_id")
+        owner = claim.get("_worker_owner", claim.get("owner"))
+        lease_token = claim.get("lease_token")
+        if not all(isinstance(value, str) and value for value in (job_id, owner, lease_token)):
+            raise LeaseConflict("worker effect claim is incomplete")
+        row = self._assert_worker_claim(conn, job_id, owner, lease_token, now)
+        if stage is not None and row["stage"] != stage:
+            raise LeaseConflict("worker effect stage does not match the claim")
+        try:
+            payload = json.loads(row["payload_json"])
+        except (TypeError, json.JSONDecodeError):
+            raise LeaseConflict("worker effect payload is invalid") from None
+        if turn_id is not None and (not isinstance(payload, Mapping) or payload.get("turn_id") != turn_id):
+            raise LeaseConflict("worker effect turn does not match the claim")
+        if row["overall_deadline_at"] is not None and row["overall_deadline_at"] <= now:
+            self._terminalize_claimed_deadline_tx(conn, row, now)
+            return False
+        return True
+
+    def assert_worker_effect_authority(self, claim: Mapping[str, Any], *, stage: str | None = None, turn_id: str | None = None, now: str | None = None) -> bool:
+        timestamp = self._time(now, self.store)
+        with self.store._tx() as conn:
+            return self._assert_worker_effect_tx(conn, claim, now=timestamp, stage=stage, turn_id=turn_id)
 
     @staticmethod
     def _receipt(receipt: Mapping[str, Any]) -> tuple[str, str]:
@@ -772,7 +1043,7 @@ class FeatureGroups:
             raise ValidationError("effect receipt must be JSON serializable") from exc
         return json.dumps(dict(receipt), ensure_ascii=False, sort_keys=True, separators=(",", ":")), sha256_bytes(encoded)
 
-    def complete_worker_job(self, job_id: str, owner: str, receipt: Mapping[str, Any], *, now: str | None = None) -> dict[str, Any]:
+    def complete_worker_job(self, job_id: str, owner: str, receipt: Mapping[str, Any], *, lease_token: str, now: str | None = None) -> dict[str, Any]:
         self._identifier(job_id, "job_id")
         self._identifier(owner, "owner")
         timestamp = self._time(now, self.store)
@@ -793,7 +1064,12 @@ class FeatureGroups:
                 if candidate_sha != existing["effect_receipt_sha256"]:
                     raise ConflictError("worker job already succeeded with a different effect receipt")
                 return self._job_payload(existing)
-            row = self._assert_worker_claim(conn, job_id, owner, timestamp)
+            if existing["status"] == "FAILED_PERMANENT" and existing["last_error_kind"] in {"deadline", "max_attempts"}:
+                return self._job_payload(existing)
+            if existing["status"] == "CLAIMED" and existing["owner"] == owner and existing["lease_token"] == lease_token and existing["overall_deadline_at"] is not None and existing["overall_deadline_at"] <= timestamp:
+                self._terminalize_claimed_deadline_tx(conn, existing, timestamp)
+                return self._job_payload(conn.execute("SELECT * FROM worker_jobs WHERE job_id=?", (job_id,)).fetchone())
+            row = self._assert_worker_claim(conn, job_id, owner, lease_token, timestamp)
             bound_receipt = dict(receipt)
             if "job_id" in bound_receipt and bound_receipt["job_id"] != row["job_id"]:
                 raise ConflictError("effect receipt job binding does not match worker job")
@@ -804,7 +1080,7 @@ class FeatureGroups:
             bound_receipt.setdefault("stage", row["stage"])
             receipt_json, receipt_sha = self._receipt(bound_receipt)
             conn.execute(
-                "UPDATE worker_jobs SET status='SUCCEEDED', owner=NULL, lease_expires_at=NULL, effect_receipt_json=?, effect_receipt_sha256=?, updated_at=?, completed_at=? WHERE job_id=?",
+                "UPDATE worker_jobs SET status='SUCCEEDED', owner=NULL, lease_token=NULL, lease_expires_at=NULL, effect_receipt_json=?, effect_receipt_sha256=?, updated_at=?, completed_at=? WHERE job_id=?",
                 (receipt_json, receipt_sha, timestamp, timestamp, job_id),
             )
             conn.execute(
@@ -820,6 +1096,8 @@ class FeatureGroups:
         *,
         error_kind: str,
         retryable: bool,
+        lease_token: str,
+        status_code: int | None = None,
         now: str | None = None,
         retry_after_seconds: int | None = None,
     ) -> dict[str, Any]:
@@ -828,9 +1106,15 @@ class FeatureGroups:
         error_kind = self._safe_error_kind(error_kind)
         if not isinstance(retryable, bool):
             raise ValidationError("retryable must be boolean")
+        if status_code is not None and (not isinstance(status_code, int) or isinstance(status_code, bool) or not 100 <= status_code <= 599):
+            raise ValidationError("status_code must be an HTTP status integer")
         timestamp = self._time(now, self.store)
         with self.store._tx() as conn:
-            row = self._assert_worker_claim(conn, job_id, owner, timestamp)
+            current = conn.execute("SELECT * FROM worker_jobs WHERE job_id=?", (job_id,)).fetchone()
+            if current is not None and current["status"] == "CLAIMED" and current["owner"] == owner and current["lease_token"] == lease_token and current["overall_deadline_at"] is not None and current["overall_deadline_at"] <= timestamp:
+                self._terminalize_claimed_deadline_tx(conn, current, timestamp)
+                return self._job_payload(conn.execute("SELECT * FROM worker_jobs WHERE job_id=?", (job_id,)).fetchone())
+            row = self._assert_worker_claim(conn, job_id, owner, lease_token, timestamp)
             attempt_count = int(row["attempt_count"])
             can_retry = retryable and attempt_count < int(row["max_attempts"]) and (row["overall_deadline_at"] is None or row["overall_deadline_at"] > timestamp)
             if can_retry:
@@ -845,19 +1129,21 @@ class FeatureGroups:
                 next_attempt_at = timestamp
                 outcome = "FAILED_PERMANENT"
             conn.execute(
-                "UPDATE worker_jobs SET status=?, owner=NULL, lease_expires_at=NULL, next_attempt_at=?, last_error_kind=?, updated_at=?, completed_at=? WHERE job_id=?",
-                (state, next_attempt_at, error_kind, timestamp, timestamp if state == "FAILED_PERMANENT" else None, job_id),
+                "UPDATE worker_jobs SET status=?, owner=NULL, lease_token=NULL, lease_expires_at=NULL, next_attempt_at=?, last_error_kind=?, last_error_status_code=?, updated_at=?, completed_at=? WHERE job_id=?",
+                (state, next_attempt_at, error_kind, status_code, timestamp, timestamp if state == "FAILED_PERMANENT" else None, job_id),
             )
             conn.execute(
-                "UPDATE worker_attempts SET outcome=?, error_kind=?, finished_at=? WHERE job_id=? AND attempt_number=? AND outcome='RUNNING'",
-                (outcome, error_kind, timestamp, job_id, attempt_count),
+                "UPDATE worker_attempts SET outcome=?, error_kind=?, error_status_code=?, finished_at=? WHERE job_id=? AND attempt_number=? AND outcome='RUNNING'",
+                (outcome, error_kind, status_code, timestamp, job_id, attempt_count),
             )
+            if state == "FAILED_PERMANENT":
+                self._project_terminal_job_tx(conn, row, error_kind=error_kind, now=timestamp)
             return self._job_payload(conn.execute("SELECT * FROM worker_jobs WHERE job_id=?", (job_id,)).fetchone())
 
     def recover_worker_jobs(self, *, now: str | None = None) -> dict[str, int]:
         timestamp = self._time(now, self.store)
         with self.store._tx() as conn:
-            rows = conn.execute("SELECT job_id, attempt_count, max_attempts, overall_deadline_at FROM worker_jobs WHERE status='CLAIMED' AND lease_expires_at <= ?", (timestamp,)).fetchall()
+            rows = conn.execute("SELECT * FROM worker_jobs WHERE status='CLAIMED' AND lease_expires_at <= ?", (timestamp,)).fetchall()
             requeued = 0
             failed = 0
             for row in rows:
@@ -868,10 +1154,12 @@ class FeatureGroups:
                     ("FAILED_PERMANENT" if terminal else "RECLAIMED", timestamp, row["job_id"], row["attempt_count"]),
                 )
                 if terminal:
-                    conn.execute("UPDATE worker_jobs SET status='FAILED_PERMANENT', owner=NULL, lease_expires_at=NULL, last_error_kind=?, updated_at=?, completed_at=? WHERE job_id=?", ("deadline" if deadline_expired else "lease_expired", timestamp, timestamp, row["job_id"]))
+                    error_kind = "deadline" if deadline_expired else "lease_expired"
+                    conn.execute("UPDATE worker_jobs SET status='FAILED_PERMANENT', owner=NULL, lease_token=NULL, lease_expires_at=NULL, last_error_kind=?, updated_at=?, completed_at=? WHERE job_id=?", (error_kind, timestamp, timestamp, row["job_id"]))
+                    self._project_terminal_job_tx(conn, row, error_kind=error_kind, now=timestamp)
                     failed += 1
                 else:
-                    conn.execute("UPDATE worker_jobs SET status='RETRY_WAIT', owner=NULL, lease_expires_at=NULL, next_attempt_at=?, updated_at=? WHERE job_id=?", (timestamp, timestamp, row["job_id"]))
+                    conn.execute("UPDATE worker_jobs SET status='RETRY_WAIT', owner=NULL, lease_token=NULL, lease_expires_at=NULL, next_attempt_at=?, updated_at=? WHERE job_id=?", (timestamp, timestamp, row["job_id"]))
                     requeued += 1
             return {"requeued": requeued, "failed": failed}
 
@@ -882,7 +1170,7 @@ class FeatureGroups:
         with self.store._read() as conn:
             if conn.execute("SELECT 1 FROM worker_jobs WHERE job_id=?", (job_id,)).fetchone() is None:
                 raise NotFoundError("worker job not found")
-            return [dict(row) for row in conn.execute("SELECT attempt_id, job_id, attempt_number, owner, stage, started_at, finished_at, outcome, error_kind, effect_receipt_sha256 FROM worker_attempts WHERE job_id=? ORDER BY attempt_number LIMIT ?", (job_id, limit)).fetchall()]
+            return [dict(row) for row in conn.execute("SELECT attempt_id, job_id, attempt_number, owner, stage, started_at, finished_at, outcome, error_kind, error_status_code, effect_receipt_sha256 FROM worker_attempts WHERE job_id=? ORDER BY attempt_number LIMIT ?", (job_id, limit)).fetchall()]
 
     # ---- Group 4: update manifest and managed APK delivery ----------------
 
@@ -1122,10 +1410,10 @@ class FeatureGroups:
             if row is None:
                 raise NotFoundError("update manifest not found")
             path = self.store.storage_root / row["artifact_relpath"]
-            content = self._read_managed_bytes(self.store.storage_root, path, expected_size=row["size"], expected_sha256=row["artifact_sha256"])
+        size = int(row["size"])
         headers = {
             "Content-Type": "application/vnd.android.package-archive",
-            "Content-Length": str(len(content)),
+            "Content-Length": str(size),
             "ETag": row["etag"],
             "Accept-Ranges": "bytes",
             "Cache-Control": "no-store",
@@ -1136,17 +1424,18 @@ class FeatureGroups:
         selected_range: tuple[int, int] | None = None
         if range_header is not None and (if_range is None or if_range == row["etag"]):
             try:
-                selected_range = self._range(range_header, len(content))
+                selected_range = self._range(range_header, size)
             except RangeNotSatisfiable:
-                headers["Content-Range"] = f"bytes */{len(content)}"
+                headers["Content-Range"] = f"bytes */{size}"
                 headers["Content-Length"] = "0"
                 return {"status": 416, "headers": headers, "body": b"", "manifest": manifest}
         if selected_range is None:
+            content = self._read_managed_bytes(self.store.storage_root, path, expected_size=size, expected_sha256=row["artifact_sha256"])
             return {"status": 200, "headers": headers, "body": content, "manifest": manifest}
         start, end = selected_range
-        body = content[start : end + 1]
+        body = self._read_managed_range(self.store.storage_root, path, expected_size=size, start=start, end=end)
         headers["Content-Length"] = str(len(body))
-        headers["Content-Range"] = f"bytes {start}-{end}/{len(content)}"
+        headers["Content-Range"] = f"bytes {start}-{end}/{size}"
         return {"status": 206, "headers": headers, "body": body, "manifest": manifest}
 
     # ---- Group 5: project history read model ------------------------------
@@ -1498,7 +1787,7 @@ class FeatureGroups:
                 owner = conn.execute("SELECT user_id, phone_device_id FROM eavesdrop_sessions WHERE session_id=?", (session_id,)).fetchone()
                 if owner is None or owner["user_id"] != user_id or owner["phone_device_id"] != phone_device_id:
                     raise UnauthorizedError("eavesdrop session owner mismatch")
-            if row["state"] in {"CREATED", "ACTIVE", "PAUSED", "STOPPING"} and row["expires_at"] <= timestamp:
+            if row["state"] in {"CREATED", "ACTIVE", "PAUSED", "STOPPING", "STOPPED"} and row["expires_at"] <= timestamp:
                 conn.execute("UPDATE eavesdrop_sessions SET state='EXPIRED', updated_at=?, stopped_at=? WHERE session_id=?", (timestamp, timestamp, session_id))
             return self._eavesdrop_payload(conn, session_id)
 
@@ -1511,7 +1800,7 @@ class FeatureGroups:
                 raise NotFoundError("eavesdrop session not found")
             if row["user_id"] != user_id or row["phone_device_id"] != phone_device_id:
                 raise UnauthorizedError("eavesdrop session owner mismatch")
-            if row["state"] in {"CREATED", "ACTIVE", "PAUSED", "STOPPING"} and row["expires_at"] <= timestamp:
+            if row["state"] in {"CREATED", "ACTIVE", "PAUSED", "STOPPING", "STOPPED"} and row["expires_at"] <= timestamp:
                 conn.execute("UPDATE eavesdrop_sessions SET state='EXPIRED', updated_at=?, stopped_at=? WHERE session_id=?", (timestamp, timestamp, session_id))
                 return self._eavesdrop_payload(conn, session_id)
             if row["state"] not in allowed and row["state"] != target:
@@ -1646,6 +1935,7 @@ class FeatureGroups:
         reason: str,
         effect_receipt: Mapping[str, Any] | None = None,
         now: str | None = None,
+        worker_claim: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         self._identifier(session_id, "session_id")
         if not isinstance(segment_sequence, int) or isinstance(segment_sequence, bool) or segment_sequence < 0:
@@ -1671,6 +1961,21 @@ class FeatureGroups:
             if len(receipt_json.encode("utf-8")) > 4096:
                 raise ValidationError("eavesdrop effect receipt is too large")
         with self.store._tx() as conn:
+            if worker_claim is not None and not self._assert_worker_effect_tx(conn, worker_claim, now=timestamp, stage="hermes"):
+                raise LeaseConflict("worker eavesdrop effect deadline has expired")
+            session = conn.execute("SELECT state, expires_at FROM eavesdrop_sessions WHERE session_id=?", (session_id,)).fetchone()
+            if session is None:
+                raise NotFoundError("eavesdrop session not found")
+            if session["state"] in {"CREATED", "ACTIVE", "PAUSED", "STOPPING", "STOPPED"} and session["expires_at"] <= timestamp:
+                conn.execute("UPDATE eavesdrop_sessions SET state='EXPIRED', updated_at=?, stopped_at=? WHERE session_id=?", (timestamp, timestamp, session_id))
+                if result_state in {"QUEUED", "DELIVERED"}:
+                    result_state = "FAILED"
+                    reason = "session_expired"
+                    receipt_json = None
+            elif session["state"] == "EXPIRED" and result_state in {"QUEUED", "DELIVERED"}:
+                result_state = "FAILED"
+                reason = "session_expired"
+                receipt_json = None
             row = conn.execute("SELECT * FROM eavesdrop_decisions WHERE session_id=? AND segment_sequence=?", (session_id, segment_sequence)).fetchone()
             if row is None:
                 raise NotFoundError("eavesdrop routing decision not found")
@@ -1759,18 +2064,27 @@ class FeatureGroups:
             del reply_text
             return {"duplicate": False, "sequence": sequence, "sha256": digest, "byte_length": len(audio), "session_id": session_id}
 
-    def record_eavesdrop_reply(self, session_id: str, *, segment_sequence: int, text: str, now: str | None = None) -> dict[str, Any]:
+    def record_eavesdrop_reply(self, session_id: str, *, segment_sequence: int, text: str, now: str | None = None, worker_claim: Mapping[str, Any] | None = None) -> dict[str, Any]:
         self._identifier(session_id, "session_id")
         if not isinstance(segment_sequence, int) or isinstance(segment_sequence, bool) or segment_sequence < 0 or not isinstance(text, str) or not text:
             raise ValidationError("reply sequence and text are required")
         normalized = normalize_hermes_text(text)
         timestamp = self._time(now, self.store)
         with self.store._tx() as conn:
+            if worker_claim is not None and not self._assert_worker_effect_tx(conn, worker_claim, now=timestamp, stage="hermes"):
+                raise LeaseConflict("worker eavesdrop reply effect deadline has expired")
             session = conn.execute("SELECT * FROM eavesdrop_sessions WHERE session_id=?", (session_id,)).fetchone()
             if session is None:
                 raise NotFoundError("eavesdrop session not found")
             if not session["response_enabled"]:
                 raise ConflictError("eavesdrop responses are disabled")
+            if session["state"] in {"CREATED", "ACTIVE", "PAUSED", "STOPPING", "STOPPED"} and session["expires_at"] <= timestamp:
+                conn.execute("UPDATE eavesdrop_sessions SET state='EXPIRED', updated_at=?, stopped_at=? WHERE session_id=?", (timestamp, timestamp, session_id))
+                raise ConflictError("eavesdrop session has expired")
+            if session["state"] == "EXPIRED":
+                raise ConflictError("eavesdrop session has expired")
+            if session["state"] != "ACTIVE":
+                raise ConflictError("eavesdrop session is not active")
             existing = conn.execute("SELECT * FROM eavesdrop_replies WHERE session_id=? AND segment_sequence=?", (session_id, segment_sequence)).fetchone()
             text_hash = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
             if existing is not None:
@@ -1814,6 +2128,12 @@ class FeatureGroups:
         "category", "stage", "status", "code", "duration_ms", "count", "size_bytes", "hash", "client_version", "turn_id", "project_id", "source", "created_at", "platform", "version", "reason", "event_type"
     }
     DIAGNOSTIC_BANNED = re.compile(r"(?:secret|token|password|authorization|credential|transcript|audio|attachment|private|storage|source_path|file_path|bearer|api[_-]?key)", re.I)
+    DIAGNOSTIC_SENSITIVE_VALUE = re.compile(
+        r"(?:-----BEGIN|\bBearer\s+\S+|\b(?:sk|ghp|xox[baprs])-[A-Za-z0-9_-]+|eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)",
+        re.I,
+    )
+    DIAGNOSTIC_SCALAR = re.compile(r"^[A-Za-z0-9_.:-]{1,256}$")
+    DIAGNOSTIC_HASH = re.compile(r"^[0-9a-fA-F]{64}$")
 
     @classmethod
     def _sanitize_diagnostic_value(cls, key: str, value: Any) -> Any:
@@ -1824,13 +2144,16 @@ class FeatureGroups:
                 return None
             return value
         if isinstance(value, str):
-            if len(value) > 1024 or cls.DIAGNOSTIC_BANNED.search(value) or re.search(r"(^|[\s])(?:/|~[/\\]|[A-Za-z]:[\\/])", value):
+            looks_like_high_entropy = len(value) >= 40 and bool(re.search(r"[A-Z]", value) and re.search(r"[a-z]", value) and re.search(r"\d", value))
+            if len(value) > 1024 or cls.DIAGNOSTIC_BANNED.search(value) or cls.DIAGNOSTIC_SENSITIVE_VALUE.search(value) or looks_like_high_entropy or re.search(r"(^|[\s])(?:/|~[/\\]|[A-Za-z]:[\\/])", value):
                 return "[REDACTED]"
-            return value
+            if key == "hash":
+                return value if cls.DIAGNOSTIC_HASH.fullmatch(value) else "[REDACTED]"
+            return value if cls.DIAGNOSTIC_SCALAR.fullmatch(value) else "[REDACTED]"
         if isinstance(value, Mapping):
             result: dict[str, Any] = {}
             for child_key, child_value in value.items():
-                if not isinstance(child_key, str) or cls.DIAGNOSTIC_BANNED.search(child_key):
+                if not isinstance(child_key, str) or child_key not in cls.DIAGNOSTIC_KEYS or cls.DIAGNOSTIC_BANNED.search(child_key):
                     continue
                 cleaned = cls._sanitize_diagnostic_value(child_key, child_value)
                 if cleaned is not None:
@@ -1857,13 +2180,18 @@ class FeatureGroups:
         return result
 
     def _diagnostics_enabled_tx(self, conn: Any, user_id: str, device_id: str, now: str, event_id: str | None = None) -> bool:
-        if event_id is not None:
-            row = conn.execute("SELECT * FROM diagnostics_consents WHERE event_id=? AND user_id=? AND device_id=?", (event_id, user_id, device_id)).fetchone()
-            if row is None or not row["enabled"] or row["revoked_at"] is not None or (row["expires_at"] and row["expires_at"] <= now):
-                return False
-            return True
-        row = conn.execute("SELECT * FROM diagnostics_consents WHERE user_id=? AND device_id=? AND revoked_at IS NULL ORDER BY created_at DESC, event_id DESC LIMIT 1", (user_id, device_id)).fetchone()
-        return bool(row is not None and row["enabled"] and (row["expires_at"] is None or row["expires_at"] > now))
+        row = conn.execute(
+            "SELECT * FROM diagnostics_consents "
+            "WHERE user_id=? AND device_id=? AND revoked_at IS NULL "
+            "ORDER BY created_at DESC, event_id DESC LIMIT 1",
+            (user_id, device_id),
+        ).fetchone()
+        if row is None or not row["enabled"] or (row["expires_at"] and row["expires_at"] <= now):
+            return False
+        # A bundle carries the consent event that authorized it.  It must be
+        # the one current row, not merely any historically enabled row.  The
+        # enclosing transaction serializes this read with opt-out revocation.
+        return event_id is None or row["event_id"] == event_id
 
     def record_diagnostics_opt_in(
         self,
@@ -1889,6 +2217,15 @@ class FeatureGroups:
                 if existing["user_id"] != user_id or existing["device_id"] != device_id or bool(existing["enabled"]) != enabled or existing["expires_at"] != expiry:
                     raise ConflictError("diagnostics consent event is immutable")
                 return {"event_id": event_id, "user_id": user_id, "device_id": device_id, "enabled": bool(existing["enabled"]), "created_at": existing["created_at"], "expires_at": existing["expires_at"]}
+            # Consent is a single current authority.  Revoke every older
+            # event before publishing either a new opt-in or an opt-out so a
+            # caller cannot reuse a historical authorization after a later
+            # decision.  This runs in the same transaction as the new event.
+            conn.execute(
+                "UPDATE diagnostics_consents SET revoked_at=? "
+                "WHERE user_id=? AND device_id=? AND revoked_at IS NULL",
+                (timestamp, user_id, device_id),
+            )
             conn.execute("INSERT INTO diagnostics_consents(user_id, device_id, event_id, enabled, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?)", (user_id, device_id, event_id, int(enabled), timestamp, expiry))
             return {"event_id": event_id, "user_id": user_id, "device_id": device_id, "enabled": enabled, "created_at": timestamp, "expires_at": expiry}
 
@@ -2023,40 +2360,62 @@ class FeatureGroups:
                 raise CleanupIncompleteError("diagnostic bundle rollback cleanup is incomplete") from exc
             raise
 
+    def _diagnostic_listing_items(self, conn: Any, user_id: str, device_id: str, *, category: str | None = None, stage: str | None = None, limit: int | None = 100) -> list[dict[str, Any]]:
+        clauses = ["user_id=?", "device_id=?", "deleted_at IS NULL"]
+        args: list[Any] = [user_id, device_id]
+        if category is not None:
+            clauses.append("category=?")
+            args.append(category)
+        if stage is not None:
+            clauses.append("stage=?")
+            args.append(stage)
+        event_query = "SELECT * FROM diagnostic_events WHERE " + " AND ".join(clauses) + " ORDER BY occurred_at, event_id"
+        bundle_query = "SELECT * FROM diagnostic_bundles WHERE user_id=? AND device_id=? AND deleted_at IS NULL ORDER BY created_at, bundle_id"
+        if limit is not None:
+            event_query += " LIMIT ?"
+            bundle_query += " LIMIT ?"
+            # Fetch one sentinel row from each source so ``has_more`` remains
+            # truthful when one source alone reaches the page boundary.
+            fetch_limit = limit + 1
+            events = conn.execute(event_query, (*args, fetch_limit)).fetchall()
+            bundles = conn.execute(bundle_query, (user_id, device_id, fetch_limit)).fetchall()
+        else:
+            events = conn.execute(event_query, args).fetchall()
+            bundles = conn.execute(bundle_query, (user_id, device_id)).fetchall()
+        items = [
+            {"type": "event", "event_id": row["event_id"], "category": row["category"], "stage": row["stage"], "metadata": json.loads(row["metadata_json"]), "occurred_at": row["occurred_at"], "retention_deadline": row["retention_deadline"]}
+            for row in events
+        ] + [
+            {"type": "bundle", "bundle_id": row["bundle_id"], "compressed_size": row["compressed_size"], "expanded_size": row["expanded_size"], "payload_sha256": row["payload_sha256"], "created_at": row["created_at"], "retention_deadline": row["retention_deadline"]}
+            for row in bundles
+        ]
+        items.sort(key=lambda item: (item.get("occurred_at") or item.get("created_at") or "", item.get("event_id") or item.get("bundle_id") or ""))
+        return items
+
     def list_diagnostics(self, user_id: str, device_id: str, *, category: str | None = None, stage: str | None = None, limit: int = 100) -> dict[str, Any]:
         self._identifier(device_id, "device_id")
         if not isinstance(limit, int) or not 1 <= limit <= 500:
             raise ValidationError("diagnostic limit must be between 1 and 500")
+        # Reads enforce logical expiry, but must not opportunistically retry a
+        # failed physical cleanup. Recovery remains an explicit maintenance
+        # operation so callers can observe a pending receipt.
+        self.purge_diagnostics(_recover_cleanup=False)
         with self.store._read() as conn:
             self.store._assert_device(conn, user_id, device_id)
-            clauses = ["user_id=?", "device_id=?", "deleted_at IS NULL"]
-            args: list[Any] = [user_id, device_id]
-            if category is not None:
-                clauses.append("category=?")
-                args.append(category)
-            if stage is not None:
-                clauses.append("stage=?")
-                args.append(stage)
-            events = conn.execute("SELECT * FROM diagnostic_events WHERE " + " AND ".join(clauses) + " ORDER BY occurred_at, event_id LIMIT ?", (*args, limit)).fetchall()
-            bundles = conn.execute("SELECT * FROM diagnostic_bundles WHERE user_id=? AND device_id=? AND deleted_at IS NULL ORDER BY created_at, bundle_id LIMIT ?", (user_id, device_id, limit)).fetchall()
-            items = [
-                {"type": "event", "event_id": row["event_id"], "category": row["category"], "stage": row["stage"], "metadata": json.loads(row["metadata_json"]), "occurred_at": row["occurred_at"], "retention_deadline": row["retention_deadline"]}
-                for row in events
-            ] + [
-                {"type": "bundle", "bundle_id": row["bundle_id"], "compressed_size": row["compressed_size"], "expanded_size": row["expanded_size"], "payload_sha256": row["payload_sha256"], "created_at": row["created_at"], "retention_deadline": row["retention_deadline"]}
-                for row in bundles
-            ]
-            items.sort(key=lambda item: (item.get("occurred_at") or item.get("created_at") or "", item.get("event_id") or item.get("bundle_id") or ""))
-            return {"items": items[:limit], "has_more": len(items) > limit or len(events) >= limit or len(bundles) >= limit}
+            items = self._diagnostic_listing_items(conn, user_id, device_id, category=category, stage=stage, limit=limit)
+            return {"items": items[:limit], "has_more": len(items) > limit}
 
     def export_diagnostics(self, user_id: str, device_id: str) -> dict[str, Any]:
-        listing = self.list_diagnostics(user_id, device_id, limit=500)
+        self._identifier(device_id, "device_id")
+        self.purge_diagnostics(_recover_cleanup=False)
         with self.store._read() as conn:
+            self.store._assert_device(conn, user_id, device_id)
+            items = self._diagnostic_listing_items(conn, user_id, device_id, limit=None)
             tombstones = [
                 {"entity_type": row["entity_type"], "entity_id": row["entity_id"], "deleted_at": row["deleted_at"]}
                 for row in conn.execute("SELECT entity_type, entity_id, deleted_at FROM diagnostic_tombstones WHERE user_id=? AND device_id=? ORDER BY deleted_at, entity_id", (user_id, device_id)).fetchall()
             ]
-        return {"schema_version": 1, "items": listing["items"], "tombstones": tombstones}
+        return {"schema_version": 1, "items": items, "tombstones": tombstones, "truncated": False, "next_cursor": None}
 
     def delete_diagnostics(self, user_id: str, device_id: str, *, now: str | None = None) -> dict[str, int]:
         self._identifier(device_id, "device_id")
@@ -2066,10 +2425,10 @@ class FeatureGroups:
             events = conn.execute("SELECT event_id FROM diagnostic_events WHERE user_id=? AND device_id=? AND deleted_at IS NULL", (user_id, device_id)).fetchall()
             bundles = conn.execute("SELECT bundle_id, storage_path, payload_sha256, compressed_size FROM diagnostic_bundles WHERE user_id=? AND device_id=? AND deleted_at IS NULL", (user_id, device_id)).fetchall()
             for row in events:
-                conn.execute("UPDATE diagnostic_events SET deleted_at=? WHERE event_id=?", (timestamp, row["event_id"]))
+                conn.execute("UPDATE diagnostic_events SET category='deleted', stage='deleted', metadata_json='{}', occurred_at=?, retention_deadline=?, deleted_at=? WHERE event_id=?", (timestamp, timestamp, timestamp, row["event_id"]))
                 conn.execute("INSERT OR IGNORE INTO diagnostic_tombstones(tombstone_id, user_id, device_id, entity_type, entity_id, deleted_at) VALUES (?, ?, ?, 'event', ?, ?)", (str(uuid.uuid5(uuid.NAMESPACE_URL, f"recorder-next:diagnostic-tombstone:event:{row['event_id']}")), user_id, device_id, row["event_id"], timestamp))
             for row in bundles:
-                conn.execute("UPDATE diagnostic_bundles SET deleted_at=? WHERE bundle_id=?", (timestamp, row["bundle_id"]))
+                conn.execute("UPDATE diagnostic_bundles SET compressed_size=0, expanded_size=0, payload_sha256=?, storage_path='', retention_deadline=?, deleted_at=? WHERE bundle_id=?", (sha256_bytes(f"deleted:{row['bundle_id']}".encode("utf-8")), timestamp, timestamp, row["bundle_id"]))
                 conn.execute("INSERT OR IGNORE INTO diagnostic_tombstones(tombstone_id, user_id, device_id, entity_type, entity_id, deleted_at) VALUES (?, ?, ?, 'bundle', ?, ?)", (str(uuid.uuid5(uuid.NAMESPACE_URL, f"recorder-next:diagnostic-tombstone:bundle:{row['bundle_id']}")), user_id, device_id, row["bundle_id"], timestamp))
                 self.store._prepare_cleanup_receipt_tx(
                     conn,
@@ -2094,16 +2453,16 @@ class FeatureGroups:
             raise CleanupIncompleteError("diagnostic deletion cleanup is incomplete")
         return {"events": len(events), "bundles": len(bundles), "tombstones": len(events) + len(bundles)}
 
-    def purge_diagnostics(self, *, now: str | None = None) -> dict[str, int]:
+    def purge_diagnostics(self, *, now: str | None = None, _recover_cleanup: bool = True) -> dict[str, int]:
         timestamp = self._time(now, self.store)
         with self.store._tx() as conn:
             expired_events = conn.execute("SELECT event_id FROM diagnostic_events WHERE deleted_at IS NULL AND retention_deadline <= ?", (timestamp,)).fetchall()
             expired_bundles = conn.execute("SELECT bundle_id, user_id, device_id, storage_path, payload_sha256, compressed_size FROM diagnostic_bundles WHERE deleted_at IS NULL AND retention_deadline <= ?", (timestamp,)).fetchall()
             for row in expired_events:
-                conn.execute("UPDATE diagnostic_events SET deleted_at=? WHERE event_id=?", (timestamp, row["event_id"]))
+                conn.execute("UPDATE diagnostic_events SET category='deleted', stage='deleted', metadata_json='{}', occurred_at=?, retention_deadline=?, deleted_at=? WHERE event_id=?", (timestamp, timestamp, timestamp, row["event_id"]))
                 conn.execute("INSERT OR IGNORE INTO diagnostic_tombstones(tombstone_id, user_id, device_id, entity_type, entity_id, deleted_at) SELECT ?, user_id, device_id, 'event', event_id, ? FROM diagnostic_events WHERE event_id=?", (str(uuid.uuid5(uuid.NAMESPACE_URL, f"recorder-next:diagnostic-tombstone:event:{row['event_id']}")), timestamp, row["event_id"]))
             for row in expired_bundles:
-                conn.execute("UPDATE diagnostic_bundles SET deleted_at=? WHERE bundle_id=?", (timestamp, row["bundle_id"]))
+                conn.execute("UPDATE diagnostic_bundles SET compressed_size=0, expanded_size=0, payload_sha256=?, storage_path='', retention_deadline=?, deleted_at=? WHERE bundle_id=?", (sha256_bytes(f"deleted:{row['bundle_id']}".encode("utf-8")), timestamp, timestamp, row["bundle_id"]))
                 conn.execute("INSERT OR IGNORE INTO diagnostic_tombstones(tombstone_id, user_id, device_id, entity_type, entity_id, deleted_at) SELECT ?, user_id, device_id, 'bundle', bundle_id, ? FROM diagnostic_bundles WHERE bundle_id=?", (str(uuid.uuid5(uuid.NAMESPACE_URL, f"recorder-next:diagnostic-tombstone:bundle:{row['bundle_id']}")), timestamp, row["bundle_id"]))
                 self.store._prepare_cleanup_receipt_tx(
                     conn,
@@ -2117,7 +2476,10 @@ class FeatureGroups:
                     entity_id=row["bundle_id"],
                     now=timestamp,
                 )
-        self.store.recover_cleanup_receipts(now=timestamp)
+        if _recover_cleanup:
+            self.store.recover_cleanup_receipts(now=timestamp)
+        if not _recover_cleanup:
+            return {"events": len(expired_events), "bundles": len(expired_bundles)}
         with self.store._read() as conn:
             pending = conn.execute(
                 "SELECT COUNT(*) FROM storage_cleanup_receipts WHERE operation IN ('diagnostic_delete', 'diagnostic_purge') AND status IN ('PENDING', 'BLOCKED')",
@@ -2135,30 +2497,110 @@ class DurableWorker:
         self.owner = owner
         self.handlers = dict(handlers)
 
+    def _start_heartbeat(
+        self,
+        *,
+        job_id: str,
+        lease_token: str,
+        lease_seconds: int,
+        stop: threading.Event,
+        lost: threading.Event,
+    ) -> threading.Thread:
+        interval = max(0.05, min(float(lease_seconds) / 3.0, 5.0))
+
+        def heartbeat() -> None:
+            while not stop.wait(interval):
+                try:
+                    renewed = self.store.renew_worker_lease(
+                        job_id,
+                        self.owner,
+                        lease_token=lease_token,
+                        lease_seconds=lease_seconds,
+                    )
+                except Exception:
+                    renewed = False
+                if not renewed:
+                    lost.set()
+                    return
+
+        thread = threading.Thread(target=heartbeat, name=f"recorder-worker-heartbeat-{job_id[:12]}", daemon=True)
+        thread.start()
+        return thread
+
     def run_once(self, *, now: str | None = None, lease_seconds: int = 30) -> dict[str, Any] | None:
         job = self.store.claim_worker_job(self.owner, now=now, lease_seconds=lease_seconds)
         if job is None:
             return None
+        lease_token = job.get("lease_token")
+        if not isinstance(lease_token, str) or not lease_token:
+            return self.store.fail_worker_job(
+                job["job_id"],
+                self.owner,
+                lease_token=lease_token or "missing-lease-token",
+                error_kind="lease_token_missing",
+                retryable=False,
+                now=now,
+            )
         handler = self.handlers.get(job["kind"]) or self.handlers.get(job["stage"])
         if handler is None:
-            return self.store.fail_worker_job(job["job_id"], self.owner, error_kind="no_handler", retryable=False, now=now)
+            return self.store.fail_worker_job(job["job_id"], self.owner, lease_token=lease_token, error_kind="no_handler", retryable=False, now=now)
+        stop = threading.Event()
+        lease_lost = threading.Event()
+        heartbeat = self._start_heartbeat(
+            job_id=job["job_id"],
+            lease_token=lease_token,
+            lease_seconds=lease_seconds,
+            stop=stop,
+            lost=lease_lost,
+        )
+
+        def fail(
+            *,
+            error_kind: str,
+            retryable: bool,
+            status_code: int | None = None,
+        ) -> dict[str, Any]:
+            try:
+                return self.store.fail_worker_job(
+                    job["job_id"],
+                    self.owner,
+                    lease_token=lease_token,
+                    error_kind=error_kind,
+                    retryable=retryable,
+                    status_code=status_code,
+                    now=now,
+                )
+            except LeaseConflict:
+                return self.store.get_worker_job(job["job_id"])
+
         try:
             handler_job = dict(job)
+            handler_job["_worker_owner"] = self.owner
             if now is not None:
                 handler_job["_worker_now"] = now
             receipt = handler(handler_job)
+        except LeaseConflict:
+            return self.store.get_worker_job(job["job_id"])
         except Exception as exc:
             retryable = bool(getattr(exc, "retryable", False))
             kind = str(getattr(exc, "kind", "handler_error"))
+            status_code = getattr(exc, "status_code", None)
+            if not isinstance(status_code, int) or isinstance(status_code, bool) or not 100 <= status_code <= 599:
+                status_code = None
             if not SAFE_ERROR_RE.fullmatch(kind):
                 kind = "handler_error"
-            return self.store.fail_worker_job(job["job_id"], self.owner, error_kind=kind, retryable=retryable, now=now)
+            return fail(error_kind=kind, retryable=retryable, status_code=status_code)
+        finally:
+            stop.set()
+            heartbeat.join(timeout=max(1.0, min(float(lease_seconds), 5.0)))
         if not isinstance(receipt, Mapping):
-            return self.store.fail_worker_job(job["job_id"], self.owner, error_kind="missing_effect_receipt", retryable=False, now=now)
+            return fail(error_kind="missing_effect_receipt", retryable=False)
         try:
-            return self.store.complete_worker_job(job["job_id"], self.owner, receipt, now=now)
+            return self.store.complete_worker_job(job["job_id"], self.owner, receipt, lease_token=lease_token, now=now)
+        except LeaseConflict:
+            return self.store.get_worker_job(job["job_id"])
         except (ValidationError, ConflictError):
-            return self.store.fail_worker_job(job["job_id"], self.owner, error_kind="invalid_effect_receipt", retryable=False, now=now)
+            return fail(error_kind="invalid_effect_receipt", retryable=False)
 
     def run_until_idle(self, *, limit: int = 100, now: str | None = None, lease_seconds: int = 30) -> list[dict[str, Any]]:
         if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 500:
