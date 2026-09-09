@@ -11,6 +11,7 @@ import sqlite3
 import stat
 import threading
 import uuid
+import zlib
 from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping, Sequence
 from urllib.parse import quote
@@ -155,6 +156,7 @@ class RecorderStore:
             conn.executescript(schema)
             version_row = conn.execute("SELECT value FROM schema_meta WHERE key='schema_version'").fetchone()
             version = int(version_row["value"]) if version_row is not None else 1
+            source_version = version
             if version > 5:
                 raise RuntimeError(f"unsupported Recorder schema version {version}")
             if version < 2:
@@ -171,7 +173,8 @@ class RecorderStore:
                 version = 4
             if version < 5:
                 self._apply_r25_migration(conn)
-                conn.execute("UPDATE schema_meta SET value='5' WHERE key='schema_version'")
+                # Keep the schema marker at 4 until diagnostics have been
+                # reprojected and their cleanup receipts are durable.
                 version = 5
             # Worker receipt fields are additive to the schema-4 worker
             # tables. Keep startup compatible with an already-created schema
@@ -182,8 +185,10 @@ class RecorderStore:
             self._ensure_finish_columns(conn)
             self._apply_r25_migration(conn)
             self._ensure_c7_columns(conn)
-            conn.execute("INSERT OR IGNORE INTO schema_meta(key, value) VALUES ('schema_version', '5')")
-            conn.execute("UPDATE schema_meta SET value='5' WHERE key='schema_version'")
+            c7_complete = self._migrate_c7_diagnostics(conn, force=source_version < 5)
+            marker = "5" if c7_complete else "4"
+            conn.execute("INSERT OR IGNORE INTO schema_meta(key, value) VALUES ('schema_version', ?)", (marker,))
+            conn.execute("UPDATE schema_meta SET value=? WHERE key='schema_version'", (marker,))
         finally:
             conn.close()
 
@@ -332,16 +337,16 @@ class RecorderStore:
 
     @staticmethod
     def _ensure_c7_columns(conn: sqlite3.Connection) -> None:
-        """Add diagnostics-v2 state without rewriting or inventing legacy data."""
+        """Add diagnostics-v2 columns without labeling legacy data as ready."""
         for table, definitions in (
             ("diagnostics_consents", (("alias_digest", "TEXT"),)),
             (
                 "diagnostic_events",
-                (("alias_digest", "TEXT"), ("privacy_version", "INTEGER NOT NULL DEFAULT 2"), ("migration_state", "TEXT NOT NULL DEFAULT 'READY'")),
+                (("alias_digest", "TEXT"), ("privacy_version", "INTEGER NOT NULL DEFAULT 2"), ("migration_state", "TEXT NOT NULL DEFAULT 'LEGACY'")),
             ),
             (
                 "diagnostic_bundles",
-                (("alias_digest", "TEXT"), ("privacy_version", "INTEGER NOT NULL DEFAULT 2"), ("migration_state", "TEXT NOT NULL DEFAULT 'READY'")),
+                (("alias_digest", "TEXT"), ("privacy_version", "INTEGER NOT NULL DEFAULT 2"), ("migration_state", "TEXT NOT NULL DEFAULT 'LEGACY'")),
             ),
             ("diagnostic_tombstones", (("expires_at", "TEXT"),)),
         ):
@@ -349,9 +354,570 @@ class RecorderStore:
             for name, definition in definitions:
                 if name not in columns:
                     conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
-        conn.execute("UPDATE diagnostic_tombstones SET expires_at=datetime(deleted_at, '+30 days') WHERE expires_at IS NULL")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_diagnostic_events_ready ON diagnostic_events(user_id, device_id, retention_deadline, privacy_version, migration_state)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_diagnostic_bundles_ready ON diagnostic_bundles(user_id, device_id, retention_deadline, privacy_version, migration_state)")
+
+    @staticmethod
+    def _create_c7_bundle_table(conn: sqlite3.Connection, table_name: str = "diagnostic_bundles_new") -> None:
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", table_name):
+            raise ValueError("diagnostic bundle table name is invalid")
+        conn.execute(
+            f"""
+            CREATE TABLE {table_name} (
+                bundle_id TEXT PRIMARY KEY,
+                alias_digest TEXT,
+                user_id TEXT NOT NULL,
+                device_id TEXT NOT NULL,
+                opt_in_event_id TEXT NOT NULL,
+                compressed_size INTEGER NOT NULL,
+                expanded_size INTEGER NOT NULL,
+                payload_sha256 TEXT NOT NULL,
+                storage_path TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                retention_deadline TEXT NOT NULL,
+                deleted_at TEXT,
+                privacy_version INTEGER NOT NULL DEFAULT 2,
+                migration_state TEXT NOT NULL DEFAULT 'READY',
+                FOREIGN KEY(opt_in_event_id) REFERENCES diagnostics_consents(event_id) ON DELETE RESTRICT
+            )
+            """
+        )
+
+    @staticmethod
+    def _c7_bundle_has_payload_unique(conn: sqlite3.Connection) -> bool:
+        try:
+            indexes = conn.execute("PRAGMA index_list(diagnostic_bundles)").fetchall()
+        except sqlite3.DatabaseError:
+            return False
+        for index in indexes:
+            if not index["unique"]:
+                continue
+            name = str(index["name"]).replace('"', '""')
+            columns = [row["name"] for row in conn.execute(f'PRAGMA index_info("{name}")').fetchall()]
+            if columns == ["user_id", "device_id", "payload_sha256"]:
+                return True
+        return False
+
+    @staticmethod
+    def _c7_event_has_legacy_unique(conn: sqlite3.Connection) -> bool:
+        try:
+            indexes = conn.execute("PRAGMA index_list(diagnostic_events)").fetchall()
+        except sqlite3.DatabaseError:
+            return False
+        for index in indexes:
+            if not index["unique"]:
+                continue
+            name = str(index["name"]).replace('"', '""')
+            columns = [row["name"] for row in conn.execute(f'PRAGMA index_info("{name}")').fetchall()]
+            if columns == ["idempotency_key"]:
+                return True
+        return False
+
+    @staticmethod
+    def _create_c7_event_table(conn: sqlite3.Connection, table_name: str = "diagnostic_events_new") -> None:
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", table_name):
+            raise ValueError("diagnostic event table name is invalid")
+        conn.execute(
+            f"""
+            CREATE TABLE {table_name} (
+                event_id TEXT PRIMARY KEY,
+                idempotency_key TEXT NOT NULL,
+                alias_digest TEXT,
+                user_id TEXT NOT NULL,
+                device_id TEXT NOT NULL,
+                category TEXT NOT NULL,
+                stage TEXT NOT NULL,
+                metadata_json TEXT NOT NULL,
+                occurred_at TEXT NOT NULL,
+                retention_deadline TEXT NOT NULL,
+                deleted_at TEXT,
+                privacy_version INTEGER NOT NULL DEFAULT 2,
+                migration_state TEXT NOT NULL DEFAULT 'READY',
+                UNIQUE(user_id, device_id, idempotency_key)
+            )
+            """
+        )
+
+    def _c7_timestamp(self, value: Any, fallback: str) -> str:
+        if isinstance(value, str) and value:
+            try:
+                parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+                if parsed.tzinfo is not None:
+                    return parsed.astimezone(dt.timezone.utc).isoformat(timespec="milliseconds")
+            except ValueError:
+                pass
+        return fallback
+
+    def _c7_plus_seconds(self, value: str, seconds: int) -> str:
+        parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return (parsed + dt.timedelta(seconds=seconds)).isoformat(timespec="milliseconds")
+
+    def _project_legacy_diagnostic_bundle(self, row: Mapping[str, Any]) -> tuple[bytes, int]:
+        from .diagnostics_contract import MetadataValidationError, project_bundle
+        from .features import FeatureGroups
+
+        path = Path(str(row["storage_path"]))
+        try:
+            compressed = FeatureGroups._read_managed_bytes(
+                self.storage_root,
+                path,
+                expected_size=int(row["compressed_size"]),
+                expected_sha256=str(row["payload_sha256"]),
+            )
+            max_compressed = int(getattr(self, "diagnostics_max_compressed_bytes"))
+            max_expanded = int(getattr(self, "diagnostics_max_expanded_bytes"))
+            if len(compressed) > max_compressed:
+                raise ValidationError("legacy diagnostic bundle exceeds the bounded limit")
+            decompressor = zlib.decompressobj()
+            expanded = decompressor.decompress(compressed, max_expanded + 1)
+            expanded += decompressor.flush(max_expanded + 1 - len(expanded))
+        except (OSError, RecorderError, ValueError, zlib.error) as exc:
+            if isinstance(exc, ValidationError):
+                raise
+            raise ValidationError("legacy diagnostic bundle cannot be read") from exc
+        if len(expanded) > max_expanded or decompressor.unconsumed_tail or decompressor.unused_data or not decompressor.eof:
+            raise ValidationError("legacy diagnostic bundle exceeds the bounded limit")
+        try:
+            projected = project_bundle(json.loads(expanded.decode("utf-8")))
+            redacted_expanded = canonical_json(projected)
+        except (UnicodeDecodeError, json.JSONDecodeError, MetadataValidationError) as exc:
+            raise ValidationError("legacy diagnostic bundle cannot be projected") from exc
+        if len(redacted_expanded) > max_expanded:
+            raise ValidationError("redacted diagnostic bundle exceeds the bounded limit")
+        redacted_compressed = zlib.compress(redacted_expanded, level=6)
+        return redacted_compressed, len(redacted_expanded)
+
+    def _recover_c7_migration_receipts(self, *, now: str) -> None:
+        from .features import FeatureGroups
+
+        with self._read() as conn:
+            rows = conn.execute(
+                "SELECT receipt_id FROM storage_cleanup_receipts "
+                "WHERE operation LIKE 'diagnostic_migration_%' AND status IN ('PENDING', 'BLOCKED')"
+            ).fetchall()
+        if rows:
+            FeatureGroups(self).recover_cleanup_receipts(
+                receipt_ids=[row["receipt_id"] for row in rows],
+                now=now,
+            )
+
+    def _finalize_c7_migration(self, *, now: str) -> None:
+        with self._tx() as conn:
+            rows = conn.execute(
+                "SELECT bundle_id FROM diagnostic_bundles WHERE migration_state='MIGRATING'"
+            ).fetchall()
+            for row in rows:
+                pending = conn.execute(
+                    "SELECT 1 FROM storage_cleanup_receipts "
+                    "WHERE entity_type='diagnostic_bundle' AND entity_id=? "
+                    "AND operation LIKE 'diagnostic_migration_cleanup_%' "
+                    "AND status != 'COMPLETE' LIMIT 1",
+                    (row["bundle_id"],),
+                ).fetchone()
+                if pending is None:
+                    conn.execute(
+                        "UPDATE diagnostic_bundles SET migration_state='READY', privacy_version=2 WHERE bundle_id=?",
+                        (row["bundle_id"],),
+                    )
+            # Expiry is based on the original deletion time, not migration
+            # time.  Invalid historical timestamps are quarantined to the
+            # current bounded cleanup horizon rather than exposed as durable
+            # tombstones with an unbounded lifetime.
+            tombstones = conn.execute(
+                "SELECT tombstone_id, deleted_at FROM diagnostic_tombstones WHERE expires_at IS NULL"
+            ).fetchall()
+            for row in tombstones:
+                deleted_at = self._c7_timestamp(row["deleted_at"], now)
+                conn.execute(
+                    "UPDATE diagnostic_tombstones SET expires_at=? WHERE tombstone_id=?",
+                    (
+                        self._c7_plus_seconds(deleted_at, self.diagnostics_tombstone_retention_seconds),
+                        row["tombstone_id"],
+                    ),
+                )
+
+    def _c7_migration_complete(self) -> bool:
+        with self._read() as conn:
+            nonready = conn.execute(
+                "SELECT 1 FROM diagnostic_events WHERE migration_state != 'READY' OR privacy_version != 2 "
+                "UNION ALL SELECT 1 FROM diagnostic_bundles WHERE migration_state != 'READY' OR privacy_version != 2 "
+                "UNION ALL SELECT 1 FROM diagnostic_tombstones WHERE expires_at IS NULL LIMIT 1"
+            ).fetchone()
+            pending = conn.execute(
+                "SELECT 1 FROM storage_cleanup_receipts WHERE operation LIKE 'diagnostic_migration_%' "
+                "AND status != 'COMPLETE' LIMIT 1"
+            ).fetchone()
+            return (
+                nonready is None
+                and pending is None
+                and not self._c7_bundle_has_payload_unique(conn)
+                and not self._c7_event_has_legacy_unique(conn)
+            )
+
+    def _migrate_c7_diagnostics(self, conn: sqlite3.Connection, *, force: bool = False) -> bool:
+        """Reproject schema-4 diagnostics before exposing the schema-5 DTO.
+
+        The database phase is transactional.  New bundle files are first
+        guarded by rollback receipts, then rows remain MIGRATING until the
+        original managed files have been cleaned up.  A process restart can
+        therefore resume either side of the physical/SQLite boundary without
+        relabeling raw legacy bytes as READY.
+        """
+        from .diagnostics_contract import MetadataValidationError, project_metadata
+        from .features import FeatureGroups
+
+        now = self._now()
+        self._recover_c7_migration_receipts(now=now)
+        with self._read() as state_conn:
+            legacy_event = state_conn.execute(
+                "SELECT 1 FROM diagnostic_events WHERE migration_state != 'READY' OR privacy_version != 2 LIMIT 1"
+            ).fetchone()
+            legacy_bundle = state_conn.execute(
+                "SELECT 1 FROM diagnostic_bundles WHERE migration_state != 'READY' OR privacy_version != 2 LIMIT 1"
+            ).fetchone()
+            migrating_bundle = state_conn.execute(
+                "SELECT 1 FROM diagnostic_bundles WHERE migration_state='MIGRATING' LIMIT 1"
+            ).fetchone()
+            has_unique = self._c7_bundle_has_payload_unique(state_conn)
+            has_legacy_event_unique = self._c7_event_has_legacy_unique(state_conn)
+            missing_alias = any(
+                state_conn.execute(f"SELECT 1 FROM {table} WHERE alias_digest IS NULL LIMIT 1").fetchone() is not None
+                for table in ("diagnostics_consents", "diagnostic_events", "diagnostic_bundles")
+            )
+        if migrating_bundle is not None and legacy_event is None and legacy_bundle is not None:
+            self._finalize_c7_migration(now=now)
+            return self._c7_migration_complete()
+        needs_reproject = legacy_event is not None or legacy_bundle is not None or (force and missing_alias)
+        if not needs_reproject and not has_unique and not has_legacy_event_unique:
+            self._finalize_c7_migration(now=now)
+            return self._c7_migration_complete()
+
+        with self._read() as snapshot_conn:
+            old_consents = [dict(row) for row in snapshot_conn.execute("SELECT * FROM diagnostics_consents ORDER BY created_at, event_id").fetchall()]
+            old_events = [dict(row) for row in snapshot_conn.execute("SELECT * FROM diagnostic_events ORDER BY occurred_at, event_id").fetchall()]
+            old_bundles = [dict(row) for row in snapshot_conn.execute("SELECT * FROM diagnostic_bundles ORDER BY created_at, bundle_id").fetchall()]
+            old_tombstones = [dict(row) for row in snapshot_conn.execute("SELECT * FROM diagnostic_tombstones ORDER BY deleted_at, tombstone_id").fetchall()]
+
+        reproject = needs_reproject
+        rebuild_events = reproject or has_legacy_event_unique
+        used_handles: set[str] = set()
+
+        def opaque_handle() -> str:
+            handle = str(uuid.uuid4())
+            while handle in used_handles:
+                handle = str(uuid.uuid4())
+            used_handles.add(handle)
+            return handle
+
+        consent_map: dict[tuple[str, str, str], str] = {}
+        event_map: dict[tuple[str, str, str], str] = {}
+        bundle_map: dict[tuple[str, str, str], str] = {}
+        if reproject:
+            for row in old_consents:
+                key = (str(row["user_id"]), str(row["device_id"]), str(row["event_id"]))
+                consent_map[key] = opaque_handle()
+            for row in old_events:
+                key = (str(row["user_id"]), str(row["device_id"]), str(row["event_id"]))
+                event_map[key] = opaque_handle()
+            for row in old_bundles:
+                key = (str(row["user_id"]), str(row["device_id"]), str(row["bundle_id"]))
+                bundle_map[key] = opaque_handle()
+
+        staged: list[dict[str, Any]] = []
+        converted_bundles: list[dict[str, Any]] = []
+        cleanup_sources: list[dict[str, Any]] = []
+        for row in old_bundles:
+            user_id = str(row["user_id"])
+            device_id = str(row["device_id"])
+            old_bundle_id = str(row["bundle_id"])
+            bundle_id = bundle_map.get((user_id, device_id, old_bundle_id), old_bundle_id)
+            old_path = str(row.get("storage_path") or "")
+            deleted_at = row.get("deleted_at")
+            if deleted_at is not None:
+                deleted_at = self._c7_timestamp(deleted_at, now)
+            alias_digest: str | None = None
+            if reproject:
+                alias_digest = FeatureGroups._alias_digest("bundle", user_id, device_id, old_bundle_id)
+                consent_key = (user_id, device_id, str(row["opt_in_event_id"]))
+                opt_in_event_id = consent_map.get(consent_key)
+                if opt_in_event_id is None:
+                    raise ValidationError("legacy diagnostic bundle consent reference is unavailable")
+                if deleted_at is None and old_path:
+                    redacted_compressed, redacted_size = self._project_legacy_diagnostic_bundle(row)
+                    new_path = self.storage_root / "diagnostics" / hashlib.sha256(user_id.encode("utf-8")).hexdigest() / f"{bundle_id}.z"
+                    staged.append({"path": new_path, "payload": redacted_compressed, "sha256": sha256_bytes(redacted_compressed), "size": len(redacted_compressed), "bundle_id": bundle_id})
+                    compressed_size = len(redacted_compressed)
+                    expanded_size = redacted_size
+                    payload_sha256 = sha256_bytes(redacted_compressed)
+                    storage_path = str(new_path)
+                else:
+                    compressed_size = 0
+                    expanded_size = 0
+                    payload_sha256 = str(row.get("payload_sha256") or sha256_bytes(b""))
+                    storage_path = ""
+                if old_path:
+                    cleanup_sources.append({"row": row, "bundle_id": bundle_id, "path": old_path})
+                migration_state = "MIGRATING" if old_path else "READY"
+            else:
+                alias_digest = row.get("alias_digest") if isinstance(row.get("alias_digest"), str) else None
+                opt_in_event_id = str(row["opt_in_event_id"])
+                compressed_size = int(row["compressed_size"])
+                expanded_size = int(row["expanded_size"])
+                payload_sha256 = str(row["payload_sha256"])
+                storage_path = old_path
+                migration_state = str(row.get("migration_state") or "READY")
+            converted_bundles.append(
+                {
+                    "bundle_id": bundle_id,
+                    "alias_digest": alias_digest,
+                    "user_id": user_id,
+                    "device_id": device_id,
+                    "opt_in_event_id": opt_in_event_id,
+                    "compressed_size": compressed_size,
+                    "expanded_size": expanded_size,
+                    "payload_sha256": payload_sha256,
+                    "storage_path": storage_path,
+                    "created_at": self._c7_timestamp(row.get("created_at"), now),
+                    "retention_deadline": self._c7_timestamp(row.get("retention_deadline"), now),
+                    "deleted_at": deleted_at,
+                    "privacy_version": 2,
+                    "migration_state": migration_state,
+                }
+            )
+
+        stage_receipts: list[str] = []
+        try:
+            if staged:
+                conn.execute("BEGIN IMMEDIATE")
+                try:
+                    for item in staged:
+                        stage_receipts.append(
+                            self._prepare_cleanup_receipt_tx(
+                                conn,
+                                operation="diagnostic_migration_stage_rollback",
+                                path=item["path"],
+                                expected_sha256=item["sha256"],
+                                expected_size=item["size"],
+                                entity_type="diagnostic_bundle_stage",
+                                entity_id=item["bundle_id"],
+                                now=now,
+                            )
+                        )
+                    conn.execute("COMMIT")
+                except Exception:
+                    conn.execute("ROLLBACK")
+                    raise
+                for item in staged:
+                    state, detail = FeatureGroups._managed_file_state(self.storage_root, item["path"])
+                    if state == "missing":
+                        self._safe_write(item["path"], item["payload"])
+                    elif state == "present":
+                        existing = FeatureGroups._read_managed_bytes(
+                            self.storage_root,
+                            item["path"],
+                            expected_size=item["size"],
+                            expected_sha256=item["sha256"],
+                        )
+                        if existing != item["payload"]:
+                            raise ConflictError("diagnostic migration staging path contains different bytes")
+                    else:
+                        raise NotReadyError(detail or "diagnostic migration staging path is unavailable")
+
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                conn.execute("DROP TABLE IF EXISTS diagnostic_bundles_new")
+                conn.execute("DROP TABLE IF EXISTS diagnostic_events_new")
+                for index_name in ("idx_diagnostic_bundles_owner", "idx_diagnostic_bundles_ready"):
+                    conn.execute(f"DROP INDEX IF EXISTS {index_name}")
+                if rebuild_events:
+                    for index_name in ("idx_diagnostic_events_owner", "idx_diagnostic_events_ready"):
+                        conn.execute(f"DROP INDEX IF EXISTS {index_name}")
+                self._create_c7_bundle_table(conn)
+                if rebuild_events:
+                    self._create_c7_event_table(conn)
+
+                if reproject:
+                    converted_consents: list[dict[str, Any]] = []
+                    for row in old_consents:
+                        user_id = str(row["user_id"])
+                        device_id = str(row["device_id"])
+                        old_event_id = str(row["event_id"])
+                        converted_consents.append(
+                            {
+                                "user_id": user_id,
+                                "device_id": device_id,
+                                "event_id": consent_map[(user_id, device_id, old_event_id)],
+                                "alias_digest": FeatureGroups._alias_digest("consent", user_id, device_id, old_event_id),
+                                "enabled": int(bool(row["enabled"])),
+                                "created_at": self._c7_timestamp(row.get("created_at"), now),
+                                "expires_at": self._c7_timestamp(row.get("expires_at"), now) if row.get("expires_at") is not None else None,
+                                "revoked_at": self._c7_timestamp(row.get("revoked_at"), now) if row.get("revoked_at") is not None else None,
+                            }
+                        )
+                    conn.execute("DROP TABLE diagnostic_bundles")
+                    conn.execute("ALTER TABLE diagnostic_bundles_new RENAME TO diagnostic_bundles")
+                    conn.execute("DELETE FROM diagnostics_consents")
+                    conn.executemany(
+                        "INSERT INTO diagnostics_consents(user_id, device_id, event_id, alias_digest, enabled, created_at, expires_at, revoked_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                        [
+                            (row["user_id"], row["device_id"], row["event_id"], row["alias_digest"], row["enabled"], row["created_at"], row["expires_at"], row["revoked_at"])
+                            for row in converted_consents
+                        ],
+                    )
+
+                    converted_events: list[dict[str, Any]] = []
+                    for row in old_events:
+                        user_id = str(row["user_id"])
+                        device_id = str(row["device_id"])
+                        old_event_id = str(row["event_id"])
+                        deleted = row["deleted_at"] is not None
+                        metadata: Mapping[str, Any] = {}
+                        if not deleted:
+                            try:
+                                parsed = json.loads(str(row["metadata_json"]))
+                                metadata = parsed if isinstance(parsed, Mapping) else {}
+                            except (TypeError, ValueError, json.JSONDecodeError):
+                                metadata = {}
+                        payload = dict(metadata)
+                        payload["category"] = row["category"]
+                        payload["stage"] = row["stage"]
+                        if deleted:
+                            projected = {}
+                            category = "other"
+                            stage = "other"
+                        else:
+                            try:
+                                projected = project_metadata(payload)
+                            except MetadataValidationError:
+                                projected = {"category": "other", "stage": "other"}
+                            category = projected["category"]
+                            stage = projected["stage"]
+                        converted_events.append(
+                            {
+                                "event_id": event_map[(user_id, device_id, old_event_id)],
+                                "idempotency_key": FeatureGroups._alias_digest("idempotency", user_id, device_id, str(row["idempotency_key"])),
+                                "alias_digest": FeatureGroups._alias_digest("event", user_id, device_id, old_event_id),
+                                "user_id": user_id,
+                                "device_id": device_id,
+                                "category": category,
+                                "stage": stage,
+                                "metadata_json": canonical_json(projected).decode("utf-8"),
+                                "occurred_at": self._c7_timestamp(row.get("occurred_at"), now),
+                                "retention_deadline": self._c7_timestamp(row.get("retention_deadline"), now),
+                                "deleted_at": self._c7_timestamp(row.get("deleted_at"), now) if row.get("deleted_at") is not None else None,
+                            }
+                        )
+                    conn.execute("DROP TABLE diagnostic_events")
+                    conn.execute("ALTER TABLE diagnostic_events_new RENAME TO diagnostic_events")
+                    conn.executemany(
+                        "INSERT INTO diagnostic_events(event_id, idempotency_key, alias_digest, user_id, device_id, category, stage, metadata_json, occurred_at, retention_deadline, deleted_at, privacy_version, migration_state) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 2, 'READY')",
+                        [
+                            (row["event_id"], row["idempotency_key"], row["alias_digest"], row["user_id"], row["device_id"], row["category"], row["stage"], row["metadata_json"], row["occurred_at"], row["retention_deadline"], row["deleted_at"])
+                            for row in converted_events
+                        ],
+                    )
+                    conn.execute("DELETE FROM diagnostic_tombstones")
+                    converted_tombstones: list[tuple[Any, ...]] = []
+                    for row in old_tombstones:
+                        user_id = str(row["user_id"])
+                        device_id = str(row["device_id"])
+                        entity_type = str(row["entity_type"])
+                        old_entity_id = str(row["entity_id"])
+                        if entity_type == "event":
+                            entity_id = event_map.get((user_id, device_id, old_entity_id), opaque_handle())
+                        else:
+                            entity_id = bundle_map.get((user_id, device_id, old_entity_id), opaque_handle())
+                        deleted_at = self._c7_timestamp(row["deleted_at"], now)
+                        expires_at = self._c7_timestamp(row.get("expires_at"), "") or self._c7_plus_seconds(deleted_at, self.diagnostics_tombstone_retention_seconds)
+                        converted_tombstones.append((opaque_handle(), user_id, device_id, entity_type, entity_id, deleted_at, expires_at))
+                    conn.executemany(
+                        "INSERT INTO diagnostic_tombstones(tombstone_id, user_id, device_id, entity_type, entity_id, deleted_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        converted_tombstones,
+                    )
+
+                bundle_table = "diagnostic_bundles" if reproject else "diagnostic_bundles_new"
+                conn.executemany(
+                    f"INSERT INTO {bundle_table}(bundle_id, alias_digest, user_id, device_id, opt_in_event_id, compressed_size, expanded_size, payload_sha256, storage_path, created_at, retention_deadline, deleted_at, privacy_version, migration_state) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    [
+                        (
+                            row["bundle_id"],
+                            row["alias_digest"],
+                            row["user_id"],
+                            row["device_id"],
+                            row["opt_in_event_id"],
+                            row["compressed_size"],
+                            row["expanded_size"],
+                            row["payload_sha256"],
+                            row["storage_path"],
+                            row["created_at"],
+                            row["retention_deadline"],
+                            row["deleted_at"],
+                            row["privacy_version"],
+                            row["migration_state"],
+                        )
+                        for row in converted_bundles
+                    ],
+                )
+                if not reproject:
+                    if rebuild_events:
+                        conn.executemany(
+                            "INSERT INTO diagnostic_events_new(event_id, idempotency_key, alias_digest, user_id, device_id, category, stage, metadata_json, occurred_at, retention_deadline, deleted_at, privacy_version, migration_state) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                            [
+                                (
+                                    row["event_id"],
+                                    row["idempotency_key"],
+                                    row.get("alias_digest"),
+                                    row["user_id"],
+                                    row["device_id"],
+                                    row["category"],
+                                    row["stage"],
+                                    row["metadata_json"],
+                                    row["occurred_at"],
+                                    row["retention_deadline"],
+                                    row.get("deleted_at"),
+                                    int(row.get("privacy_version") or 2),
+                                    str(row.get("migration_state") or "READY"),
+                                )
+                                for row in old_events
+                            ],
+                        )
+                        conn.execute("DROP TABLE diagnostic_events")
+                        conn.execute("ALTER TABLE diagnostic_events_new RENAME TO diagnostic_events")
+                    conn.execute("DROP TABLE diagnostic_bundles")
+                    conn.execute("ALTER TABLE diagnostic_bundles_new RENAME TO diagnostic_bundles")
+                for source in cleanup_sources:
+                    old_row = source["row"]
+                    source_path = Path(source["path"])
+                    operation = f"diagnostic_migration_cleanup_{source['bundle_id'][:12]}"
+                    self._prepare_cleanup_receipt_tx(
+                        conn,
+                        operation=operation,
+                        path=source_path,
+                        expected_sha256=str(old_row["payload_sha256"]),
+                        expected_size=int(old_row["compressed_size"]),
+                        user_id=str(old_row["user_id"]),
+                        device_id=str(old_row["device_id"]),
+                        entity_type="diagnostic_bundle",
+                        entity_id=source["bundle_id"],
+                        now=now,
+                    )
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_diagnostic_bundles_owner ON diagnostic_bundles(user_id, device_id, created_at)")
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_diagnostic_bundles_ready ON diagnostic_bundles(user_id, device_id, retention_deadline, privacy_version, migration_state)")
+                if rebuild_events:
+                    conn.execute("CREATE INDEX IF NOT EXISTS idx_diagnostic_events_owner ON diagnostic_events(user_id, device_id, occurred_at)")
+                    conn.execute("CREATE INDEX IF NOT EXISTS idx_diagnostic_events_ready ON diagnostic_events(user_id, device_id, retention_deadline, privacy_version, migration_state)")
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+        except Exception:
+            if stage_receipts:
+                FeatureGroups(self).recover_cleanup_receipts(receipt_ids=stage_receipts, now=now)
+            raise
+
+        self._recover_c7_migration_receipts(now=self._now())
+        self._finalize_c7_migration(now=self._now())
+        return self._c7_migration_complete()
 
     @staticmethod
     def _apply_r25_migration(conn: sqlite3.Connection) -> None:
@@ -3408,10 +3974,21 @@ class RecorderStore:
                         complete = False
                         continue
                 try:
-                    if not self._cleanup_target_matches(path, target):
+                    state, _detail = self._features._managed_file_state(self.storage_root, path)
+                    if state == "missing":
+                        # A missing parent is already a converged physical
+                        # state.  Do not route it through the managed unlink
+                        # helper, which correctly refuses to create or open
+                        # missing directories during cleanup.
+                        pass
+                    elif state == "present":
+                        if not self._cleanup_target_matches(path, target):
+                            complete = False
+                            continue
+                        self._safe_unlink(path)
+                    else:
                         complete = False
                         continue
-                    self._safe_unlink(path)
                 except FileNotFoundError:
                     pass
                 except (OSError, RecorderError):

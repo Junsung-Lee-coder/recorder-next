@@ -26,7 +26,7 @@ from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 from .canonical import canonical_json, hermes_content_hash, normalize_hermes_text, sha256_bytes, sha256_json
 from .diagnostics_contract import MetadataValidationError, project_bundle, project_metadata
-from .errors import CleanupIncompleteError, ConflictError, LeaseConflict, NotFoundError, NotReadyError, RangeNotSatisfiable, RecorderError, UnauthorizedError, ValidationError
+from .errors import CleanupIncompleteError, ConflictError, LeaseConflict, NotFoundError, NotReadyError, RangeNotSatisfiable, RecorderError, SourceUnavailableError, UnauthorizedError, ValidationError
 
 
 DIGEST_RE = re.compile(r"^[0-9a-fA-F]{64}$")
@@ -1658,6 +1658,8 @@ class FeatureGroups:
             row = conn.execute("SELECT * FROM turn_parts WHERE turn_id=? AND part_id=?", (turn_id, part_id)).fetchone()
             if row is None:
                 raise NotFoundError("attachment part not found")
+            if row["source_deleted_at"] is not None:
+                raise SourceUnavailableError("attachment source is unavailable")
             if row["status"] != "COMPLETE" or not row["whole_stream_sha256"]:
                 raise NotReadyError("attachment part is not complete")
             digest = self._digest(row["whole_stream_sha256"], "attachment hash")
@@ -1687,6 +1689,8 @@ class FeatureGroups:
             ).fetchone()
             if row is None:
                 raise NotFoundError("attachment part not found")
+            if row["source_deleted_at"] is not None:
+                raise SourceUnavailableError("attachment source is unavailable")
             if row["status"] != "COMPLETE" or not row["source_path"]:
                 raise NotReadyError("attachment part is not complete")
             if row["whole_stream_sha256"] != expected_hash:
@@ -2341,7 +2345,19 @@ class FeatureGroups:
         # A bundle carries the consent event that authorized it.  It must be
         # the one current row, not merely any historically enabled row.  The
         # enclosing transaction serializes this read with opt-out revocation.
-        return event_id is None or row["event_id"] == event_id
+        if event_id is None or row["event_id"] == event_id:
+            return True
+        alias_digest = self._alias_digest("consent", user_id, device_id, event_id)
+        return row["alias_digest"] == alias_digest
+
+    def _resolve_consent_event_id_tx(self, conn: Any, user_id: str, device_id: str, event_id: str) -> str | None:
+        alias_digest = self._alias_digest("consent", user_id, device_id, event_id)
+        row = conn.execute(
+            "SELECT event_id FROM diagnostics_consents WHERE user_id=? AND device_id=? "
+            "AND (event_id=? OR alias_digest=?) ORDER BY created_at DESC, event_id DESC LIMIT 1",
+            (user_id, device_id, event_id, alias_digest),
+        ).fetchone()
+        return str(row["event_id"]) if row is not None else None
 
     def record_diagnostics_opt_in(
         self,
@@ -2365,7 +2381,13 @@ class FeatureGroups:
         expiry = self._time(expires_at, self.store) if expires_at is not None else None
         with self.store._tx() as conn:
             self.store._assert_device(conn, user_id, device_id)
-            existing = conn.execute("SELECT * FROM diagnostics_consents WHERE user_id=? AND device_id=? AND alias_digest=?", (user_id, device_id, alias_digest)).fetchone() if alias_digest else None
+            if alias_digest:
+                existing = conn.execute(
+                    "SELECT * FROM diagnostics_consents WHERE user_id=? AND device_id=? AND (event_id=? OR alias_digest=?)",
+                    (user_id, device_id, event_id, alias_digest),
+                ).fetchone()
+            else:
+                existing = None
             if existing is not None:
                 if existing["user_id"] != user_id or existing["device_id"] != device_id or bool(existing["enabled"]) != enabled or existing["expires_at"] != expiry:
                     raise ConflictError("diagnostics consent event is immutable")
@@ -2410,12 +2432,18 @@ class FeatureGroups:
             self.store._assert_device(conn, user_id, device_id)
             if not self._diagnostics_enabled_tx(conn, user_id, device_id, timestamp):
                 raise UnauthorizedError("diagnostics requires an active opt-in")
-            existing = conn.execute("SELECT * FROM diagnostic_events WHERE user_id=? AND device_id=? AND idempotency_key=?", (user_id, device_id, idempotency_digest)).fetchone()
+            existing = conn.execute(
+                "SELECT * FROM diagnostic_events WHERE user_id=? AND device_id=? "
+                "AND (idempotency_key=? OR alias_digest=?)",
+                (user_id, device_id, idempotency_digest, event_alias_digest),
+            ).fetchone()
             if existing is not None:
                 if existing["deleted_at"] is not None or existing["retention_deadline"] <= timestamp or existing["privacy_version"] != 2 or existing["migration_state"] != "READY":
                     raise ConflictError("diagnostic event is expired or deleted")
                 if existing["metadata_json"] != metadata_json or existing["user_id"] != user_id or existing["device_id"] != device_id:
                     raise ConflictError("diagnostic event idempotency key has a different payload")
+                if existing["idempotency_key"] != idempotency_digest:
+                    raise ConflictError("diagnostic event alias has a different idempotency key")
                 return {"event_id": existing["event_id"], "category": existing["category"], "stage": existing["stage"], "metadata": json.loads(existing["metadata_json"]), "occurred_at": existing["occurred_at"], "retention_deadline": existing["retention_deadline"]}
             handle = str(uuid.uuid4())
             conn.execute("INSERT INTO diagnostic_events(event_id, idempotency_key, alias_digest, user_id, device_id, category, stage, metadata_json, occurred_at, retention_deadline, privacy_version, migration_state) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 2, 'READY')", (handle, idempotency_digest, event_alias_digest, user_id, device_id, category, stage, metadata_json, occurred, deadline))
@@ -2495,7 +2523,8 @@ class FeatureGroups:
         path = self.store.storage_root / "diagnostics" / hashlib.sha256(user_id.encode("utf-8")).hexdigest() / f"{handle}.z"
         with self.store._read() as conn:
             self.store._assert_device(conn, user_id, device_id)
-            if not self._diagnostics_enabled_tx(conn, user_id, device_id, timestamp, opt_in_event_id):
+            resolved_opt_in_event_id = self._resolve_consent_event_id_tx(conn, user_id, device_id, opt_in_event_id)
+            if resolved_opt_in_event_id is None or not self._diagnostics_enabled_tx(conn, user_id, device_id, timestamp, resolved_opt_in_event_id):
                 raise UnauthorizedError("diagnostic bundle requires the exact active opt-in event")
         self._mkdir_managed_path(self.store.storage_root, path.parent)
         receipt_id = self.store._prepare_cleanup_receipt(
@@ -2506,13 +2535,14 @@ class FeatureGroups:
             user_id=user_id,
             device_id=device_id,
             entity_type="diagnostic_bundle",
-            entity_id=bundle_id,
+            entity_id=handle,
             now=timestamp,
         )
         try:
             with self.store._tx() as conn:
                 self.store._assert_device(conn, user_id, device_id)
-                if not self._diagnostics_enabled_tx(conn, user_id, device_id, timestamp, opt_in_event_id):
+                resolved_opt_in_event_id = self._resolve_consent_event_id_tx(conn, user_id, device_id, opt_in_event_id)
+                if resolved_opt_in_event_id is None or not self._diagnostics_enabled_tx(conn, user_id, device_id, timestamp, resolved_opt_in_event_id):
                     raise UnauthorizedError("diagnostic bundle requires the exact active opt-in event")
                 existing = conn.execute("SELECT * FROM diagnostic_bundles WHERE user_id=? AND device_id=? AND (alias_digest=? OR bundle_id=?)", (user_id, device_id, alias_digest, bundle_id)).fetchone()
                 if existing is not None:
@@ -2527,7 +2557,7 @@ class FeatureGroups:
                     raise ConflictError("diagnostic bundle path already contains different bytes")
                 if not path_existed:
                     self.store._safe_write(path, redacted_compressed)
-                conn.execute("INSERT INTO diagnostic_bundles(bundle_id, alias_digest, user_id, device_id, opt_in_event_id, compressed_size, expanded_size, payload_sha256, storage_path, created_at, retention_deadline, privacy_version, migration_state) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 2, 'READY')", (handle, alias_digest, user_id, device_id, opt_in_event_id, len(redacted_compressed), len(redacted_expanded), digest, str(path), timestamp, deadline))
+                conn.execute("INSERT INTO diagnostic_bundles(bundle_id, alias_digest, user_id, device_id, opt_in_event_id, compressed_size, expanded_size, payload_sha256, storage_path, created_at, retention_deadline, privacy_version, migration_state) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 2, 'READY')", (handle, alias_digest, user_id, device_id, resolved_opt_in_event_id, len(redacted_compressed), len(redacted_expanded), digest, str(path), timestamp, deadline))
                 self.store._complete_cleanup_receipt_tx(conn, receipt_id, now=timestamp)
                 return {"bundle_id": handle, "compressed_size": len(redacted_compressed), "expanded_size": len(redacted_expanded), "created_at": timestamp, "retention_deadline": deadline}
         except Exception as exc:
