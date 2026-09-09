@@ -18,8 +18,323 @@ from recorder_next.features import FeatureGroups
 from recorder_next.models import AsrResult
 from recorder_next.store import RecorderStore
 
+SCHEMA4_FIXTURE = Path(__file__).with_name("fixtures") / "schema4_public_preimage.sql"
+SCHEMA4_FIXTURE_SHA256 = "73076556af3d41c46b45ef43049346ad750fd705bdc6bef5cc53ba12c1316d84"
+
+
+def _seed_migration_fixture(db_path: Path, script_path: Path, *, version: int) -> None:
+    conn = sqlite3.connect(db_path)
+    conn.executescript(script_path.read_text(encoding="utf-8"))
+    conn.execute("UPDATE schema_meta SET value=? WHERE key='schema_version'", (str(version),))
+    conn.execute(
+        "INSERT INTO devices(user_id, device_id, kind, created_at) VALUES (?, ?, ?, ?)",
+        ("sentinel-user", "sentinel-device", "phone", "2026-09-10T00:00:00+00:00"),
+    )
+    conn.commit()
+    conn.close()
+
+
+def _logical_database_snapshot(db_path: Path) -> dict:
+    conn = sqlite3.connect(db_path)
+    conn.execute("PRAGMA foreign_keys=ON")
+    objects = [
+        tuple(row)
+        for row in conn.execute(
+            "SELECT type, name, tbl_name, sql FROM sqlite_master "
+            "WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name"
+        )
+    ]
+    tables = [row[1] for row in objects if row[0] == "table"]
+    rows = {}
+    for table in tables:
+        escaped = table.replace('"', '""')
+        values = [tuple(row) for row in conn.execute(f'SELECT * FROM "{escaped}"')]
+        rows[table] = sorted(values, key=repr)
+    snapshot = {
+        "objects": objects,
+        "rows": rows,
+        "foreign_key_check": [tuple(row) for row in conn.execute("PRAGMA foreign_key_check")],
+        "integrity_check": conn.execute("PRAGMA integrity_check").fetchone()[0],
+    }
+    conn.close()
+    return snapshot
+
 
 class R25IntegratedRegressionTests(unittest.TestCase):
+    def test_schema4_fixture_is_the_pinned_public_preimage(self):
+        content = SCHEMA4_FIXTURE.read_bytes()
+        self.assertEqual(len(content), 19999)
+        self.assertEqual(hashlib.sha256(content).hexdigest(), SCHEMA4_FIXTURE_SHA256)
+
+    def test_sql_script_executor_preserves_transaction_and_sqlite_parsing(self):
+        with sqlite3.connect(":memory:", isolation_level=None) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            RecorderStore._execute_sql_script(
+                conn,
+                "-- semicolon in a comment;\n"
+                "CREATE TABLE parsed (value TEXT);\n"
+                "INSERT INTO parsed VALUES ('quoted;semicolon');\n"
+                "CREATE TABLE unterminated (value TEXT)\n"
+                "/* final comment */",
+            )
+            self.assertEqual(conn.execute("SELECT value FROM parsed").fetchone()[0], "quoted;semicolon")
+            self.assertEqual(
+                [row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")],
+                ["parsed", "unterminated"],
+            )
+            conn.execute("ROLLBACK")
+            with self.assertRaisesRegex(RuntimeError, "active transaction"):
+                RecorderStore._execute_sql_script(conn, "CREATE TABLE inactive (value TEXT);")
+            conn.execute("BEGIN IMMEDIATE")
+            with self.assertRaises(sqlite3.OperationalError):
+                RecorderStore._execute_sql_script(conn, "CREATE TABLE malformed (")
+            conn.execute("ROLLBACK")
+
+    def test_schema_preparation_failure_after_real_r25_rolls_back_pre_a_state(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            db_path = root / "db.sqlite3"
+            _seed_migration_fixture(db_path, SCHEMA4_FIXTURE, version=4)
+            before = _logical_database_snapshot(db_path)
+            original = RecorderStore._apply_r25_migration
+
+            def fail_after_real_work(conn):
+                original(conn)
+                raise RuntimeError("injected-after-real-r25")
+
+            with patch.object(RecorderStore, "_apply_r25_migration", staticmethod(fail_after_real_work)):
+                with self.assertRaisesRegex(RuntimeError, "injected-after-real-r25"):
+                    RecorderStore(db_path, storage_root=root / "data")
+
+            self.assertEqual(_logical_database_snapshot(db_path), before)
+            with sqlite3.connect(db_path) as conn:
+                self.assertEqual(conn.execute("SELECT value FROM schema_meta WHERE key='schema_version'").fetchone()[0], "4")
+                self.assertEqual(conn.execute("SELECT device_id FROM devices WHERE device_id='sentinel-device'").fetchone()[0], "sentinel-device")
+            migrated = RecorderStore(db_path, storage_root=root / "data")
+            with migrated._read() as conn:
+                self.assertEqual(conn.execute("SELECT value FROM schema_meta WHERE key='schema_version'").fetchone()[0], "5")
+                self.assertIsNotNone(conn.execute("SELECT 1 FROM sqlite_master WHERE name='hermes_run_bindings'").fetchone())
+            restarted = RecorderStore(db_path, storage_root=root / "data")
+            with restarted._read() as conn:
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM devices WHERE device_id='sentinel-device'").fetchone()[0], 1)
+
+    def test_historical_migration_failure_rolls_back_script_and_alters(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            db_path = root / "db.sqlite3"
+            initial = root / "initial.sql"
+            initial.write_text(
+                (Path(__file__).parents[1] / "migrations" / "001_initial.sql").read_text(encoding="utf-8"),
+                encoding="utf-8",
+            )
+            _seed_migration_fixture(db_path, initial, version=1)
+            before = _logical_database_snapshot(db_path)
+            real_connect = sqlite3.connect
+            created = []
+
+            class FailingScheduleConnection(sqlite3.Connection):
+                def __init__(self, *args, **kwargs):
+                    super().__init__(*args, **kwargs)
+                    self.closed_for_test = False
+
+                def execute(self, sql, parameters=()):
+                    if "idx_schedule_occurrences_due" in str(sql):
+                        raise RuntimeError("injected-mid-scheduled-script")
+                    return super().execute(sql, parameters)
+
+                def close(self):
+                    self.closed_for_test = True
+                    return super().close()
+
+            def connect(*args, **kwargs):
+                kwargs["factory"] = FailingScheduleConnection
+                conn = real_connect(*args, **kwargs)
+                created.append(conn)
+                return conn
+
+            with patch("recorder_next.store.sqlite3.connect", side_effect=connect):
+                with self.assertRaisesRegex(RuntimeError, "injected-mid-scheduled-script"):
+                    RecorderStore(db_path, storage_root=root / "data")
+            self.assertTrue(created[0].closed_for_test)
+            self.assertEqual(_logical_database_snapshot(db_path), before)
+
+    def test_schema_preparation_commit_refusal_restores_pre_a_state(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            db_path = root / "db.sqlite3"
+            _seed_migration_fixture(db_path, SCHEMA4_FIXTURE, version=4)
+            before = _logical_database_snapshot(db_path)
+            real_connect = sqlite3.connect
+            created = []
+
+            class FailingInitialCommitConnection(sqlite3.Connection):
+                def __init__(self, *args, **kwargs):
+                    super().__init__(*args, **kwargs)
+                    self.commit_attempts = 0
+                    self.closed_for_test = False
+
+                def execute(self, sql, parameters=()):
+                    if str(sql).strip().upper() == "COMMIT":
+                        self.commit_attempts += 1
+                        if self.commit_attempts == 1:
+                            raise RuntimeError("injected-initial-commit")
+                    return super().execute(sql, parameters)
+
+                def close(self):
+                    self.closed_for_test = True
+                    return super().close()
+
+            def connect(*args, **kwargs):
+                kwargs["factory"] = FailingInitialCommitConnection
+                conn = real_connect(*args, **kwargs)
+                created.append(conn)
+                return conn
+
+            with patch("recorder_next.store.sqlite3.connect", side_effect=connect):
+                with self.assertRaisesRegex(RuntimeError, "injected-initial-commit"):
+                    RecorderStore(db_path, storage_root=root / "data")
+            self.assertTrue(created[0].closed_for_test)
+            self.assertEqual(_logical_database_snapshot(db_path), before)
+
+    def test_final_marker_write_failure_leaves_committed_schema4_checkpoint(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            db_path = root / "db.sqlite3"
+            _seed_migration_fixture(db_path, SCHEMA4_FIXTURE, version=4)
+            real_connect = sqlite3.connect
+            created = []
+
+            class FailingFinalMarkerConnection(sqlite3.Connection):
+                def __init__(self, *args, **kwargs):
+                    super().__init__(*args, **kwargs)
+                    self.closed_for_test = False
+
+                def execute(self, sql, parameters=()):
+                    if (
+                        str(sql).strip().upper() == "UPDATE SCHEMA_META SET VALUE=? WHERE KEY='SCHEMA_VERSION'"
+                        and tuple(parameters) == ("5",)
+                    ):
+                        raise RuntimeError("injected-final-marker-write")
+                    return super().execute(sql, parameters)
+
+                def close(self):
+                    self.closed_for_test = True
+                    return super().close()
+
+            def connect(*args, **kwargs):
+                kwargs["factory"] = FailingFinalMarkerConnection
+                conn = real_connect(*args, **kwargs)
+                created.append(conn)
+                return conn
+
+            with patch("recorder_next.store.sqlite3.connect", side_effect=connect), patch.object(
+                RecorderStore, "_migrate_c7_diagnostics", return_value=True
+            ):
+                with self.assertRaisesRegex(RuntimeError, "injected-final-marker-write"):
+                    RecorderStore(db_path, storage_root=root / "data")
+            self.assertTrue(created[0].closed_for_test)
+            with sqlite3.connect(db_path) as conn:
+                self.assertEqual(conn.execute("SELECT value FROM schema_meta WHERE key='schema_version'").fetchone()[0], "4")
+                self.assertIsNotNone(conn.execute("SELECT 1 FROM sqlite_master WHERE name='hermes_run_bindings'").fetchone())
+
+    def test_unsupported_version_rejection_rolls_back_bootstrap_changes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            db_path = root / "db.sqlite3"
+            _seed_migration_fixture(db_path, SCHEMA4_FIXTURE, version=6)
+            before = _logical_database_snapshot(db_path)
+            with self.assertRaisesRegex(RuntimeError, "unsupported Recorder schema version 6"):
+                RecorderStore(db_path, storage_root=root / "data")
+            self.assertEqual(_logical_database_snapshot(db_path), before)
+
+    def test_c7_starts_after_committed_schema_checkpoint_and_exception_preserves_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            db_path = root / "db.sqlite3"
+            _seed_migration_fixture(db_path, SCHEMA4_FIXTURE, version=4)
+            observations = []
+
+            def fail_c7(conn, *, force):
+                observations.append((conn.in_transaction, force))
+                raise RuntimeError("injected-c7-failure")
+
+            with patch.object(RecorderStore, "_migrate_c7_diagnostics", side_effect=fail_c7):
+                with self.assertRaisesRegex(RuntimeError, "injected-c7-failure"):
+                    RecorderStore(db_path, storage_root=root / "data")
+            self.assertEqual(observations, [(False, True)])
+            with sqlite3.connect(db_path) as conn:
+                self.assertEqual(conn.execute("SELECT value FROM schema_meta WHERE key='schema_version'").fetchone()[0], "4")
+                self.assertIsNotNone(conn.execute("SELECT 1 FROM sqlite_master WHERE name='hermes_run_bindings'").fetchone())
+            resumed = RecorderStore(db_path, storage_root=root / "data")
+            with resumed._read() as conn:
+                self.assertEqual(conn.execute("SELECT value FROM schema_meta WHERE key='schema_version'").fetchone()[0], "5")
+
+    def test_final_marker_commit_failure_rolls_back_to_schema4_checkpoint(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            db_path = root / "db.sqlite3"
+            _seed_migration_fixture(db_path, SCHEMA4_FIXTURE, version=4)
+            real_connect = sqlite3.connect
+            created = []
+
+            class FailingFinalCommitConnection(sqlite3.Connection):
+                def __init__(self, *args, **kwargs):
+                    super().__init__(*args, **kwargs)
+                    self.commit_attempts = 0
+                    self.closed_for_test = False
+
+                def execute(self, sql, parameters=()):
+                    if str(sql).strip().upper() == "COMMIT":
+                        self.commit_attempts += 1
+                        if self.commit_attempts == 2:
+                            raise RuntimeError("injected-final-commit")
+                    return super().execute(sql, parameters)
+
+                def close(self):
+                    self.closed_for_test = True
+                    return super().close()
+
+            def connect(*args, **kwargs):
+                kwargs["factory"] = FailingFinalCommitConnection
+                conn = real_connect(*args, **kwargs)
+                created.append(conn)
+                return conn
+
+            with patch("recorder_next.store.sqlite3.connect", side_effect=connect), patch.object(
+                RecorderStore, "_migrate_c7_diagnostics", return_value=True
+            ):
+                with self.assertRaisesRegex(RuntimeError, "injected-final-commit"):
+                    RecorderStore(db_path, storage_root=root / "data")
+            self.assertTrue(created[0].closed_for_test)
+            with sqlite3.connect(db_path) as conn:
+                self.assertEqual(conn.execute("SELECT value FROM schema_meta WHERE key='schema_version'").fetchone()[0], "4")
+                self.assertIsNotNone(conn.execute("SELECT 1 FROM sqlite_master WHERE name='hermes_run_bindings'").fetchone())
+
+    def test_connect_closes_acquired_connection_when_pragma_setup_fails(self):
+        real_connect = sqlite3.connect
+
+        class FailingPragmaConnection(sqlite3.Connection):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.closed_for_test = False
+
+            def execute(self, sql, parameters=()):
+                if str(sql).strip().upper() == "PRAGMA JOURNAL_MODE = WAL":
+                    raise RuntimeError("injected-journal-mode")
+                return super().execute(sql, parameters)
+
+            def close(self):
+                self.closed_for_test = True
+                return super().close()
+
+        conn = real_connect(":memory:", factory=FailingPragmaConnection, isolation_level=None)
+        instance = RecorderStore.__new__(RecorderStore)
+        instance.db_path = ":memory:"
+        with patch("recorder_next.store.sqlite3.connect", return_value=conn):
+            with self.assertRaisesRegex(RuntimeError, "injected-journal-mode"):
+                instance._connect()
+        self.assertTrue(conn.closed_for_test)
+
     def test_terminal_worker_replay_requires_winning_attempt_token(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = RecorderStore(Path(tmp) / "db.sqlite3", storage_root=Path(tmp) / "data")

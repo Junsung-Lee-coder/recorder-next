@@ -142,18 +142,40 @@ class RecorderStore:
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path, timeout=30, isolation_level=None, check_same_thread=False)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA foreign_keys = ON")
-        conn.execute("PRAGMA busy_timeout = 30000")
-        conn.execute("PRAGMA journal_mode = WAL")
-        conn.execute("PRAGMA synchronous = NORMAL")
+        try:
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA foreign_keys = ON")
+            conn.execute("PRAGMA busy_timeout = 30000")
+            conn.execute("PRAGMA journal_mode = WAL")
+            conn.execute("PRAGMA synchronous = NORMAL")
+        except BaseException:
+            with contextlib.suppress(BaseException):
+                conn.close()
+            raise
         return conn
+
+    @staticmethod
+    def _execute_sql_script(conn: sqlite3.Connection, script: str) -> None:
+        if not conn.in_transaction:
+            raise RuntimeError("SQL migration script requires an active transaction")
+        statement: list[str] = []
+        for character in script:
+            statement.append(character)
+            if character == ";":
+                candidate = "".join(statement)
+                if sqlite3.complete_statement(candidate):
+                    conn.execute(candidate)
+                    statement.clear()
+        remainder = "".join(statement)
+        if remainder.strip():
+            conn.execute(remainder)
 
     def _initialize(self) -> None:
         schema = SCHEMA_PATH.read_text(encoding="utf-8")
         conn = self._connect()
         try:
-            conn.executescript(schema)
+            conn.execute("BEGIN IMMEDIATE")
+            self._execute_sql_script(conn, schema)
             version_row = conn.execute("SELECT value FROM schema_meta WHERE key='schema_version'").fetchone()
             version = int(version_row["value"]) if version_row is not None else 1
             source_version = version
@@ -185,11 +207,25 @@ class RecorderStore:
             self._ensure_finish_columns(conn)
             self._apply_r25_migration(conn)
             self._ensure_c7_columns(conn)
+            conn.execute("INSERT OR IGNORE INTO schema_meta(key, value) VALUES ('schema_version', '4')")
+            conn.execute("UPDATE schema_meta SET value='4' WHERE key='schema_version'")
+            conn.execute("COMMIT")
+            if conn.in_transaction:
+                raise RuntimeError("schema preparation transaction remained active after commit")
             c7_complete = self._migrate_c7_diagnostics(conn, force=source_version < 5)
             marker = "5" if c7_complete else "4"
+            conn.execute("BEGIN IMMEDIATE")
             conn.execute("INSERT OR IGNORE INTO schema_meta(key, value) VALUES ('schema_version', ?)", (marker,))
             conn.execute("UPDATE schema_meta SET value=? WHERE key='schema_version'", (marker,))
-        finally:
+            conn.execute("COMMIT")
+        except BaseException:
+            with contextlib.suppress(BaseException):
+                if conn.in_transaction:
+                    conn.execute("ROLLBACK")
+            with contextlib.suppress(BaseException):
+                conn.close()
+            raise
+        else:
             conn.close()
 
     @staticmethod
@@ -212,7 +248,8 @@ class RecorderStore:
         if "delivery_target_device_id" not in artifact_columns:
             conn.execute("ALTER TABLE tts_artifacts ADD COLUMN delivery_target_device_id TEXT")
         conn.execute("UPDATE tts_artifacts SET delivery_target_device_id=origin_device_id WHERE delivery_target_device_id IS NULL")
-        conn.executescript(
+        RecorderStore._execute_sql_script(
+            conn,
             """
             CREATE TABLE IF NOT EXISTS schedules (
                 schedule_id TEXT PRIMARY KEY,
@@ -285,7 +322,7 @@ class RecorderStore:
                 conn.execute(line)
             else:
                 statements.append(line)
-        conn.executescript("\n".join(statements))
+        RecorderStore._execute_sql_script(conn, "\n".join(statements))
 
     @staticmethod
     def _apply_eavesdrop_migration(conn: sqlite3.Connection) -> None:
@@ -301,7 +338,7 @@ class RecorderStore:
                 conn.execute(line)
                 continue
             statements.append(line)
-        conn.executescript("\n".join(statements))
+        RecorderStore._execute_sql_script(conn, "\n".join(statements))
 
 
     @staticmethod
@@ -927,7 +964,8 @@ class RecorderStore:
         columns = {row["name"] for row in conn.execute("PRAGMA table_info(turn_parts)").fetchall()}
         if "source_deleted_at" not in columns:
             conn.execute("ALTER TABLE turn_parts ADD COLUMN source_deleted_at TEXT")
-        conn.executescript(
+        RecorderStore._execute_sql_script(
+            conn,
             """
             CREATE TABLE IF NOT EXISTS hermes_run_bindings (
                 submission_id TEXT PRIMARY KEY,
