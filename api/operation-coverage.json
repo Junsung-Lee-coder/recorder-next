@@ -21,6 +21,12 @@
           "body": "Error",
           "headers": [],
           "media_type": "application/json",
+          "status": 400
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
           "status": 500
         }
       ]
@@ -41,6 +47,12 @@
           "headers": [],
           "media_type": null,
           "status": 200
+        },
+        {
+          "body": "none",
+          "headers": [],
+          "media_type": null,
+          "status": 400
         },
         {
           "body": "none",
@@ -71,6 +83,12 @@
           "body": "Error",
           "headers": [],
           "media_type": "application/json",
+          "status": 400
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
           "status": 500
         }
       ]
@@ -91,6 +109,12 @@
           "headers": [],
           "media_type": null,
           "status": 200
+        },
+        {
+          "body": "none",
+          "headers": [],
+          "media_type": null,
+          "status": 400
         },
         {
           "body": "none",
@@ -4496,6 +4520,12 @@
           "body": "Error",
           "headers": [],
           "media_type": "application/json",
+          "status": 400
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
           "status": 500
         }
       ]
@@ -4516,6 +4546,12 @@
           "headers": [],
           "media_type": null,
           "status": 200
+        },
+        {
+          "body": "none",
+          "headers": [],
+          "media_type": null,
+          "status": 400
         },
         {
           "body": "none",

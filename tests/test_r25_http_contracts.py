@@ -29,6 +29,44 @@ class R25HttpContractTests(unittest.TestCase):
             [(item.method, item.path_template) for item in catalog],
         )
 
+    def test_duplicate_query_parameters_are_declared_as_400_for_public_get_and_head_routes(self):
+        routes = ("/v1/health", "/v1/openapi.json", "/healthz")
+        for path in routes:
+            for method in ("GET", "HEAD"):
+                with self.subTest(path=path, method=method):
+                    operation = match_operation(path, method)
+                    self.assertIn(400, [response.status for response in operation.responses])
+                    if method == "GET":
+                        self.assertEqual(operation.response(400).schema_name, "Error")
+                        self.assertEqual(operation.response(400).media_type, "application/json")
+                    else:
+                        self.assertTrue(operation.response(400).no_body)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = RecorderStore(root / "db.sqlite3", storage_root=root / "data")
+            service = RecorderService(store)
+            before = store.db_snapshot()
+            for path in routes:
+                for method in ("GET", "HEAD"):
+                    with self.subTest(path=path, method=method, behavior=True):
+                        status, headers, payload = service.handle_http(
+                            method,
+                            f"{path}?probe=1&probe=1",
+                            {},
+                            b"",
+                        )
+                        self.assertEqual(status, 400)
+                        self.assertEqual(headers["Content-Type"], "application/json")
+                        if method == "GET":
+                            self.assertEqual(
+                                payload,
+                                {"error": {"code": "VALIDATION_ERROR", "message": "duplicate query parameters are not permitted"}},
+                            )
+                        else:
+                            self.assertEqual(payload, b"")
+            self.assertEqual(store.db_snapshot(), before)
+
     def test_openapi_validation_is_mutation_sensitive_to_routes_and_responses(self):
         missing_route = copy.deepcopy(OPENAPI)
         del missing_route["paths"]["/v1/turns"]

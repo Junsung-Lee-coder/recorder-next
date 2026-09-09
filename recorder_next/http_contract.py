@@ -256,8 +256,8 @@ def _protected(*extra: Parameter, phone: bool = False) -> tuple[Parameter, ...]:
 
 
 _BASE_OPERATIONS: tuple[Operation, ...] = (
-    _op("/v1/health", "GET", parameters=(), responses=_responses((_json_success(200, "HealthResponse", "Readiness"),), errors=(500,)), public=True, principal_policy="public"),
-    _op("/v1/openapi.json", "GET", parameters=(), responses=_responses((_json_success(200, "OpenAPIDocument", "This contract"),), errors=(500,)), public=True, principal_policy="public"),
+    _op("/v1/health", "GET", parameters=(), responses=_responses((_json_success(200, "HealthResponse", "Readiness"),), errors=(400, 500)), public=True, principal_policy="public"),
+    _op("/v1/openapi.json", "GET", parameters=(), responses=_responses((_json_success(200, "OpenAPIDocument", "This contract"),), errors=(400, 500)), public=True, principal_policy="public"),
     _op("/v1/devices", "POST", request_model=DEVICE_REGISTER, request_required=True, parameters=_PRINCIPAL, responses=_responses((_json_success(201, "DeviceResponse", "Registered device"),), errors=(400, 401, 409, 413, 415, 500))),
     _op("/v1/devices/{device_id}/revoke", "POST", request_model=DEVICE_REVOKE, request_required=True, parameters=_protected(_path("device_id")), responses=_responses((_json_success(200, "DeviceResponse", "Revoked device"),))),
     _op("/v1/turns", "POST", request_model=TURN_CREATE, request_required=True, parameters=_PRINCIPAL, responses=_responses((_json_success(201, "TurnResponse", "Receiving turn"), _json_success(202, "TurnResponse", "Accepted text turn")), errors=(400, 401, 409, 413, 415, 500))),
@@ -315,7 +315,7 @@ _BASE_OPERATIONS: tuple[Operation, ...] = (
 
 
 _ALIAS_OPERATIONS: tuple[Operation, ...] = (
-    _op("/healthz", "GET", responses=_responses((_json_success(200, "HealthResponse", "Readiness"),), errors=(500,)), operation_id="HealthAlias", deprecated=True, public=True, principal_policy="public"),
+    _op("/healthz", "GET", responses=_responses((_json_success(200, "HealthResponse", "Readiness"),), errors=(400, 500)), operation_id="HealthAlias", deprecated=True, public=True, principal_policy="public"),
     _op("/v1/devices/register", "POST", request_model=DEVICE_REGISTER, request_required=True, parameters=_PRINCIPAL, responses=_responses((_json_success(201, "DeviceResponse", "Confirmed device"),), errors=(400, 401, 409, 413, 415, 500)), operation_id="DeviceConfirm"),
     _op("/v1/turns/{turn_id}/events/{event_id}", "POST", request_model=EVENT_ACK, request_required=True, parameters=_protected(_path("turn_id", format="uuid"), _path("event_id")), responses=_responses((_json_success(200, "EventAckResponse", "Event ACK"),)), operation_id="EventAckAlias"),
     _op("/v1/updates/{channel}/manifest.json", "GET", parameters=(_path("channel"), _header("If-None-Match")), responses=_responses((_json_success(200, "UpdateManifestResponse", "Current immutable channel manifest"), ResponseSpec(304, "ETag matched", None, None, ("ETag", "Cache-Control"), True)), errors=(400, 404, 500)), operation_id="UpdateManifestJson", deprecated=True, principal_policy="none"),
