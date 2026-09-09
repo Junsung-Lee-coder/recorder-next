@@ -263,9 +263,9 @@ _BASE_OPERATIONS: tuple[Operation, ...] = (
     _op("/v1/turns", "POST", request_model=TURN_CREATE, request_required=True, parameters=_PRINCIPAL, responses=_responses((_json_success(201, "TurnResponse", "Receiving turn"), _json_success(202, "TurnResponse", "Accepted text turn")), errors=(400, 401, 409, 413, 415, 500))),
     _op("/v1/turns/{turn_id}", "GET", parameters=_protected(_path("turn_id", format="uuid")), responses=_responses((_json_success(200, "TurnResponse", "Turn ledger"),))),
     _op("/v1/turns/{turn_id}/accept", "POST", request_model=OWNER_PROOF, request_required=True, parameters=_protected(_path("turn_id", format="uuid")), responses=_responses((_json_success(200, "TurnResponse", "Durable ACCEPTED"),))),
-    _op("/v1/turns/{turn_id}/parts/{part_id}/chunks/{sequence}", "PUT", request_media_types=_BINARY, request_required=True, parameters=_protected(_path("turn_id", format="uuid"), _path("part_id"), _path("sequence", schema_type="integer", minimum=0), _header("X-Chunk-SHA256", required=True)), responses=_responses((_json_success(200, "ChunkReceipt", "Chunk receipt"),))),
-    _op("/v1/turns/{turn_id}/parts/{part_id}/chunks/{sequence}", "POST", request_media_types=_BINARY, request_required=True, parameters=_protected(_path("turn_id", format="uuid"), _path("part_id"), _path("sequence", schema_type="integer", minimum=0), _header("X-Chunk-SHA256", required=True)), responses=_responses((_json_success(200, "ChunkReceipt", "Chunk receipt"),)), operation_id="ChunkUploadPost"),
-    _op("/v1/turns/{turn_id}/parts/{part_id}/missing", "GET", parameters=_protected(_path("turn_id", format="uuid"), _path("part_id"), _query("total_chunks", required=True, schema_type="integer", minimum=1), _query("offset", schema_type="integer", minimum=0), _query("limit", schema_type="integer", minimum=1), _query("encoding", enum=("list", "ranges"))), responses=_responses((_json_success(200, "MissingSequencePage", "Missing sequence list"),))),
+    _op("/v1/turns/{turn_id}/parts/{part_id}/chunks/{sequence}", "PUT", request_media_types=_BINARY, request_required=True, parameters=_protected(_path("turn_id", format="uuid"), _path("part_id"), _path("sequence", schema_type="integer", minimum=0), _header("X-Chunk-SHA256")), responses=_responses((_json_success(200, "ChunkReceipt", "Chunk receipt"),))),
+    _op("/v1/turns/{turn_id}/parts/{part_id}/chunks/{sequence}", "POST", request_media_types=_BINARY, request_required=True, parameters=_protected(_path("turn_id", format="uuid"), _path("part_id"), _path("sequence", schema_type="integer", minimum=0), _header("X-Chunk-SHA256")), responses=_responses((_json_success(200, "ChunkReceipt", "Chunk receipt"),)), operation_id="ChunkUploadPost"),
+    _op("/v1/turns/{turn_id}/parts/{part_id}/missing", "GET", parameters=_protected(_path("turn_id", format="uuid"), _path("part_id"), _query("total_chunks", schema_type="integer", minimum=1), _query("offset", schema_type="integer", minimum=0), _query("limit", schema_type="integer", minimum=1), _query("encoding", enum=("list", "ranges"))), responses=_responses((_json_success(200, "MissingSequencePage", "Missing sequence list"),))),
     _op("/v1/turns/{turn_id}/parts/{part_id}/finish", "POST", request_model=FINISH_PART, request_required=True, parameters=_protected(_path("turn_id", format="uuid"), _path("part_id")), responses=_responses((_json_success(200, "TurnPartResponse", "Verified part"),))),
     _op("/v1/turns/{turn_id}/events/{event_id}/ack", "POST", request_model=EVENT_ACK, request_required=True, parameters=_protected(_path("turn_id", format="uuid"), _path("event_id")), responses=_responses((_json_success(200, "EventAckResponse", "Event ACK"),))),
     _op("/v1/outbox", "GET", parameters=_protected(_query("limit", schema_type="integer", minimum=1)), responses=_responses((_json_success(200, "OutboxResponse", "Origin-device ordered outbox"),))),
@@ -280,12 +280,12 @@ _BASE_OPERATIONS: tuple[Operation, ...] = (
     _op("/v1/projects/{project_id}", "PATCH", request_model=PROJECT_PATCH, request_required=True, parameters=_protected(_path("project_id")), responses=_responses((_json_success(200, "ProjectResponse", "CAS update"),))),
     _op("/v1/turns/{turn_id}/archive", "POST", request_model=ARCHIVE_TURN, request_required=True, parameters=_protected(_path("turn_id", format="uuid")), responses=_responses((_json_success(200, "TurnResponse", "Archive-only turn retention"),))),
     _op("/v1/projects/{project_id}/archive", "POST", request_model=EXPECTED_VERSION, request_required=True, parameters=_protected(_path("project_id")), responses=_responses((_json_success(200, "ProjectResponse", "Archive-only transition"),))),
-    _op("/v1/internal/schedule_create", "POST", request_model=SCHEDULE_CREATE, request_required=True, parameters=_protected(_header("X-Recorder-Internal-Trusted")), responses=_responses((_json_success(201, "ScheduleResponse", "Durably scheduled with atomic confirmation FINAL"),), errors=(400, 401, 409, 413, 415, 500))),
+    _op("/v1/internal/schedule_create", "POST", request_model=SCHEDULE_CREATE, request_required=True, parameters=_protected(_header("X-Recorder-Internal-Trusted", required=True)), responses=_responses((_json_success(201, "ScheduleResponse", "Durably scheduled with atomic confirmation FINAL"),), errors=(400, 401, 409, 413, 415, 500))),
     _op("/v1/internal/scheduler/fire", "POST", request_model=SCHEDULER_FIRE, request_required=True, parameters=_protected(), responses=_responses((_json_success(200, "SchedulerFireResponse", "Scheduled FINAL readback"),), forbidden=True)),
     _op("/v1/internal/scheduler/recover", "POST", request_model=SCHEDULER_RECOVER, request_required=True, parameters=_protected(), responses=_responses((_json_success(200, "SchedulerRecoveryResponse", "Recovery counts"),), forbidden=True)),
     _op("/v1/schedules/{schedule_id}", "GET", parameters=_protected(_path("schedule_id")), responses=_responses((_json_success(200, "ScheduleResponse", "Schedule and occurrence readback"),))),
     _op("/v1/updates/{channel}/manifest", "GET", parameters=(_path("channel"), _header("If-None-Match")), responses=_responses((_json_success(200, "UpdateManifestResponse", "Current immutable channel manifest"), ResponseSpec(304, "ETag matched", None, None, ("ETag", "Cache-Control"), True)), errors=(400, 404, 500)), principal_policy="none"),
-    _op("/v1/updates/{channel}/{generation}/{artifact_name}", "GET", parameters=(_path("channel"), _path("generation", schema_type="integer", minimum=1), _path("artifact_name"), _header("Range"), _header("If-Range"), _header("If-None-Match")), responses=_responses((ResponseSpec(200, "Hash-bound APK bytes", "BinaryBody", "application/vnd.android.package-archive", ("Content-Type", "Content-Length", "ETag", "Accept-Ranges", "Cache-Control")), ResponseSpec(206, "Byte range", "BinaryBody", "application/vnd.android.package-archive", ("Content-Type", "Content-Length", "ETag", "Accept-Ranges", "Content-Range", "Cache-Control")), ResponseSpec(304, "ETag matched", None, None, ("ETag", "Content-Length", "Cache-Control"), True), ResponseSpec(416, "Unsatisfiable range", None, None, ("ETag", "Content-Length", "Accept-Ranges", "Content-Range", "Cache-Control"), True)), errors=(400, 404, 500)), principal_policy="none"),
+    _op("/v1/updates/{channel}/{generation}/{artifact_name}", "GET", parameters=(_path("channel"), _path("generation", schema_type="integer", minimum=1), _path("artifact_name"), _header("Range"), _header("If-Range"), _header("If-None-Match")), responses=_responses((ResponseSpec(200, "Hash-bound APK bytes", "BinaryBody", "application/vnd.android.package-archive", ("Content-Type", "Content-Length", "ETag", "Accept-Ranges", "Cache-Control")), ResponseSpec(206, "Byte range", "BinaryBody", "application/vnd.android.package-archive", ("Content-Type", "Content-Length", "ETag", "Accept-Ranges", "Cache-Control", "Content-Range")), ResponseSpec(304, "ETag matched", None, None, ("Content-Type", "Content-Length", "ETag", "Accept-Ranges", "Cache-Control"), True), ResponseSpec(416, "Unsatisfiable range", None, None, ("Content-Type", "Content-Length", "ETag", "Accept-Ranges", "Content-Range", "Cache-Control"), True)), errors=(400, 404, 409, 500)), principal_policy="none"),
     _op("/v1/history", "GET", parameters=_protected(_query("project_id"), _query("include_archived", schema_type="boolean"), _query("input_type"), _query("cursor"), _query("since_seq", schema_type="integer", minimum=0), _query("limit", schema_type="integer", minimum=1)), responses=_responses((_json_success(200, "HistoryResponse", "Paired user/assistant messages"),))),
     _op("/v1/eavesdrop", "POST", request_model=EAVESDROP_START, request_required=True, parameters=_PRINCIPAL, responses=_responses((_json_success(201, "EavesdropSessionResponse", "Created session"),), errors=(400, 401, 409, 413, 415, 500))),
     _op("/v1/eavesdrop/{session_id}", "GET", parameters=_protected(_path("session_id"), phone=True), responses=_responses((_json_success(200, "EavesdropSessionResponse", "Session state"),))),
@@ -332,12 +332,7 @@ def _template_regex(template: str) -> re.Pattern[str]:
 def _head_operation(operation: Operation) -> Operation:
     if operation.method != "GET":
         return operation
-    success = tuple(
-        ResponseSpec(item.status, item.description, None if item.no_body else item.schema_name, None if item.no_body else item.media_type, item.headers, True)
-        for item in operation.responses
-        if item.status < 400
-    )
-    errors = tuple(item for item in operation.responses if item.status >= 400)
+    responses = tuple(ResponseSpec(item.status, item.description, None, None, item.headers, True) for item in operation.responses)
     return Operation(
         operation.path_template,
         "HEAD",
@@ -350,7 +345,7 @@ def _head_operation(operation: Operation) -> Operation:
         operation.deprecated,
         operation.public,
         operation.principal_policy,
-        success + errors,
+        responses,
     )
 
 
@@ -396,6 +391,8 @@ def _path_values(operation: Operation, path: str) -> dict[str, str]:
 
 
 def _validate_parameter(parameter: Parameter, value: str, *, path: str) -> None:
+    if not isinstance(value, str):
+        raise ValidationError(f"{path} must be a string")
     if parameter.schema_type == "integer":
         if not re.fullmatch(r"[0-9]+", value):
             raise ValidationError(f"{path} must be a non-negative integer")
@@ -437,10 +434,6 @@ def validate_request(
     for parameter in parameters_by_location["query"].values():
         value = query.get(parameter.name)
         if value is None:
-            # Domain handlers perform owner/authentication before consuming
-            # required query values.  Keeping that ordering preserves a
-            # precise 401 for an unregistered owner instead of leaking a
-            # pre-authentication 400 for a missing filter.
             continue
         if parameter.internal and network:
             raise ValidationError("server time cannot be supplied by a client")
@@ -449,6 +442,8 @@ def validate_request(
         values_for_header = [value for key, value in headers.items() if str(key).lower() == parameter.name.lower()]
         if len(values_for_header) > 1:
             raise ValidationError(f"duplicate {parameter.name} headers are not permitted")
+        if parameter.required and not values_for_header and network:
+            raise ValidationError(f"header {parameter.name} is required")
 
     if operation.method == "HEAD":
         if body:
@@ -829,6 +824,10 @@ def _validate_schema_value(schema: Mapping[str, Any], value: Any, *, path: str, 
         if schema.get("nullable"):
             return
         raise ValueError(f"{path} must not be null")
+    if schema.get("format") == "binary":
+        if not isinstance(value, bytes):
+            raise ValueError(f"{path} must be binary bytes")
+        return
     alternatives = schema.get("oneOf")
     if isinstance(alternatives, list):
         errors: list[str] = []

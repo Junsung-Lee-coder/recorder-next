@@ -1445,7 +1445,11 @@ class RecorderService:
             validate_response(operation, result[0], result[1], result[2])
             return result
         except RecorderError as exc:
-            return exc.status, {"Content-Type": "application/json"}, {"error": {"code": exc.code, "message": exc.message}}
+            payload = {"error": {"code": exc.code, "message": exc.message}}
+            if method.upper() == "HEAD":
+                encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+                return exc.status, {"Content-Type": "application/json", "Content-Length": str(len(encoded))}, b""
+            return exc.status, {"Content-Type": "application/json"}, payload
         except (ValueError, KeyError, json.JSONDecodeError) as exc:
             del exc
             return 400, {"Content-Type": "application/json"}, {"error": {"code": "INVALID_REQUEST", "message": "request is invalid"}}
@@ -1627,6 +1631,7 @@ class RecorderService:
         peer_addr: tuple[str, int] | None = None,
     ) -> tuple[int, dict[str, str], Any]:
         requested_method = method.upper()
+        method = requested_method
         if method == "HEAD":
             method = "GET"
         parsed = urlsplit(target)
@@ -1654,7 +1659,7 @@ class RecorderService:
                 decoded_payload = self._json_body(body)
             return decoded_payload
 
-        if peer_addr is not None and path not in {"/healthz", "/v1/health", "/v1/openapi.json"} and not path.startswith("/v1/updates/"):
+        if peer_addr is not None and operation.requires_principal:
             raw_chunk = len(segments) == 7 and segments[:2] == ["v1", "turns"] and segments[3] == "parts" and segments[5] == "chunks"
             decoded_payload = self._verify_network_principal(query, headers, body, path=path, raw_chunk=raw_chunk)
             if "now" in query:
@@ -1949,7 +1954,15 @@ class RecorderService:
                 if not segments[6].isdigit():
                     raise ValidationError("chunk sequence must be a non-negative integer")
                 sequence = int(segments[6])
-                result = self.store.put_chunk(turn_id, part_id, sequence, body, expected_sha256=self._header_value(headers, "X-Chunk-SHA256"), user_id=user_id, device_id=device_id)
+                result = self.store.put_chunk(
+                    turn_id,
+                    part_id,
+                    sequence,
+                    body,
+                    expected_sha256=self._header_value(headers, "X-Chunk-SHA256"),
+                    user_id=user_id,
+                    device_id=device_id,
+                )
                 return 200, {}, result
             if len(segments) == 6 and segments[5] == "finish" and method == "POST":
                 user_id, device_id = self._authenticated_owner(query, headers)

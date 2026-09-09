@@ -7,9 +7,9 @@ import unittest
 import uuid
 from pathlib import Path
 
-from recorder_next.http_contract import match_operation, project_response, route_catalog, validate_response
+from recorder_next.http_contract import match_operation, project_response, route_catalog, validate_request, validate_response
 from recorder_next.openapi import OPENAPI, validate_openapi_contract
-from recorder_next.errors import NotFoundError
+from recorder_next.errors import NotFoundError, ValidationError
 from recorder_next.service import RecorderService
 from recorder_next.store import RecorderStore
 
@@ -81,6 +81,74 @@ class R25HttpContractTests(unittest.TestCase):
         self.assertIn("ETag", update["get"]["responses"]["206"]["headers"])
         self.assertIn("Content-Range", update["get"]["responses"]["206"]["headers"])
         self.assertIn("Accept-Ranges", update["head"]["responses"]["200"]["headers"])
+        for status, response in update["head"]["responses"].items():
+            self.assertNotIn("content", response, status)
+            self.assertTrue(response.get("x-no-body"), status)
+
+    def test_binary_update_responses_and_head_errors_follow_the_runtime_contract(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            artifact = root / "candidate.apk"
+            artifact.write_bytes(b"0123456789")
+            store = RecorderStore(root / "db.sqlite3", storage_root=root / "data")
+            store.publish_update_manifest(
+                channel="test",
+                generation=1,
+                platform="phone",
+                version="1.2.3",
+                version_code=12,
+                artifact_name="recorder-phone.apk",
+                artifact_path=artifact,
+                signer_digest="a" * 64,
+                changelog="feature",
+                min_server_version="1.0.0",
+                authorization_policy="test-only",
+            )
+            service = RecorderService(store)
+
+            status, headers, payload = service.handle_http("GET", "/v1/updates/test/1/recorder-phone.apk", {}, b"")
+            self.assertEqual((status, headers["Content-Type"], payload), (200, "application/vnd.android.package-archive", b"0123456789"))
+            status, headers, payload = service.handle_http("GET", "/v1/updates/test/1/recorder-phone.apk", {"Range": "bytes=2-5"}, b"")
+            self.assertEqual((status, headers["Content-Range"], payload), (206, "bytes 2-5/10", b"2345"))
+            status, headers, payload = service.handle_http("GET", "/v1/updates/test/1/recorder-phone.apk", {"If-None-Match": "*"}, b"")
+            self.assertEqual((status, headers["Content-Length"], payload), (304, "0", b""))
+            status, headers, payload = service.handle_http("GET", "/v1/updates/test/1/recorder-phone.apk", {"Range": "bytes=99-100"}, b"")
+            self.assertEqual((status, headers["Content-Range"], payload), (416, "bytes */10", b""))
+            status, headers, payload = service.handle_http("HEAD", "/v1/updates/test/1/recorder-phone.apk", {}, b"")
+            self.assertEqual((status, headers["Content-Length"], payload), (200, "10", b""))
+            status, _headers, payload = service.handle_http("HEAD", "/v1/updates/test/1/missing.apk", {}, b"")
+            self.assertEqual((status, payload), (404, b""))
+
+    def test_required_catalog_parameters_are_rejected_before_network_handlers(self):
+        operation = match_operation("/v1/internal/schedule_create", "POST")
+        headers = {
+            "X-Recorder-Principal-User": "user-1",
+            "X-Recorder-Principal-Device": "phone-1",
+            "X-Recorder-Principal-Signature": "proof",
+            "Content-Type": "application/json",
+        }
+        with self.assertRaises(ValidationError):
+            validate_request(
+                operation,
+                path="/v1/internal/schedule_create",
+                query={},
+                headers=headers,
+                body=json.dumps(
+                    {
+                        "schedule_id": "schedule-1",
+                        "parent_turn_id": "turn-1",
+                        "project_id": "project-1",
+                        "session_key": "session-1",
+                        "origin_device_id": "phone-1",
+                        "delivery_target_device_id": "phone-1",
+                        "fire_at_utc": "2026-08-25T00:00:00Z",
+                        "timezone_offset": "+09:00",
+                        "reminder_text": "reminder",
+                        "confirmation_text": "confirmed",
+                    }
+                ).encode(),
+                network=True,
+            )
 
     def test_openapi_is_executable_and_static_projection_matches(self):
         validate_openapi_contract()
