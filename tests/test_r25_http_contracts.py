@@ -1,11 +1,13 @@
+import copy
 import hashlib
 import hmac
 import json
 import tempfile
 import unittest
+import uuid
 from pathlib import Path
 
-from recorder_next.http_contract import match_operation
+from recorder_next.http_contract import match_operation, project_response, route_catalog, validate_response
 from recorder_next.openapi import OPENAPI, validate_openapi_contract
 from recorder_next.errors import NotFoundError
 from recorder_next.service import RecorderService
@@ -13,6 +15,73 @@ from recorder_next.store import RecorderStore
 
 
 class R25HttpContractTests(unittest.TestCase):
+    def test_catalog_is_authoritative_and_checked_in_coverage_is_generated(self):
+        source = Path(__file__).parents[1].joinpath("recorder_next/http_contract.py").read_text()
+        self.assertNotIn("from .openapi import", source)
+        catalog = route_catalog()
+        self.assertGreaterEqual(len(catalog), 59)
+        self.assertEqual(len({(item.method, item.path_template) for item in catalog}), len(catalog))
+        self.assertNotIn("ApiResponse", json.dumps(OPENAPI, sort_keys=True))
+        coverage_path = Path(__file__).parents[1].joinpath("api/operation-coverage.json")
+        coverage = json.loads(coverage_path.read_text())
+        self.assertEqual(
+            [(item["method"], item["path"]) for item in coverage["operations"]],
+            [(item.method, item.path_template) for item in catalog],
+        )
+
+    def test_openapi_validation_is_mutation_sensitive_to_routes_and_responses(self):
+        missing_route = copy.deepcopy(OPENAPI)
+        del missing_route["paths"]["/v1/turns"]
+        with self.assertRaises(ValueError):
+            validate_openapi_contract(missing_route)
+
+        changed_response = copy.deepcopy(OPENAPI)
+        changed_response["paths"]["/v1/turns"]["post"]["responses"]["201"]["content"] = {
+            "application/octet-stream": {"schema": {"type": "string", "format": "binary"}}
+        }
+        with self.assertRaises(ValueError):
+            validate_openapi_contract(changed_response)
+
+    def test_signed_request_rejects_undeclared_fields_before_eavesdrop_mutation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = RecorderStore(root / "db.sqlite3", storage_root=root / "data")
+            store.register_device("contract-user", "contract-phone", "phone")
+            service = RecorderService(store, ingress_secret="test-secret")
+            headers = self._principal_headers("contract-user", "contract-phone", "test-secret")
+            payload = {
+                "user_id": "contract-user",
+                "phone_device_id": "contract-phone",
+                "unexpected": "must-not-reach-store",
+            }
+            before = store.db_snapshot()
+            status, _headers, response = service.handle_http(
+                "POST",
+                "/v1/eavesdrop",
+                headers,
+                json.dumps(payload).encode(),
+                peer_addr=("127.0.0.1", 1),
+            )
+            self.assertEqual(status, 400, response)
+            self.assertEqual(response["error"]["code"], "VALIDATION_ERROR")
+            self.assertEqual(store.db_snapshot(), before)
+
+    def test_update_binary_and_head_response_contracts_are_exact(self):
+        update = OPENAPI["paths"]["/v1/updates/{channel}/{generation}/{artifact_name}"]
+        self.assertEqual(
+            set(update["get"]["responses"]["200"]["content"]),
+            {"application/vnd.android.package-archive"},
+        )
+        self.assertEqual(
+            set(update["get"]["responses"]["206"]["content"]),
+            {"application/vnd.android.package-archive"},
+        )
+        self.assertNotIn("content", update["get"]["responses"]["304"])
+        self.assertNotIn("content", update["head"]["responses"]["200"])
+        self.assertIn("ETag", update["get"]["responses"]["206"]["headers"])
+        self.assertIn("Content-Range", update["get"]["responses"]["206"]["headers"])
+        self.assertIn("Accept-Ranges", update["head"]["responses"]["200"]["headers"])
+
     def test_openapi_is_executable_and_static_projection_matches(self):
         validate_openapi_contract()
         checked_in = json.loads(Path(__file__).parents[1].joinpath("api/openapi.json").read_text())
@@ -25,7 +94,10 @@ class R25HttpContractTests(unittest.TestCase):
                 operation_ids.append(operation["operationId"])
                 for status, response in operation["responses"].items():
                     if status not in {"204", "304"}:
-                        self.assertIn("content", response, (path, method, status))
+                        self.assertTrue(
+                            "content" in response or response.get("x-no-body") is True,
+                            (path, method, status),
+                        )
         self.assertEqual(len(operation_ids), len(set(operation_ids)))
         self.assertNotIn("/v1/eavesdrop/{session_id}/{action}", OPENAPI["paths"])
         self.assertEqual(
@@ -39,7 +111,7 @@ class R25HttpContractTests(unittest.TestCase):
 
     def test_route_catalog_rejects_prefix_suffixes_and_generic_actions(self):
         self.assertEqual(match_operation("/v1/history", "GET").method, "GET")
-        self.assertEqual(match_operation("/v1/history", "HEAD").method, "GET")
+        self.assertEqual(match_operation("/v1/history", "HEAD").method, "HEAD")
         self.assertEqual(match_operation("/v1/updates/beta/manifest.json", "GET").deprecated, True)
         for path in (
             "/v1/history/extra",
@@ -49,6 +121,24 @@ class R25HttpContractTests(unittest.TestCase):
         ):
             with self.subTest(path=path), self.assertRaises(NotFoundError):
                 match_operation(path, "GET" if path.endswith("extra") else "POST")
+
+    def test_response_dtos_reject_extra_fields_and_projection_hides_storage_paths(self):
+        operation = match_operation("/v1/turns/turn-1", "GET")
+        with self.assertRaises(ValueError):
+            validate_response(operation, 200, {}, {"unexpected": True})
+        with self.assertRaises(ValueError):
+            validate_response(operation, 200, {}, {"parts": [{"unexpected": True}]})
+        projected = project_response(
+            operation,
+            200,
+            {"turn_id": "turn-1", "parts": [{"part_id": "part-1", "source_path": "/private/file", "source_available": False}]},
+        )
+        self.assertNotIn("source_path", json.dumps(projected))
+
+    def test_body_sequence_route_alias_is_catalogued(self):
+        operation = match_operation("/v1/eavesdrop/session-1/segments/route", "POST")
+        self.assertTrue(operation.deprecated)
+        self.assertEqual(operation.request_model.name, "EavesdropRoute")
 
     def test_unknown_routes_are_non_mutating_http_404s(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -101,6 +191,47 @@ class R25HttpContractTests(unittest.TestCase):
             )
             self.assertEqual(status, 200)
             self.assertEqual(set(payload), {"requeued", "failed"})
+
+    def test_worker_claim_and_mutation_bodies_match_catalogued_dtos(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = RecorderStore(root / "db.sqlite3", storage_root=root / "data")
+            store.register_device("worker-user", "worker-device", "other")
+            store.enqueue_worker_job(
+                kind="contract-test",
+                stage="route",
+                payload={"turn_id": "turn-1"},
+                idempotency_key="contract-worker-job",
+            )
+            service = RecorderService(
+                store,
+                ingress_secret="test-secret",
+                internal_worker_principals=(("worker-user", "worker-device"),),
+            )
+            headers = self._principal_headers("worker-user", "worker-device", "test-secret")
+            status, _headers, payload = service.handle_http(
+                "POST", "/v1/internal/worker/claim", headers, b"{}", peer_addr=("127.0.0.1", 1)
+            )
+            self.assertEqual(status, 200)
+            self.assertEqual(set(payload), {"job"})
+            job = payload["job"]
+            self.assertEqual(job["status"], "CLAIMED")
+            completion = {
+                "job_id": job["job_id"],
+                "owner": "worker-1",
+                "lease_token": job["lease_token"],
+                "receipt": {"effect_id": str(uuid.uuid4()), "status": "succeeded"},
+            }
+            status, _headers, payload = service.handle_http(
+                "POST",
+                "/v1/internal/worker/complete",
+                headers,
+                json.dumps(completion).encode("utf-8"),
+                peer_addr=("127.0.0.1", 1),
+            )
+            self.assertEqual(status, 200)
+            self.assertEqual(payload["status"], "SUCCEEDED")
+            self.assertEqual(payload["effect_receipt"]["status"], "succeeded")
 
     def test_network_now_and_duplicate_json_keys_are_rejected_before_handlers(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -44,7 +44,7 @@ from .config import RecorderConfig
 from .errors import ForbiddenError, GatewayRequestTooLargeError, LeaseConflict, NotFoundError, RecorderError, UnauthorizedError, UnsupportedMediaType, ValidationError
 from .features import DurableWorker
 from .hermes_wire import GatewayRequestTooLarge, SubmissionContext, WirePolicy, estimate_run_body_upper_bound, serialize_json
-from .http_contract import match_operation
+from .http_contract import match_operation, project_response, validate_request, validate_response
 from .ingress_contract import strict_json_loads
 from .media import MediaValidationError, validate_wav
 from .models import AsrResult, HermesResult, RouterDecision, TTSResult
@@ -1420,7 +1420,30 @@ class RecorderService:
         peer_addr: tuple[str, int] | None = None,
     ) -> tuple[int, dict[str, str], Any]:
         try:
-            return self._handle_http(method, target, headers, body, peer_addr=peer_addr)
+            result = self._handle_http(method, target, headers, body, peer_addr=peer_addr)
+            path = urlsplit(target).path.rstrip("/") or "/"
+            response_status, response_headers, response_payload = result
+            if method.upper() == "HEAD":
+                response_headers = dict(response_headers)
+                encoded = response_payload if isinstance(response_payload, bytes) else json.dumps(
+                    response_payload,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+                if not any(key.lower() == "content-type" for key in response_headers):
+                    response_headers["Content-Type"] = (
+                        "application/octet-stream" if isinstance(response_payload, bytes) else "application/json; charset=utf-8"
+                    )
+                if not any(key.lower() == "content-length" for key in response_headers):
+                    response_headers["Content-Length"] = str(len(encoded))
+                response_payload = b""
+                result = response_status, response_headers, response_payload
+            operation = match_operation(path, method)
+            projected_payload = project_response(operation, result[0], result[2])
+            result = result[0], result[1], projected_payload
+            validate_response(operation, result[0], result[1], result[2])
+            return result
         except RecorderError as exc:
             return exc.status, {"Content-Type": "application/json"}, {"error": {"code": exc.code, "message": exc.message}}
         except (ValueError, KeyError, json.JSONDecodeError) as exc:
@@ -1616,7 +1639,7 @@ class RecorderService:
             raise ValidationError("duplicate query parameters are not permitted")
         query = dict(query_pairs)
         segments = [unquote(item) for item in path.split("/") if item]
-        match_operation(path, requested_method)
+        operation = match_operation(path, requested_method)
         if method == "GET" and path in {"/healthz", "/v1/health"}:
             return 200, {}, {"status": "ok", "product_identity": "recorder-next-server-product-items-1-through-8", "api_version": "v1", "worker": self.store.worker_health()}
         if method == "GET" and path == "/v1/openapi.json":
@@ -1636,6 +1659,15 @@ class RecorderService:
             decoded_payload = self._verify_network_principal(query, headers, body, path=path, raw_chunk=raw_chunk)
             if "now" in query:
                 raise ValidationError("server time cannot be supplied by a client")
+        decoded_payload = validate_request(
+            operation,
+            path=path,
+            query=query,
+            headers=headers,
+            body=body,
+            decoded=decoded_payload,
+            network=peer_addr is not None,
+        )
         if segments[:3] == ["v1", "internal", "worker"] and len(segments) == 4 and method == "POST":
             if peer_addr is not None:
                 self._assert_worker_principal(headers)
@@ -1648,7 +1680,7 @@ class RecorderService:
                 owner = self._json_string(payload, "owner") if "owner" in payload else "worker-1"
                 lease_seconds = self._json_integer(payload, "lease_seconds") if "lease_seconds" in payload else 30
                 assert lease_seconds is not None
-                return 200, {}, self.store.claim_worker_job(owner, lease_seconds=lease_seconds) or {"job": None}
+                return 200, {}, {"job": self.store.claim_worker_job(owner, lease_seconds=lease_seconds)}
             if action == "recover":
                 WORKER_RECOVER.validate(payload)
                 if payload:
@@ -1690,7 +1722,7 @@ class RecorderService:
                 owner = self._json_string(payload, "owner") if "owner" in payload else "worker-1"
                 lease_seconds = self._json_integer(payload, "lease_seconds") if "lease_seconds" in payload else 30
                 assert lease_seconds is not None
-                return 200, {}, self.run_background_worker_once(owner=owner, lease_seconds=lease_seconds) or {"job": None}
+                return 200, {}, {"job": self.run_background_worker_once(owner=owner, lease_seconds=lease_seconds)}
         if segments[:2] == ["v1", "updates"] and len(segments) == 4 and segments[3] in {"manifest", "manifest.json"} and method == "GET":
             manifest = self.store.get_update_manifest(segments[2])
             if_none_match = self._header_value(headers, "If-None-Match")

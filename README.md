@@ -1,52 +1,34 @@
-# Recorder Next v1 standalone server
+# Recorder Next
 
-Recorder Next is a server-only, SQLite-authoritative adapter between Phone/Watch turn uploads and project-scoped Hermes sessions. It is deliberately independent of the legacy Recorder compatibility service, Hermes core/Gateway source, and Android/Wear code.
+Recorder Next is a standalone Python server for Phone and Watch turn uploads.
+It uses SQLite as the source of truth and exposes a versioned HTTP API for
+turns, projects, event delivery, audio replies, diagnostics, scheduling, and
+immutable Phone/Wear update files. It does not replace the legacy Recorder
+compatibility service or Hermes Gateway.
 
-## Candidate scope
+## Requirements
 
-- versioned loopback HTTP API under `/v1`
-- durable `ACCEPTED`, `ROUTED`, and `FINAL` event ledger
-- immutable turn fingerprint and `(turn_id, part_id, sequence)` chunk receipts
-- resumable chunk storage with whole-part SHA-256 verification
-- ordered per-user Router queue with persistent lease/CAS takeover
-- project registry and `project:<stable_project_id>:default` session seam
-- transactional route receipt + ROUTED outbox + Hermes session ingress
-- Hermes adapter with message-history fallback, bounded late-result grace, and
-  optional startup-resolved Bearer authentication
-- normalized/hash-bound Hermes result references and append-only FINAL versions
-- ASR realtime → batch → local generation arbitration seam
-- origin-device-only text/event/playback ACKs; Watch relay is not playback completion
-- TTS artifact spool lifecycle independent from text FINAL terminal state
-- restart-safe autonomous worker jobs with leases, retry/deadline recovery,
-  frozen provider-chain generations, and effect receipts
-- named Hermes/Nemotron/Whisper/Edge ASR/TTS provider registries with explicit
-  fallback order, health/capability metadata, media limits, and scoped overrides
-- immutable Phone/Wear update manifests with monotonic generations, CAS
-  publication, SHA-256/ETag range serving, and APK identity metadata
-- project-scoped cursor history read model with path-free attachment summaries
-- hash-bound resolver delivery of completed text/image/canonical-WAV inputs into
-  Hermes; PDF, CSV, generic binary, and document delivery are unsupported and
-  rejected before durable acceptance; incomplete or changed bytes fail closed
-- Phone-mediated Watch eavesdrop state machine with a separate routing decision
-  agent, `FORWARD_DEFAULT`/`STORE_SILENT` outcomes, and no project auto-switch
-- opt-in diagnostics with consent revocation, bounded compressed bundles,
-  server-side redaction before storage, retention purge, export, and tombstones
-- archive-only project/turn retention operations
-- clean-install schema, config example, service template, OpenAPI JSON, and deterministic fixtures
-- generated multimodal acceptance fixtures under `fixtures/generated/`: offline espeak-ng Korean/English speech, PNG, PDF, UTF-8 text, CSV, and generic binary; each file is hash-bound by `fixtures/generated/manifest.json`
+- Python 3.11 or newer
+- SQLite supplied by Python's standard library
+- No runtime third-party dependencies
 
-The default candidate uses only Python 3.11+ standard-library modules. Real ASR/TTS/Hermes adapters are injected at the seam. The generated acceptance fixture set contains synthetic speech and files only; no user content is included. Supported ingress kinds are text (`text/plain`), image (`image/*`), and canonical PCM16 mono 16 kHz WAV (`audio/wav` or `audio/x-wav`); `documents=false`. Mixed turns are intentionally outside the current Phone/Watch-supported scope.
+The optional provider adapters use configured HTTP endpoints. The test suite
+uses local fakes and temporary databases; it does not require credentials,
+devices, emulators, or a running service.
 
-## Run a local smoke server
+## Run locally
 
 ```text
-python3 -m recorder_next --db /tmp/recorder-next.sqlite3 \\
+python3 -m recorder_next --db /tmp/recorder-next.sqlite3 \
   --storage-root /tmp/recorder-next-data --host 127.0.0.1 --port 8643
 ```
 
-The protected legacy port `5000` is rejected by `create_http_server`. The service template is an artifact only; this candidate does not install, enable, start, stop, or restart any live service.
+Port 5000 is reserved for the legacy compatibility service and is rejected by
+`create_http_server`. The systemd unit in `systemd/recorder-next.service` is a
+deployment template; inspect and adapt its paths and credential source before
+installing it.
 
-## Test and static checks
+## Check the source
 
 ```text
 python3 -m unittest discover -s tests -v
@@ -54,70 +36,111 @@ python3 -m compileall -q recorder_next tests
 python3 -m recorder_next --help
 ```
 
-To regenerate the generated fixture set, provide a local espeak-ng and ffmpeg:
+The optional multimodal fixture generator needs local `espeak-ng` and
+`ffmpeg` binaries:
 
 ```text
-python3 fixtures/generate_multimodal_fixtures.py \\
-  --output-root fixtures/generated \\
-  --espeak /path/to/espeak-ng \\
-  --ffmpeg /usr/bin/ffmpeg \\
+python3 fixtures/generate_multimodal_fixtures.py \
+  --output-root fixtures/generated \
+  --espeak /path/to/espeak-ng \
+  --ffmpeg /usr/bin/ffmpeg \
   --espeak-data /path/to/espeak-ng-data-parent
 ```
 
-The generator uses fixed prompts, fixed voice parameters, deterministic mode, and metadata-stripped 16 kHz mono PCM16 WAV output. The acceptance fixtures cover the admitted text, image, and canonical WAV profiles; PDF, CSV, generic binary, and mixed multipart inputs are explicit rejection cases.
+Supported turn inputs are UTF-8 text (`text/plain`), images (`image/*`), and
+canonical PCM16 mono 16 kHz WAV (`audio/wav` or `audio/x-wav`). Document,
+CSV, and generic binary inputs are rejected. Mixed multipart input is outside
+the Phone/Watch API scope. The generated fixture manifest records the hashes
+of the synthetic files used by the tests.
 
-The tests use temporary SQLite databases, temporary spool roots, generated fixture bytes, and ephemeral loopback ports. No credentials, devices, AVDs/APKs, legacy databases, or live services are touched.
+## HTTP API
 
-## API
+The machine-readable contract is `api/openapi.json` and is served at
+`GET /v1/openapi.json`. The same operation catalog defines request fields,
+response status and media types, authentication parameters, range handling,
+and the closed JSON error envelope.
 
-The machine-readable contract is `api/openapi.json` and is also served at `GET /v1/openapi.json`. The minimal flow is:
+The main turn flow is:
 
-1. `POST /v1/turns` with a manifest, or with a safe text fixture payload.
-2. `PUT /v1/turns/{turn_id}/parts/{part_id}/chunks/{sequence}` for ordered bytes.
-3. `POST /v1/turns/{turn_id}/parts/{part_id}/finish` with totals and whole hash.
-4. `POST /v1/turns/{turn_id}/accept` after all parts verify.
-5. Origin-device outbox polling uses `GET /v1/outbox?device_id=...`.
-6. Exact event ACK uses `POST /v1/turns/{turn_id}/events/{event_id}/ack`.
-7. Target TTS playback completion uses `POST /v1/tts/{artifact_id}/playback-ack`; its JSON body must include the target `device_id`, non-empty exact `payload_sha256`, exact `turn_id`, and positive `artifact_version`. A relay receipt cannot complete playback.
-8. An active registered Phone can bridge-read Watch-targeted audio with `GET /v1/tts/{artifact_id}/bridge-read?device_id=...`; bridge reads never authorize playback completion or spool deletion.
-9. `GET /v1/updates/{channel}/manifest` and `GET /v1/updates/{channel}/{generation}/{artifact_name}` serve immutable, hash-verified Phone/Wear APK candidates with `Range`, `If-Range`, and `If-None-Match` support.
-10. `GET /v1/history?user_id=...&project_id=...&cursor=...` returns the path-free project read model with filter-bound keyset cursors.
-11. Phone-owned eavesdrop controls use `POST /v1/eavesdrop`, `POST /v1/eavesdrop/{id}/activate|pause|resume|stop`, `POST /v1/eavesdrop/{id}/segments`, and `POST /v1/eavesdrop/{id}/segments/{sequence}/route`; readback requires the registered Phone owner tuple.
-12. Opt-in diagnostics use `POST /v1/diagnostics/opt-in`, `POST /v1/diagnostics/events`, `POST /v1/diagnostics/bundles`, `GET /v1/diagnostics`, `GET /v1/diagnostics/export`, and `DELETE /v1/diagnostics`.
-13. Router, Hermes, scheduler, and durable worker execution are in-process lifecycle components. The exact allowlisted `/v1/internal/worker/{claim,recover,complete,fail,run}` controls are available only to a verified active worker principal; worker health is read-only and background workers are also started by the service entry point.
+1. `POST /v1/turns` creates a manifest or accepts a text turn.
+2. `PUT` or `POST /v1/turns/{turn_id}/parts/{part_id}/chunks/{sequence}`
+   uploads ordered bytes.
+3. `POST /v1/turns/{turn_id}/parts/{part_id}/finish` verifies totals and the
+   whole-part hash.
+4. `POST /v1/turns/{turn_id}/accept` records durable receipt.
+5. `GET /v1/outbox?device_id=...` reads origin-device delivery events.
+6. `POST /v1/turns/{turn_id}/events/{event_id}/ack` acknowledges an exact event.
 
-Network requests other than health, OpenAPI, and immutable update reads require a verified principal. Configure the deployment-only `RECORDER_INGRESS_SECRET`; the trusted ingress signs `X-Recorder-Principal-User` plus `X-Recorder-Principal-Device` with HMAC-SHA256 and sends the signature in `X-Recorder-Principal-Signature`. The principal identity must match all user/device fields in the query or JSON body. Direct in-process calls are not a network authorization boundary.
+Other API areas include:
 
-The event, bridge-read, eavesdrop read, diagnostics, and artifact handlers also enforce registered active device identity; playback completion remains bound to the frozen delivery target and exact artifact receipt.
+- `GET /v1/history` for a project-scoped, path-free history read model.
+- `GET /v1/tts/{artifact_id}` for target audio and
+  `GET /v1/tts/{artifact_id}/bridge-read` for an authenticated Phone bridge.
+- `POST /v1/tts/{artifact_id}/playback-ack` for target playback completion;
+  a relay receipt cannot complete playback.
+- `GET /v1/updates/{channel}/manifest` and the corresponding artifact route
+  for hash-verified Phone/Wear files with `Range`, `If-Range`, `ETag`, and
+  `If-None-Match` support. `HEAD` returns the same metadata without a body.
+- Phone-owned eavesdrop controls and routing-decision readback under
+  `/v1/eavesdrop`.
+- Opt-in diagnostic events, bounded bundle storage, export, and deletion under
+  `/v1/diagnostics`.
+- Project registry, scheduled FINAL creation, and bounded worker controls.
 
-When the configured Hermes provider is enabled, `hermes_api_key_file` must name
-one owner-only credential file containing exactly one ASCII
-`API_SERVER_KEY=<value>` entry. The adapter reads it once during startup and
-sends an in-memory `Authorization: Bearer example-token` header and the preferred
-`X-Hermes-Session-Token` header; the value is never logged or persisted. The
-systemd template uses
-`LoadCredential=recorder_api_key:...` and
-`$CREDENTIALS_DIRECTORY/recorder_api_key`. Rotate the source only with a
-Recorder Next restart; do not restart Hermes Gateway.
+Health, OpenAPI, and immutable update reads are public. Other network
+operations require a verified active principal. Direct calls to the service
+object are an in-process testing interface, not a network authorization
+boundary.
 
-The Hermes Gateway API listener is not the dashboard audio listener: its
-capability document may report `audio_api=false`, and it does not serve
-`POST /api/audio/speak`. A server-side `HermesAudioTTSProvider` declaration
-must therefore point its `endpoint` at a separately configured audio-capable
-Hermes web endpoint. A 404 from the API-only listener is recorded as
-`provider_unavailable` (with only the bounded HTTP status), not as a generic
-client error; the authenticated 2xx contract is covered by the isolated TTS
-fixture tests.
+## Authentication and credentials
+
+The trusted ingress signs
+`X-Recorder-Principal-User`, a NUL byte, and
+`X-Recorder-Principal-Device` with HMAC-SHA256. It sends the lowercase
+hexadecimal digest in `X-Recorder-Principal-Signature`. The asserted identity
+must agree with matching query, header, and JSON fields, and must be an active
+registered device. Legacy `X-Recorder-User-ID` and `X-Recorder-Device-ID`
+headers are optional matching assertions.
+
+When the Hermes provider is enabled, `hermes_api_key_file` names an owner-only
+credential file containing exactly one ASCII `API_SERVER_KEY=<value>` entry.
+The adapter reads it at startup and sends an in-memory Bearer authorization
+header plus the preferred `X-Hermes-Session-Token` header. The value is never logged or
+persisted. The systemd template uses `LoadCredential=recorder_api_key:...`
+and `$CREDENTIALS_DIRECTORY/recorder_api_key`. Rotate the source only with an
+authorized Recorder service restart; do not restart Hermes Gateway for this
+configuration change.
+
+## Database schema and migrations
+
+`recorder_next/schema.sql` is the clean-install schema and records schema
+version `5` in `schema_meta`. Existing databases are upgraded transactionally
+by the packaged startup code using these additive migrations:
+
+- `002_scheduled_final.sql` — scheduled FINAL fields and tables.
+- `003_feature_groups.sql` — worker jobs, update manifests, eavesdrop, and
+  diagnostics tables.
+- `004_eavesdrop_decisions.sql` — routing-decision and diagnostic tombstone
+  tables/columns.
+- `005_r25_contracts.sql` — Hermes run bindings, lease/run metadata, source
+  deletion metadata, diagnostic privacy/alias state, and readiness indexes.
+
+The repository-level `migrations/` files and byte-equivalent copies under
+`recorder_next/migrations/` are kept together so source inspection and the
+installed package describe the same upgrade sequence. Migration 005 is the
+single schema-5 upgrade; startup guards each additive change for partial
+recovery. Before changing an existing database, take a SQLite backup and
+retain it as the rollback source. Do not drop tables to roll back an upgrade.
 
 ## Layout
 
-- `recorder_next/store.py` — SQLite schema, transactions, state transitions, leases, outboxes, registry, spool
-- `recorder_next/service.py` — Router/ASR/Hermes/TTS orchestration and HTTP routing
-- `recorder_next/adapters.py` — injectable Router/Hermes/ASR/TTS seams and privacy-safe fixtures
-- `recorder_next/schema.sql` + `migrations/001_initial.sql` … `004_eavesdrop_decisions.sql` — authoritative schema artifacts
-- `recorder_next/openapi.py` + `api/openapi.json` — machine-readable v1 contract
-- `systemd/recorder-next.service` + `config.example.toml` — non-live deployment artifacts
-
-## Release-control binding
-
-This candidate-only activation packet is an exact ordered argv contract. Fresh preflight revalidates every manifest, freeze, runtime-preimage, test-ID, and test-source referent by canonical path, size, SHA-256, and semantic fields; any drift is a fail-closed hold. Live apply remains owned by the root orchestrator; migration, rollback, and predecessor continuity are out of scope for this repair.
+- `recorder_next/service.py` — request dispatch and provider integration.
+- `recorder_next/http.py` — bounded HTTP framing and response writing.
+- `recorder_next/http_contract.py` — operation catalog and OpenAPI projection.
+- `recorder_next/api_models.py` — closed request DTO descriptors.
+- `recorder_next/store.py` and `recorder_next/features.py` — SQLite state and
+  durable feature operations.
+- `recorder_next/adapters.py` — injectable Router, Hermes, ASR, and TTS seams.
+- `recorder_next/schema.sql` and `migrations/` — schema definitions and
+  upgrade SQL.
+- `config.example.toml` and `systemd/` — deployment configuration examples.

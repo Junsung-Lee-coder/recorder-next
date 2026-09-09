@@ -1,0 +1,4724 @@
+{
+  "operations": [
+    {
+      "handler_key": "get_v1_health",
+      "method": "GET",
+      "operation_id": "get_v1_health",
+      "path": "/v1/health",
+      "request": {
+        "media_types": [],
+        "required": false,
+        "schema": null
+      },
+      "responses": [
+        {
+          "body": "HealthResponse",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 200
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 500
+        }
+      ]
+    },
+    {
+      "handler_key": "head_get_v1_health",
+      "method": "HEAD",
+      "operation_id": "head_get_v1_health",
+      "path": "/v1/health",
+      "request": {
+        "media_types": [],
+        "required": false,
+        "schema": null
+      },
+      "responses": [
+        {
+          "body": "none",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 200
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 500
+        }
+      ]
+    },
+    {
+      "handler_key": "get_v1_openapi.json",
+      "method": "GET",
+      "operation_id": "get_v1_openapi.json",
+      "path": "/v1/openapi.json",
+      "request": {
+        "media_types": [],
+        "required": false,
+        "schema": null
+      },
+      "responses": [
+        {
+          "body": "OpenAPIDocument",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 200
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 500
+        }
+      ]
+    },
+    {
+      "handler_key": "head_get_v1_openapi.json",
+      "method": "HEAD",
+      "operation_id": "head_get_v1_openapi.json",
+      "path": "/v1/openapi.json",
+      "request": {
+        "media_types": [],
+        "required": false,
+        "schema": null
+      },
+      "responses": [
+        {
+          "body": "none",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 200
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 500
+        }
+      ]
+    },
+    {
+      "handler_key": "post_v1_devices",
+      "method": "POST",
+      "operation_id": "post_v1_devices",
+      "path": "/v1/devices",
+      "request": {
+        "media_types": [
+          "application/json"
+        ],
+        "required": true,
+        "schema": "DeviceRegister"
+      },
+      "responses": [
+        {
+          "body": "DeviceResponse",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 201
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 400
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 401
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 409
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 413
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 415
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 500
+        }
+      ]
+    },
+    {
+      "handler_key": "post_v1_devices_device_id_revoke",
+      "method": "POST",
+      "operation_id": "post_v1_devices_device_id_revoke",
+      "path": "/v1/devices/{device_id}/revoke",
+      "request": {
+        "media_types": [
+          "application/json"
+        ],
+        "required": true,
+        "schema": "DeviceRevoke"
+      },
+      "responses": [
+        {
+          "body": "DeviceResponse",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 200
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 400
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 401
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 404
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 409
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 413
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 415
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 500
+        }
+      ]
+    },
+    {
+      "handler_key": "post_v1_turns",
+      "method": "POST",
+      "operation_id": "post_v1_turns",
+      "path": "/v1/turns",
+      "request": {
+        "media_types": [
+          "application/json"
+        ],
+        "required": true,
+        "schema": "TurnCreate"
+      },
+      "responses": [
+        {
+          "body": "TurnResponse",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 201
+        },
+        {
+          "body": "TurnResponse",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 202
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 400
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 401
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 409
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 413
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 415
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 500
+        }
+      ]
+    },
+    {
+      "handler_key": "get_v1_turns_turn_id",
+      "method": "GET",
+      "operation_id": "get_v1_turns_turn_id",
+      "path": "/v1/turns/{turn_id}",
+      "request": {
+        "media_types": [],
+        "required": false,
+        "schema": null
+      },
+      "responses": [
+        {
+          "body": "TurnResponse",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 200
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 400
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 401
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 404
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 409
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 413
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 415
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 500
+        }
+      ]
+    },
+    {
+      "handler_key": "head_get_v1_turns_turn_id",
+      "method": "HEAD",
+      "operation_id": "head_get_v1_turns_turn_id",
+      "path": "/v1/turns/{turn_id}",
+      "request": {
+        "media_types": [],
+        "required": false,
+        "schema": null
+      },
+      "responses": [
+        {
+          "body": "none",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 200
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 400
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 401
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 404
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 409
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 413
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 415
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 500
+        }
+      ]
+    },
+    {
+      "handler_key": "post_v1_turns_turn_id_accept",
+      "method": "POST",
+      "operation_id": "post_v1_turns_turn_id_accept",
+      "path": "/v1/turns/{turn_id}/accept",
+      "request": {
+        "media_types": [
+          "application/json"
+        ],
+        "required": true,
+        "schema": "OwnerProof"
+      },
+      "responses": [
+        {
+          "body": "TurnResponse",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 200
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 400
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 401
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 404
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 409
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 413
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 415
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 500
+        }
+      ]
+    },
+    {
+      "handler_key": "put_v1_turns_turn_id_parts_part_id_chunks_sequence",
+      "method": "PUT",
+      "operation_id": "put_v1_turns_turn_id_parts_part_id_chunks_sequence",
+      "path": "/v1/turns/{turn_id}/parts/{part_id}/chunks/{sequence}",
+      "request": {
+        "media_types": [
+          "application/octet-stream"
+        ],
+        "required": true,
+        "schema": null
+      },
+      "responses": [
+        {
+          "body": "ChunkReceipt",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 200
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 400
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 401
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 404
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 409
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 413
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 415
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 500
+        }
+      ]
+    },
+    {
+      "handler_key": "ChunkUploadPost",
+      "method": "POST",
+      "operation_id": "ChunkUploadPost",
+      "path": "/v1/turns/{turn_id}/parts/{part_id}/chunks/{sequence}",
+      "request": {
+        "media_types": [
+          "application/octet-stream"
+        ],
+        "required": true,
+        "schema": null
+      },
+      "responses": [
+        {
+          "body": "ChunkReceipt",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 200
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 400
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 401
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 404
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 409
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 413
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 415
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 500
+        }
+      ]
+    },
+    {
+      "handler_key": "get_v1_turns_turn_id_parts_part_id_missing",
+      "method": "GET",
+      "operation_id": "get_v1_turns_turn_id_parts_part_id_missing",
+      "path": "/v1/turns/{turn_id}/parts/{part_id}/missing",
+      "request": {
+        "media_types": [],
+        "required": false,
+        "schema": null
+      },
+      "responses": [
+        {
+          "body": "MissingSequencePage",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 200
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 400
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 401
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 404
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 409
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 413
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 415
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 500
+        }
+      ]
+    },
+    {
+      "handler_key": "head_get_v1_turns_turn_id_parts_part_id_missing",
+      "method": "HEAD",
+      "operation_id": "head_get_v1_turns_turn_id_parts_part_id_missing",
+      "path": "/v1/turns/{turn_id}/parts/{part_id}/missing",
+      "request": {
+        "media_types": [],
+        "required": false,
+        "schema": null
+      },
+      "responses": [
+        {
+          "body": "none",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 200
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 400
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 401
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 404
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 409
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 413
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 415
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 500
+        }
+      ]
+    },
+    {
+      "handler_key": "post_v1_turns_turn_id_parts_part_id_finish",
+      "method": "POST",
+      "operation_id": "post_v1_turns_turn_id_parts_part_id_finish",
+      "path": "/v1/turns/{turn_id}/parts/{part_id}/finish",
+      "request": {
+        "media_types": [
+          "application/json"
+        ],
+        "required": true,
+        "schema": "FinishPart"
+      },
+      "responses": [
+        {
+          "body": "TurnPartResponse",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 200
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 400
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 401
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 404
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 409
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 413
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 415
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 500
+        }
+      ]
+    },
+    {
+      "handler_key": "post_v1_turns_turn_id_events_event_id_ack",
+      "method": "POST",
+      "operation_id": "post_v1_turns_turn_id_events_event_id_ack",
+      "path": "/v1/turns/{turn_id}/events/{event_id}/ack",
+      "request": {
+        "media_types": [
+          "application/json"
+        ],
+        "required": true,
+        "schema": "EventAck"
+      },
+      "responses": [
+        {
+          "body": "EventAckResponse",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 200
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 400
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 401
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 404
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 409
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 413
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 415
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 500
+        }
+      ]
+    },
+    {
+      "handler_key": "get_v1_outbox",
+      "method": "GET",
+      "operation_id": "get_v1_outbox",
+      "path": "/v1/outbox",
+      "request": {
+        "media_types": [],
+        "required": false,
+        "schema": null
+      },
+      "responses": [
+        {
+          "body": "OutboxResponse",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 200
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 400
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 401
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 404
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 409
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 413
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 415
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 500
+        }
+      ]
+    },
+    {
+      "handler_key": "head_get_v1_outbox",
+      "method": "HEAD",
+      "operation_id": "head_get_v1_outbox",
+      "path": "/v1/outbox",
+      "request": {
+        "media_types": [],
+        "required": false,
+        "schema": null
+      },
+      "responses": [
+        {
+          "body": "none",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 200
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 400
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 401
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 404
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 409
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 413
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 415
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 500
+        }
+      ]
+    },
+    {
+      "handler_key": "get_v1_tts_artifact_id",
+      "method": "GET",
+      "operation_id": "get_v1_tts_artifact_id",
+      "path": "/v1/tts/{artifact_id}",
+      "request": {
+        "media_types": [],
+        "required": false,
+        "schema": null
+      },
+      "responses": [
+        {
+          "body": "TTSResponse",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 200
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 400
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 401
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 404
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 409
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 500
+        }
+      ]
+    },
+    {
+      "handler_key": "head_get_v1_tts_artifact_id",
+      "method": "HEAD",
+      "operation_id": "head_get_v1_tts_artifact_id",
+      "path": "/v1/tts/{artifact_id}",
+      "request": {
+        "media_types": [],
+        "required": false,
+        "schema": null
+      },
+      "responses": [
+        {
+          "body": "none",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 200
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 400
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 401
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 404
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 409
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 500
+        }
+      ]
+    },
+    {
+      "handler_key": "get_v1_tts_artifact_id_bridge-read",
+      "method": "GET",
+      "operation_id": "get_v1_tts_artifact_id_bridge-read",
+      "path": "/v1/tts/{artifact_id}/bridge-read",
+      "request": {
+        "media_types": [],
+        "required": false,
+        "schema": null
+      },
+      "responses": [
+        {
+          "body": "TTSResponse",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 200
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 400
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 401
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 404
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 409
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 500
+        }
+      ]
+    },
+    {
+      "handler_key": "head_get_v1_tts_artifact_id_bridge-read",
+      "method": "HEAD",
+      "operation_id": "head_get_v1_tts_artifact_id_bridge-read",
+      "path": "/v1/tts/{artifact_id}/bridge-read",
+      "request": {
+        "media_types": [],
+        "required": false,
+        "schema": null
+      },
+      "responses": [
+        {
+          "body": "none",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 200
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 400
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 401
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 404
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 409
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 500
+        }
+      ]
+    },
+    {
+      "handler_key": "post_v1_tts_artifact_id_playback-ack",
+      "method": "POST",
+      "operation_id": "post_v1_tts_artifact_id_playback-ack",
+      "path": "/v1/tts/{artifact_id}/playback-ack",
+      "request": {
+        "media_types": [
+          "application/json"
+        ],
+        "required": true,
+        "schema": "PlaybackAck"
+      },
+      "responses": [
+        {
+          "body": "PlaybackAckResponse",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 200
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 400
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 401
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 404
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 409
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 413
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 415
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 500
+        }
+      ]
+    },
+    {
+      "handler_key": "post_v1_tts_artifact_id_relay-received",
+      "method": "POST",
+      "operation_id": "post_v1_tts_artifact_id_relay-received",
+      "path": "/v1/tts/{artifact_id}/relay-received",
+      "request": {
+        "media_types": [
+          "application/json"
+        ],
+        "required": true,
+        "schema": "RelayReceived"
+      },
+      "responses": [
+        {
+          "body": "RelayReceivedResponse",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 200
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 400
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 401
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 404
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 409
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 413
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 415
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 500
+        }
+      ]
+    },
+    {
+      "handler_key": "get_v1_projects",
+      "method": "GET",
+      "operation_id": "get_v1_projects",
+      "path": "/v1/projects",
+      "request": {
+        "media_types": [],
+        "required": false,
+        "schema": null
+      },
+      "responses": [
+        {
+          "body": "ProjectListResponse",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 200
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 400
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 401
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 404
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 409
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 413
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 415
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 500
+        }
+      ]
+    },
+    {
+      "handler_key": "head_get_v1_projects",
+      "method": "HEAD",
+      "operation_id": "head_get_v1_projects",
+      "path": "/v1/projects",
+      "request": {
+        "media_types": [],
+        "required": false,
+        "schema": null
+      },
+      "responses": [
+        {
+          "body": "none",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 200
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 400
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 401
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 404
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 409
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 413
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 415
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 500
+        }
+      ]
+    },
+    {
+      "handler_key": "post_v1_projects",
+      "method": "POST",
+      "operation_id": "post_v1_projects",
+      "path": "/v1/projects",
+      "request": {
+        "media_types": [
+          "application/json"
+        ],
+        "required": true,
+        "schema": "ProjectCreate"
+      },
+      "responses": [
+        {
+          "body": "ProjectResponse",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 201
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 400
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 401
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 409
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 413
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 415
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 500
+        }
+      ]
+    },
+    {
+      "handler_key": "get_v1_projects_search",
+      "method": "GET",
+      "operation_id": "get_v1_projects_search",
+      "path": "/v1/projects/search",
+      "request": {
+        "media_types": [],
+        "required": false,
+        "schema": null
+      },
+      "responses": [
+        {
+          "body": "ProjectListResponse",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 200
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 400
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 401
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 404
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 409
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 413
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 415
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 500
+        }
+      ]
+    },
+    {
+      "handler_key": "head_get_v1_projects_search",
+      "method": "HEAD",
+      "operation_id": "head_get_v1_projects_search",
+      "path": "/v1/projects/search",
+      "request": {
+        "media_types": [],
+        "required": false,
+        "schema": null
+      },
+      "responses": [
+        {
+          "body": "none",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 200
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 400
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 401
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 404
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 409
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 413
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 415
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 500
+        }
+      ]
+    },
+    {
+      "handler_key": "get_v1_projects_project_id",
+      "method": "GET",
+      "operation_id": "get_v1_projects_project_id",
+      "path": "/v1/projects/{project_id}",
+      "request": {
+        "media_types": [],
+        "required": false,
+        "schema": null
+      },
+      "responses": [
+        {
+          "body": "ProjectResponse",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 200
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 400
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 401
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 404
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 409
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 413
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 415
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 500
+        }
+      ]
+    },
+    {
+      "handler_key": "head_get_v1_projects_project_id",
+      "method": "HEAD",
+      "operation_id": "head_get_v1_projects_project_id",
+      "path": "/v1/projects/{project_id}",
+      "request": {
+        "media_types": [],
+        "required": false,
+        "schema": null
+      },
+      "responses": [
+        {
+          "body": "none",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 200
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 400
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 401
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 404
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 409
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 413
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 415
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 500
+        }
+      ]
+    },
+    {
+      "handler_key": "patch_v1_projects_project_id",
+      "method": "PATCH",
+      "operation_id": "patch_v1_projects_project_id",
+      "path": "/v1/projects/{project_id}",
+      "request": {
+        "media_types": [
+          "application/json"
+        ],
+        "required": true,
+        "schema": "ProjectPatch"
+      },
+      "responses": [
+        {
+          "body": "ProjectResponse",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 200
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 400
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 401
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 404
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 409
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 413
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 415
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 500
+        }
+      ]
+    },
+    {
+      "handler_key": "post_v1_turns_turn_id_archive",
+      "method": "POST",
+      "operation_id": "post_v1_turns_turn_id_archive",
+      "path": "/v1/turns/{turn_id}/archive",
+      "request": {
+        "media_types": [
+          "application/json"
+        ],
+        "required": true,
+        "schema": "ArchiveTurn"
+      },
+      "responses": [
+        {
+          "body": "TurnResponse",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 200
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 400
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 401
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 404
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 409
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 413
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 415
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 500
+        }
+      ]
+    },
+    {
+      "handler_key": "post_v1_projects_project_id_archive",
+      "method": "POST",
+      "operation_id": "post_v1_projects_project_id_archive",
+      "path": "/v1/projects/{project_id}/archive",
+      "request": {
+        "media_types": [
+          "application/json"
+        ],
+        "required": true,
+        "schema": "ExpectedVersion"
+      },
+      "responses": [
+        {
+          "body": "ProjectResponse",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 200
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 400
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 401
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 404
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 409
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 413
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 415
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 500
+        }
+      ]
+    },
+    {
+      "handler_key": "post_v1_internal_schedule_create",
+      "method": "POST",
+      "operation_id": "post_v1_internal_schedule_create",
+      "path": "/v1/internal/schedule_create",
+      "request": {
+        "media_types": [
+          "application/json"
+        ],
+        "required": true,
+        "schema": "ScheduleCreate"
+      },
+      "responses": [
+        {
+          "body": "ScheduleResponse",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 201
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 400
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 401
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 409
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 413
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 415
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 500
+        }
+      ]
+    },
+    {
+      "handler_key": "post_v1_internal_scheduler_fire",
+      "method": "POST",
+      "operation_id": "post_v1_internal_scheduler_fire",
+      "path": "/v1/internal/scheduler/fire",
+      "request": {
+        "media_types": [
+          "application/json"
+        ],
+        "required": true,
+        "schema": "SchedulerFire"
+      },
+      "responses": [
+        {
+          "body": "SchedulerFireResponse",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 200
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 400
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 401
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 404
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 409
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 413
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 415
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 500
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 403
+        }
+      ]
+    },
+    {
+      "handler_key": "post_v1_internal_scheduler_recover",
+      "method": "POST",
+      "operation_id": "post_v1_internal_scheduler_recover",
+      "path": "/v1/internal/scheduler/recover",
+      "request": {
+        "media_types": [
+          "application/json"
+        ],
+        "required": true,
+        "schema": "SchedulerRecover"
+      },
+      "responses": [
+        {
+          "body": "SchedulerRecoveryResponse",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 200
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 400
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 401
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 404
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 409
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 413
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 415
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 500
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 403
+        }
+      ]
+    },
+    {
+      "handler_key": "get_v1_schedules_schedule_id",
+      "method": "GET",
+      "operation_id": "get_v1_schedules_schedule_id",
+      "path": "/v1/schedules/{schedule_id}",
+      "request": {
+        "media_types": [],
+        "required": false,
+        "schema": null
+      },
+      "responses": [
+        {
+          "body": "ScheduleResponse",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 200
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 400
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 401
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 404
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 409
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 413
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 415
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 500
+        }
+      ]
+    },
+    {
+      "handler_key": "head_get_v1_schedules_schedule_id",
+      "method": "HEAD",
+      "operation_id": "head_get_v1_schedules_schedule_id",
+      "path": "/v1/schedules/{schedule_id}",
+      "request": {
+        "media_types": [],
+        "required": false,
+        "schema": null
+      },
+      "responses": [
+        {
+          "body": "none",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 200
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 400
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 401
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 404
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 409
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 413
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 415
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 500
+        }
+      ]
+    },
+    {
+      "handler_key": "get_v1_updates_channel_manifest",
+      "method": "GET",
+      "operation_id": "get_v1_updates_channel_manifest",
+      "path": "/v1/updates/{channel}/manifest",
+      "request": {
+        "media_types": [],
+        "required": false,
+        "schema": null
+      },
+      "responses": [
+        {
+          "body": "UpdateManifestResponse",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 200
+        },
+        {
+          "body": "none",
+          "headers": [
+            "ETag",
+            "Cache-Control"
+          ],
+          "media_type": null,
+          "status": 304
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 400
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 404
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 500
+        }
+      ]
+    },
+    {
+      "handler_key": "head_get_v1_updates_channel_manifest",
+      "method": "HEAD",
+      "operation_id": "head_get_v1_updates_channel_manifest",
+      "path": "/v1/updates/{channel}/manifest",
+      "request": {
+        "media_types": [],
+        "required": false,
+        "schema": null
+      },
+      "responses": [
+        {
+          "body": "none",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 200
+        },
+        {
+          "body": "none",
+          "headers": [
+            "ETag",
+            "Cache-Control"
+          ],
+          "media_type": null,
+          "status": 304
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 400
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 404
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 500
+        }
+      ]
+    },
+    {
+      "handler_key": "get_v1_updates_channel_generation_artifact_name",
+      "method": "GET",
+      "operation_id": "get_v1_updates_channel_generation_artifact_name",
+      "path": "/v1/updates/{channel}/{generation}/{artifact_name}",
+      "request": {
+        "media_types": [],
+        "required": false,
+        "schema": null
+      },
+      "responses": [
+        {
+          "body": "BinaryBody",
+          "headers": [
+            "Content-Type",
+            "Content-Length",
+            "ETag",
+            "Accept-Ranges",
+            "Cache-Control"
+          ],
+          "media_type": "application/vnd.android.package-archive",
+          "status": 200
+        },
+        {
+          "body": "BinaryBody",
+          "headers": [
+            "Content-Type",
+            "Content-Length",
+            "ETag",
+            "Accept-Ranges",
+            "Content-Range",
+            "Cache-Control"
+          ],
+          "media_type": "application/vnd.android.package-archive",
+          "status": 206
+        },
+        {
+          "body": "none",
+          "headers": [
+            "ETag",
+            "Content-Length",
+            "Cache-Control"
+          ],
+          "media_type": null,
+          "status": 304
+        },
+        {
+          "body": "none",
+          "headers": [
+            "ETag",
+            "Content-Length",
+            "Accept-Ranges",
+            "Content-Range",
+            "Cache-Control"
+          ],
+          "media_type": null,
+          "status": 416
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 400
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 404
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 500
+        }
+      ]
+    },
+    {
+      "handler_key": "head_get_v1_updates_channel_generation_artifact_name",
+      "method": "HEAD",
+      "operation_id": "head_get_v1_updates_channel_generation_artifact_name",
+      "path": "/v1/updates/{channel}/{generation}/{artifact_name}",
+      "request": {
+        "media_types": [],
+        "required": false,
+        "schema": null
+      },
+      "responses": [
+        {
+          "body": "none",
+          "headers": [
+            "Content-Type",
+            "Content-Length",
+            "ETag",
+            "Accept-Ranges",
+            "Cache-Control"
+          ],
+          "media_type": "application/vnd.android.package-archive",
+          "status": 200
+        },
+        {
+          "body": "none",
+          "headers": [
+            "Content-Type",
+            "Content-Length",
+            "ETag",
+            "Accept-Ranges",
+            "Content-Range",
+            "Cache-Control"
+          ],
+          "media_type": "application/vnd.android.package-archive",
+          "status": 206
+        },
+        {
+          "body": "none",
+          "headers": [
+            "ETag",
+            "Content-Length",
+            "Cache-Control"
+          ],
+          "media_type": null,
+          "status": 304
+        },
+        {
+          "body": "none",
+          "headers": [
+            "ETag",
+            "Content-Length",
+            "Accept-Ranges",
+            "Content-Range",
+            "Cache-Control"
+          ],
+          "media_type": null,
+          "status": 416
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 400
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 404
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 500
+        }
+      ]
+    },
+    {
+      "handler_key": "get_v1_history",
+      "method": "GET",
+      "operation_id": "get_v1_history",
+      "path": "/v1/history",
+      "request": {
+        "media_types": [],
+        "required": false,
+        "schema": null
+      },
+      "responses": [
+        {
+          "body": "HistoryResponse",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 200
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 400
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 401
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 404
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 409
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 413
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 415
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 500
+        }
+      ]
+    },
+    {
+      "handler_key": "head_get_v1_history",
+      "method": "HEAD",
+      "operation_id": "head_get_v1_history",
+      "path": "/v1/history",
+      "request": {
+        "media_types": [],
+        "required": false,
+        "schema": null
+      },
+      "responses": [
+        {
+          "body": "none",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 200
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 400
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 401
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 404
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 409
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 413
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 415
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 500
+        }
+      ]
+    },
+    {
+      "handler_key": "post_v1_eavesdrop",
+      "method": "POST",
+      "operation_id": "post_v1_eavesdrop",
+      "path": "/v1/eavesdrop",
+      "request": {
+        "media_types": [
+          "application/json"
+        ],
+        "required": true,
+        "schema": "EavesdropStart"
+      },
+      "responses": [
+        {
+          "body": "EavesdropSessionResponse",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 201
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 400
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 401
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 409
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 413
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 415
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 500
+        }
+      ]
+    },
+    {
+      "handler_key": "get_v1_eavesdrop_session_id",
+      "method": "GET",
+      "operation_id": "get_v1_eavesdrop_session_id",
+      "path": "/v1/eavesdrop/{session_id}",
+      "request": {
+        "media_types": [],
+        "required": false,
+        "schema": null
+      },
+      "responses": [
+        {
+          "body": "EavesdropSessionResponse",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 200
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 400
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 401
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 404
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 409
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 413
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 415
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 500
+        }
+      ]
+    },
+    {
+      "handler_key": "head_get_v1_eavesdrop_session_id",
+      "method": "HEAD",
+      "operation_id": "head_get_v1_eavesdrop_session_id",
+      "path": "/v1/eavesdrop/{session_id}",
+      "request": {
+        "media_types": [],
+        "required": false,
+        "schema": null
+      },
+      "responses": [
+        {
+          "body": "none",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 200
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 400
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 401
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 404
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 409
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 413
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 415
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 500
+        }
+      ]
+    },
+    {
+      "handler_key": "post_v1_eavesdrop_session_id_activate",
+      "method": "POST",
+      "operation_id": "post_v1_eavesdrop_session_id_activate",
+      "path": "/v1/eavesdrop/{session_id}/activate",
+      "request": {
+        "media_types": [
+          "application/json"
+        ],
+        "required": true,
+        "schema": "EavesdropAction"
+      },
+      "responses": [
+        {
+          "body": "EavesdropSessionResponse",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 200
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 400
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 401
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 404
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 409
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 413
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 415
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 500
+        }
+      ]
+    },
+    {
+      "handler_key": "post_v1_eavesdrop_session_id_pause",
+      "method": "POST",
+      "operation_id": "post_v1_eavesdrop_session_id_pause",
+      "path": "/v1/eavesdrop/{session_id}/pause",
+      "request": {
+        "media_types": [
+          "application/json"
+        ],
+        "required": true,
+        "schema": "EavesdropAction"
+      },
+      "responses": [
+        {
+          "body": "EavesdropSessionResponse",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 200
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 400
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 401
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 404
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 409
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 413
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 415
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 500
+        }
+      ]
+    },
+    {
+      "handler_key": "post_v1_eavesdrop_session_id_resume",
+      "method": "POST",
+      "operation_id": "post_v1_eavesdrop_session_id_resume",
+      "path": "/v1/eavesdrop/{session_id}/resume",
+      "request": {
+        "media_types": [
+          "application/json"
+        ],
+        "required": true,
+        "schema": "EavesdropAction"
+      },
+      "responses": [
+        {
+          "body": "EavesdropSessionResponse",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 200
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 400
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 401
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 404
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 409
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 413
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 415
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 500
+        }
+      ]
+    },
+    {
+      "handler_key": "post_v1_eavesdrop_session_id_stop",
+      "method": "POST",
+      "operation_id": "post_v1_eavesdrop_session_id_stop",
+      "path": "/v1/eavesdrop/{session_id}/stop",
+      "request": {
+        "media_types": [
+          "application/json"
+        ],
+        "required": true,
+        "schema": "EavesdropAction"
+      },
+      "responses": [
+        {
+          "body": "EavesdropSessionResponse",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 200
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 400
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 401
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 404
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 409
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 413
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 415
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 500
+        }
+      ]
+    },
+    {
+      "handler_key": "post_v1_eavesdrop_session_id_segments",
+      "method": "POST",
+      "operation_id": "post_v1_eavesdrop_session_id_segments",
+      "path": "/v1/eavesdrop/{session_id}/segments",
+      "request": {
+        "media_types": [
+          "application/json"
+        ],
+        "required": true,
+        "schema": "EavesdropSegment"
+      },
+      "responses": [
+        {
+          "body": "EavesdropSegmentResponse",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 201
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 400
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 401
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 404
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 409
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 413
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 415
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 500
+        }
+      ]
+    },
+    {
+      "handler_key": "get_v1_eavesdrop_session_id_replies",
+      "method": "GET",
+      "operation_id": "get_v1_eavesdrop_session_id_replies",
+      "path": "/v1/eavesdrop/{session_id}/replies",
+      "request": {
+        "media_types": [],
+        "required": false,
+        "schema": null
+      },
+      "responses": [
+        {
+          "body": "EavesdropRepliesResponse",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 200
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 400
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 401
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 404
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 409
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 413
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 415
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 500
+        }
+      ]
+    },
+    {
+      "handler_key": "head_get_v1_eavesdrop_session_id_replies",
+      "method": "HEAD",
+      "operation_id": "head_get_v1_eavesdrop_session_id_replies",
+      "path": "/v1/eavesdrop/{session_id}/replies",
+      "request": {
+        "media_types": [],
+        "required": false,
+        "schema": null
+      },
+      "responses": [
+        {
+          "body": "none",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 200
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 400
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 401
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 404
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 409
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 413
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 415
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 500
+        }
+      ]
+    },
+    {
+      "handler_key": "post_v1_diagnostics_opt-in",
+      "method": "POST",
+      "operation_id": "post_v1_diagnostics_opt-in",
+      "path": "/v1/diagnostics/opt-in",
+      "request": {
+        "media_types": [
+          "application/json"
+        ],
+        "required": true,
+        "schema": "DiagnosticsOptIn"
+      },
+      "responses": [
+        {
+          "body": "DiagnosticsConsentResponse",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 201
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 400
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 401
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 409
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 413
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 415
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 500
+        }
+      ]
+    },
+    {
+      "handler_key": "post_v1_diagnostics_events",
+      "method": "POST",
+      "operation_id": "post_v1_diagnostics_events",
+      "path": "/v1/diagnostics/events",
+      "request": {
+        "media_types": [
+          "application/json"
+        ],
+        "required": true,
+        "schema": "DiagnosticsEvent"
+      },
+      "responses": [
+        {
+          "body": "DiagnosticEventResponse",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 201
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 400
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 401
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 409
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 413
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 415
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 500
+        }
+      ]
+    },
+    {
+      "handler_key": "post_v1_diagnostics_bundles",
+      "method": "POST",
+      "operation_id": "post_v1_diagnostics_bundles",
+      "path": "/v1/diagnostics/bundles",
+      "request": {
+        "media_types": [
+          "application/json"
+        ],
+        "required": true,
+        "schema": "DiagnosticsBundle"
+      },
+      "responses": [
+        {
+          "body": "DiagnosticBundleResponse",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 201
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 400
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 401
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 409
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 413
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 415
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 500
+        }
+      ]
+    },
+    {
+      "handler_key": "get_v1_diagnostics",
+      "method": "GET",
+      "operation_id": "get_v1_diagnostics",
+      "path": "/v1/diagnostics",
+      "request": {
+        "media_types": [],
+        "required": false,
+        "schema": null
+      },
+      "responses": [
+        {
+          "body": "DiagnosticListResponse",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 200
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 400
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 401
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 404
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 409
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 413
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 415
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 500
+        }
+      ]
+    },
+    {
+      "handler_key": "head_get_v1_diagnostics",
+      "method": "HEAD",
+      "operation_id": "head_get_v1_diagnostics",
+      "path": "/v1/diagnostics",
+      "request": {
+        "media_types": [],
+        "required": false,
+        "schema": null
+      },
+      "responses": [
+        {
+          "body": "none",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 200
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 400
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 401
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 404
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 409
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 413
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 415
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 500
+        }
+      ]
+    },
+    {
+      "handler_key": "delete_v1_diagnostics",
+      "method": "DELETE",
+      "operation_id": "delete_v1_diagnostics",
+      "path": "/v1/diagnostics",
+      "request": {
+        "media_types": [
+          "application/json"
+        ],
+        "required": true,
+        "schema": "DiagnosticsDelete"
+      },
+      "responses": [
+        {
+          "body": "DeletionReceipt",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 200
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 400
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 401
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 409
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 413
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 415
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 500
+        }
+      ]
+    },
+    {
+      "handler_key": "post_v1_diagnostics_delete",
+      "method": "POST",
+      "operation_id": "post_v1_diagnostics_delete",
+      "path": "/v1/diagnostics/delete",
+      "request": {
+        "media_types": [
+          "application/json"
+        ],
+        "required": true,
+        "schema": "DiagnosticsDelete"
+      },
+      "responses": [
+        {
+          "body": "DeletionReceipt",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 200
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 400
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 401
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 409
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 413
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 415
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 500
+        }
+      ]
+    },
+    {
+      "handler_key": "post_v1_internal_worker_claim",
+      "method": "POST",
+      "operation_id": "post_v1_internal_worker_claim",
+      "path": "/v1/internal/worker/claim",
+      "request": {
+        "media_types": [
+          "application/json"
+        ],
+        "required": true,
+        "schema": "WorkerClaim"
+      },
+      "responses": [
+        {
+          "body": "WorkerClaimResponse",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 200
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 400
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 401
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 404
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 409
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 413
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 415
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 500
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 403
+        }
+      ]
+    },
+    {
+      "handler_key": "post_v1_internal_worker_recover",
+      "method": "POST",
+      "operation_id": "post_v1_internal_worker_recover",
+      "path": "/v1/internal/worker/recover",
+      "request": {
+        "media_types": [
+          "application/json"
+        ],
+        "required": true,
+        "schema": "WorkerRecover"
+      },
+      "responses": [
+        {
+          "body": "WorkerRecoveryResponse",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 200
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 400
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 401
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 404
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 409
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 413
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 415
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 500
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 403
+        }
+      ]
+    },
+    {
+      "handler_key": "post_v1_internal_worker_complete",
+      "method": "POST",
+      "operation_id": "post_v1_internal_worker_complete",
+      "path": "/v1/internal/worker/complete",
+      "request": {
+        "media_types": [
+          "application/json"
+        ],
+        "required": true,
+        "schema": "WorkerComplete"
+      },
+      "responses": [
+        {
+          "body": "WorkerMutationResponse",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 200
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 400
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 401
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 404
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 409
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 413
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 415
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 500
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 403
+        }
+      ]
+    },
+    {
+      "handler_key": "post_v1_internal_worker_fail",
+      "method": "POST",
+      "operation_id": "post_v1_internal_worker_fail",
+      "path": "/v1/internal/worker/fail",
+      "request": {
+        "media_types": [
+          "application/json"
+        ],
+        "required": true,
+        "schema": "WorkerFail"
+      },
+      "responses": [
+        {
+          "body": "WorkerMutationResponse",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 200
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 400
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 401
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 404
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 409
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 413
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 415
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 500
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 403
+        }
+      ]
+    },
+    {
+      "handler_key": "post_v1_internal_worker_run",
+      "method": "POST",
+      "operation_id": "post_v1_internal_worker_run",
+      "path": "/v1/internal/worker/run",
+      "request": {
+        "media_types": [
+          "application/json"
+        ],
+        "required": true,
+        "schema": "WorkerRun"
+      },
+      "responses": [
+        {
+          "body": "WorkerRunResponse",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 200
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 400
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 401
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 404
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 409
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 413
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 415
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 500
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 403
+        }
+      ]
+    },
+    {
+      "handler_key": "get_v1_internal_worker_health",
+      "method": "GET",
+      "operation_id": "get_v1_internal_worker_health",
+      "path": "/v1/internal/worker/health",
+      "request": {
+        "media_types": [],
+        "required": false,
+        "schema": null
+      },
+      "responses": [
+        {
+          "body": "WorkerHealth",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 200
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 400
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 401
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 404
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 409
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 413
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 415
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 500
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 403
+        }
+      ]
+    },
+    {
+      "handler_key": "head_get_v1_internal_worker_health",
+      "method": "HEAD",
+      "operation_id": "head_get_v1_internal_worker_health",
+      "path": "/v1/internal/worker/health",
+      "request": {
+        "media_types": [],
+        "required": false,
+        "schema": null
+      },
+      "responses": [
+        {
+          "body": "none",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 200
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 400
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 401
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 404
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 409
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 413
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 415
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 500
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 403
+        }
+      ]
+    },
+    {
+      "handler_key": "post_v1_eavesdrop_session_id_segments_segment_sequence_route",
+      "method": "POST",
+      "operation_id": "post_v1_eavesdrop_session_id_segments_segment_sequence_route",
+      "path": "/v1/eavesdrop/{session_id}/segments/{segment_sequence}/route",
+      "request": {
+        "media_types": [
+          "application/json"
+        ],
+        "required": true,
+        "schema": "EavesdropRoutePath"
+      },
+      "responses": [
+        {
+          "body": "RoutingDecisionResponse",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 200
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 400
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 401
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 404
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 409
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 413
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 415
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 500
+        }
+      ]
+    },
+    {
+      "handler_key": "EavesdropRouteBodyAlias",
+      "method": "POST",
+      "operation_id": "EavesdropRouteBodyAlias",
+      "path": "/v1/eavesdrop/{session_id}/segments/route",
+      "request": {
+        "media_types": [
+          "application/json"
+        ],
+        "required": true,
+        "schema": "EavesdropRoute"
+      },
+      "responses": [
+        {
+          "body": "RoutingDecisionResponse",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 200
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 400
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 401
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 404
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 409
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 413
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 415
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 500
+        }
+      ]
+    },
+    {
+      "handler_key": "get_v1_eavesdrop_session_id_decisions",
+      "method": "GET",
+      "operation_id": "get_v1_eavesdrop_session_id_decisions",
+      "path": "/v1/eavesdrop/{session_id}/decisions",
+      "request": {
+        "media_types": [],
+        "required": false,
+        "schema": null
+      },
+      "responses": [
+        {
+          "body": "RoutingDecisionsResponse",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 200
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 400
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 401
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 404
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 409
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 413
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 415
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 500
+        }
+      ]
+    },
+    {
+      "handler_key": "head_get_v1_eavesdrop_session_id_decisions",
+      "method": "HEAD",
+      "operation_id": "head_get_v1_eavesdrop_session_id_decisions",
+      "path": "/v1/eavesdrop/{session_id}/decisions",
+      "request": {
+        "media_types": [],
+        "required": false,
+        "schema": null
+      },
+      "responses": [
+        {
+          "body": "none",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 200
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 400
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 401
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 404
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 409
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 413
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 415
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 500
+        }
+      ]
+    },
+    {
+      "handler_key": "get_v1_diagnostics_export",
+      "method": "GET",
+      "operation_id": "get_v1_diagnostics_export",
+      "path": "/v1/diagnostics/export",
+      "request": {
+        "media_types": [],
+        "required": false,
+        "schema": null
+      },
+      "responses": [
+        {
+          "body": "DiagnosticExportResponse",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 200
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 400
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 401
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 404
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 409
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 413
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 415
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 500
+        }
+      ]
+    },
+    {
+      "handler_key": "head_get_v1_diagnostics_export",
+      "method": "HEAD",
+      "operation_id": "head_get_v1_diagnostics_export",
+      "path": "/v1/diagnostics/export",
+      "request": {
+        "media_types": [],
+        "required": false,
+        "schema": null
+      },
+      "responses": [
+        {
+          "body": "none",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 200
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 400
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 401
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 404
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 409
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 413
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 415
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 500
+        }
+      ]
+    },
+    {
+      "handler_key": "HealthAlias",
+      "method": "GET",
+      "operation_id": "HealthAlias",
+      "path": "/healthz",
+      "request": {
+        "media_types": [],
+        "required": false,
+        "schema": null
+      },
+      "responses": [
+        {
+          "body": "HealthResponse",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 200
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 500
+        }
+      ]
+    },
+    {
+      "handler_key": "head_HealthAlias",
+      "method": "HEAD",
+      "operation_id": "head_HealthAlias",
+      "path": "/healthz",
+      "request": {
+        "media_types": [],
+        "required": false,
+        "schema": null
+      },
+      "responses": [
+        {
+          "body": "none",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 200
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 500
+        }
+      ]
+    },
+    {
+      "handler_key": "DeviceConfirm",
+      "method": "POST",
+      "operation_id": "DeviceConfirm",
+      "path": "/v1/devices/register",
+      "request": {
+        "media_types": [
+          "application/json"
+        ],
+        "required": true,
+        "schema": "DeviceRegister"
+      },
+      "responses": [
+        {
+          "body": "DeviceResponse",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 201
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 400
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 401
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 409
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 413
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 415
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 500
+        }
+      ]
+    },
+    {
+      "handler_key": "EventAckAlias",
+      "method": "POST",
+      "operation_id": "EventAckAlias",
+      "path": "/v1/turns/{turn_id}/events/{event_id}",
+      "request": {
+        "media_types": [
+          "application/json"
+        ],
+        "required": true,
+        "schema": "EventAck"
+      },
+      "responses": [
+        {
+          "body": "EventAckResponse",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 200
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 400
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 401
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 404
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 409
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 413
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 415
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 500
+        }
+      ]
+    },
+    {
+      "handler_key": "UpdateManifestJson",
+      "method": "GET",
+      "operation_id": "UpdateManifestJson",
+      "path": "/v1/updates/{channel}/manifest.json",
+      "request": {
+        "media_types": [],
+        "required": false,
+        "schema": null
+      },
+      "responses": [
+        {
+          "body": "UpdateManifestResponse",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 200
+        },
+        {
+          "body": "none",
+          "headers": [
+            "ETag",
+            "Cache-Control"
+          ],
+          "media_type": null,
+          "status": 304
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 400
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 404
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 500
+        }
+      ]
+    },
+    {
+      "handler_key": "head_UpdateManifestJson",
+      "method": "HEAD",
+      "operation_id": "head_UpdateManifestJson",
+      "path": "/v1/updates/{channel}/manifest.json",
+      "request": {
+        "media_types": [],
+        "required": false,
+        "schema": null
+      },
+      "responses": [
+        {
+          "body": "none",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 200
+        },
+        {
+          "body": "none",
+          "headers": [
+            "ETag",
+            "Cache-Control"
+          ],
+          "media_type": null,
+          "status": 304
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 400
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 404
+        },
+        {
+          "body": "Error",
+          "headers": [],
+          "media_type": "application/json",
+          "status": 500
+        }
+      ]
+    }
+  ],
+  "schema": "recorder-next-operation-coverage/v1"
+}
