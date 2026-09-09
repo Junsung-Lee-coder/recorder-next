@@ -20,9 +20,11 @@ import urllib.request
 from urllib.parse import quote
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, Mapping, Protocol, Sequence
+from typing import Any, Callable, Mapping, Protocol, Sequence
 
 from .canonical import sha256_bytes
+from .hermes_wire import SubmissionContext, WirePolicy, serialize_json
+from .media import ASRInput, MediaValidationError, validate_wav
 from .models import AsrResult, HermesResult, RouterDecision, TTSResult
 
 
@@ -172,7 +174,16 @@ class RouterAdapter(Protocol):
 
 
 class HermesGateway(Protocol):
-    def submit(self, *, session_key: str, request: Mapping[str, Any], submission_id: str, marker: str) -> HermesResult | None: ...
+    def submit(
+        self,
+        *,
+        session_key: str,
+        request: Mapping[str, Any],
+        submission_id: str,
+        marker: str,
+        context: SubmissionContext | None = None,
+        on_run_accepted: Callable[[str], bool] | None = None,
+    ) -> HermesResult | None: ...
 
     def history(self, *, session_key: str, marker: str) -> HermesResult | None: ...
 
@@ -182,7 +193,7 @@ class HermesGateway(Protocol):
 class ASRProvider(Protocol):
     name: str
 
-    def transcribe(self, audio: bytes, *, turn_id: str, generation: int) -> AsrResult: ...
+    def transcribe(self, audio: ASRInput | bytes, *, turn_id: str, generation: int) -> AsrResult: ...
 
 
 class TTSProvider(Protocol):
@@ -255,9 +266,24 @@ class MemoryHermesGateway:
         self.history_message_responses: dict[str, list[HermesResult]] = {}
         self.calls: list[dict[str, Any]] = []
 
-    def submit(self, *, session_key: str, request: Mapping[str, Any], submission_id: str, marker: str) -> HermesResult | None:
+    def submit(
+        self,
+        *,
+        session_key: str,
+        request: Mapping[str, Any],
+        submission_id: str,
+        marker: str,
+        context: SubmissionContext | None = None,
+        on_run_accepted: Callable[[str], bool] | None = None,
+    ) -> HermesResult | None:
         self.calls.append({"kind": "submit", "session_key": session_key, "submission_id": submission_id, "marker": marker, "request": dict(request)})
-        return self.responses.get(submission_id)
+        result = self.responses.get(submission_id)
+        if context is not None and result is not None:
+            run_id = result.run_id or f"memory-run:{submission_id}"
+            if on_run_accepted is not None and not on_run_accepted(run_id):
+                return None
+            return replace(result, run_id=run_id, submission_id=context.submission_id, turn_id=context.turn_id, marker=context.marker, session_key=context.gateway_session_key, request_sha256=context.canonical_request_sha256, subject_kind=context.subject_kind, eavesdrop_session_id=context.eavesdrop_session_id, segment_sequence=context.segment_sequence, segment_sha256=context.segment_sha256)
+        return result
 
     def history(self, *, session_key: str, marker: str) -> HermesResult | None:
         self.calls.append({"kind": "history", "session_key": session_key, "marker": marker})
@@ -296,6 +322,7 @@ class HttpHermesGateway:
         max_submit_attempts: int = 2,
         poll_interval_seconds: float = 1.0,
         run_timeout_seconds: float = 120.0,
+        max_request_bytes: int = 10_000_000,
     ):
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
@@ -311,6 +338,7 @@ class HttpHermesGateway:
         self.max_submit_attempts = max_submit_attempts
         self.poll_interval_seconds = float(poll_interval_seconds)
         self.run_timeout_seconds = float(run_timeout_seconds)
+        self._wire_policy = WirePolicy(gateway_max_request_bytes=max_request_bytes)
 
     def _session_headers(self, session_key: str) -> dict[str, str]:
         headers = {"X-Hermes-Session-Key": session_key}
@@ -319,12 +347,15 @@ class HttpHermesGateway:
         return headers
 
     def _request(self, method: str, path: str, payload: Mapping[str, Any] | None = None, *, extra_headers: Mapping[str, str] | None = None) -> Any:
-        body = None if payload is None else json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        body = None if payload is None else self._wire_policy.ensure_size(serialize_json(payload))
+        request_headers = {"Accept": "application/json", **dict(extra_headers or {})}
+        if body is not None:
+            request_headers.update({"Content-Type": "application/json", "Content-Length": str(len(body))})
         request = urllib.request.Request(
             self.base_url + path,
             data=body,
             method=method,
-            headers={"Content-Type": "application/json", "Accept": "application/json", **dict(extra_headers or {})},
+            headers=request_headers,
         )
         with _urlopen_no_redirect(request, timeout=self.timeout) as response:
             raw = response.read()
@@ -466,7 +497,7 @@ class HttpHermesGateway:
             raw = fetched.get("body")
             if not isinstance(raw, bytes) or not raw:
                 raise ValueError("attachment resolver returned invalid bytes")
-            if len(raw) > 16 * 1024 * 1024:
+            if len(raw) > 8 * 1024 * 1024:
                 raise ValueError("attachment exceeds Hermes inline input limit")
             digest = fetched.get("sha256")
             mime = fetched.get("mime")
@@ -504,17 +535,42 @@ class HttpHermesGateway:
             value = "".join(values)
         return value.strip() if isinstance(value, str) else ""
 
-    def _parse_run_result(self, result: Any, run_id: str) -> HermesResult | None:
+    def _parse_run_result(self, result: Any, run_id: str, context: SubmissionContext | None = None) -> HermesResult | None:
         if not isinstance(result, Mapping):
             return None
         status = str(result.get("status") or "").lower().replace("-", "_")
-        if status and status not in self._RUN_TERMINAL_STATUSES:
+        if context is not None and status != "completed":
+            return None
+        if context is None and status and status not in self._RUN_TERMINAL_STATUSES:
             return None
         text = self._run_text(result)
         if not text:
             return None
+        response_run_id = result.get("run_id") or result.get("id")
+        if response_run_id is not None and response_run_id != run_id:
+            return None
         assistant_id = result.get("assistant_message_id") or result.get("message_id") or result.get("response_id") or run_id
-        return HermesResult(str(assistant_id), text, True, "hermes-run")
+        if context is None:
+            return HermesResult(str(assistant_id), text, True, "hermes-run", run_id=run_id)
+        for key, expected in (("submission_id", context.submission_id), ("turn_id", context.turn_id), ("eavesdrop_session_id", context.eavesdrop_session_id), ("segment_sequence", context.segment_sequence), ("segment_sha256", context.segment_sha256), ("marker", context.marker), ("session_key", context.gateway_session_key), ("request_sha256", context.canonical_request_sha256), ("subject_kind", context.subject_kind)):
+            if result.get(key) is not None and result.get(key) != expected:
+                return None
+        return HermesResult(
+            str(assistant_id),
+            text,
+            True,
+            "hermes-run",
+            submission_id=context.submission_id,
+            turn_id=context.turn_id,
+            marker=context.marker,
+            session_key=context.gateway_session_key,
+            run_id=run_id,
+            request_sha256=context.canonical_request_sha256,
+            subject_kind=context.subject_kind,
+            eavesdrop_session_id=context.eavesdrop_session_id,
+            segment_sequence=context.segment_sequence,
+            segment_sha256=context.segment_sha256,
+        )
 
     def _submit_legacy_session_chat(
         self,
@@ -584,7 +640,16 @@ class HttpHermesGateway:
             return None
         return parsed
 
-    def submit(self, *, session_key: str, request: Mapping[str, Any], submission_id: str, marker: str) -> HermesResult | None:
+    def submit(
+        self,
+        *,
+        session_key: str,
+        request: Mapping[str, Any],
+        submission_id: str,
+        marker: str,
+        context: SubmissionContext | None = None,
+        on_run_accepted: Callable[[str], bool] | None = None,
+    ) -> HermesResult | None:
         # The durable session_ingress row stores an envelope containing the
         # normalized request plus route metadata.  Only user input bytes cross
         # this seam; Recorder IDs are transport/session state, not prompt text.
@@ -593,6 +658,9 @@ class HttpHermesGateway:
             raise ValueError("Hermes request projection must be an object")
         if not isinstance(submission_id, str) or not 1 <= len(submission_id) <= 255 or any(ord(ch) < 33 or ord(ch) > 126 for ch in submission_id):
             raise ValueError("Hermes submission id is not a valid Idempotency-Key")
+        json_session = request.get("session_id")
+        if json_session is not None and json_session != session_key:
+            raise ValueError("JSON session_id conflicts with X-Hermes-Session-Key")
         projected = projected_value
         text = projected.get("input") or projected.get("text") or ""
         attachments = self._resolve_inline_attachments(projected, submission_id=submission_id)
@@ -604,13 +672,25 @@ class HttpHermesGateway:
         }
         headers = self._session_headers(session_key)
         headers["Idempotency-Key"] = submission_id
+        if context is not None:
+            if context.submission_id != submission_id or context.marker != marker or context.gateway_session_key != session_key:
+                raise ValueError("Hermes submission context does not match the request")
+            headers.update({
+                "X-Hermes-Submission-ID": context.submission_id,
+                "X-Hermes-Marker": context.marker,
+                "X-Hermes-Wire-Revision": context.wire_revision,
+            })
         deadline = time.monotonic() + self.run_timeout_seconds
         accepted: Mapping[str, Any] | None = None
+        accepted_run_id: str | None = context.run_id if context is not None else None
         for attempt in range(self.max_submit_attempts):
+            if accepted_run_id is not None:
+                accepted = {"run_id": accepted_run_id}
+                break
             try:
                 response = self._request("POST", "/v1/runs", body, extra_headers=headers)
             except urllib.error.HTTPError as exc:
-                if attempt == 0:
+                if context is None and attempt == 0:
                     return self._submit_legacy_session_chat(
                         session_key=session_key,
                         body=body,
@@ -629,13 +709,22 @@ class HttpHermesGateway:
                 return None
             run_id = response.get("run_id") or response.get("id")
             if isinstance(run_id, str) and run_id:
+                if accepted_run_id is not None and run_id != accepted_run_id:
+                    return None
+                accepted_run_id = run_id
                 accepted = response
                 break
             return None
         if accepted is None:
             return None
         run_id = str(accepted.get("run_id") or accepted.get("id"))
-        immediate = self._parse_run_result(accepted, run_id)
+        if context is not None and on_run_accepted is not None and context.run_id is None:
+            try:
+                if not on_run_accepted(run_id):
+                    return None
+            except Exception:
+                return None
+        immediate = self._parse_run_result(accepted, run_id, context)
         if immediate is not None:
             return immediate
         while time.monotonic() <= deadline:
@@ -649,7 +738,7 @@ class HttpHermesGateway:
                 continue
             if isinstance(status, Mapping):
                 normalized = str(status.get("status") or "").lower().replace("-", "_")
-                parsed = self._parse_run_result(status, run_id)
+                parsed = self._parse_run_result(status, run_id, context)
                 if parsed is not None:
                     return parsed
                 if normalized in self._RUN_TERMINAL_STATUSES:
@@ -1074,6 +1163,41 @@ class _HTTPProvider:
         except urllib.error.URLError:
             raise ProviderFailure("transport", retryable=True) from None
 
+    def _request_bytes(
+        self,
+        body: bytes,
+        *,
+        content_type: str,
+        max_response_bytes: int = 16 * 1024 * 1024,
+        timeout_seconds: float | None = None,
+    ) -> tuple[str, bytes]:
+        if not isinstance(body, bytes) or not body:
+            raise ProviderFailure("unsupported_media", retryable=False)
+        if not isinstance(content_type, str) or not content_type or any(ord(char) < 0x20 for char in content_type):
+            raise ValueError("provider content type is invalid")
+        if not isinstance(max_response_bytes, int) or max_response_bytes < 1:
+            raise ValueError("provider response limit is invalid")
+        headers = {"Accept": "application/json, audio/mpeg", "Content-Type": content_type, "Content-Length": str(len(body))}
+        headers.update(self._auth_headers())
+        timeout = self.timeout if timeout_seconds is None else min(self.timeout, float(timeout_seconds))
+        if timeout <= 0:
+            raise ProviderFailure("timeout", retryable=True)
+        request = urllib.request.Request(self.endpoint, data=body, method="POST", headers=headers)
+        try:
+            with _urlopen_no_redirect(request, timeout=timeout) as response:
+                raw = response.read(max_response_bytes + 1)
+                if len(raw) > max_response_bytes:
+                    raise ProviderFailure("response_too_large", retryable=False)
+                return response.headers.get("Content-Type", ""), raw
+        except urllib.error.HTTPError as exc:
+            status_code = exc.code
+            _close_http_error(exc)
+            raise _provider_failure_for_http(status_code) from None
+        except (socket.timeout, TimeoutError):
+            raise ProviderFailure("timeout", retryable=True) from None
+        except urllib.error.URLError:
+            raise ProviderFailure("transport", retryable=True) from None
+
     def _probe(self, path: str | None) -> dict[str, Any]:
         if path is None:
             return {"configured": False}
@@ -1265,6 +1389,41 @@ def _asr_payload_details(payload: Mapping[str, Any]) -> tuple[str, str | None, s
     return outcome, text, provider
 
 
+def _coerce_asr_input(audio: ASRInput | bytes, *, part_id: str = "audio-1") -> ASRInput:
+    if isinstance(audio, ASRInput):
+        return audio
+    if isinstance(audio, bytes):
+        try:
+            return validate_wav(audio, part_id=part_id, mime="audio/wav")
+        except MediaValidationError as exc:
+            raise ProviderFailure("unsupported_media", retryable=False) from exc
+    raise ProviderFailure("unsupported_media", retryable=False)
+
+
+def _language_code(language: str) -> str:
+    if not isinstance(language, str) or not re.fullmatch(r"[A-Za-z]{2}(?:-[A-Za-z]{2})?", language):
+        raise ValueError("ASR language must be an ISO-639-1 code or locale")
+    return language[:2].lower()
+
+
+def _multipart_form(fields: Mapping[str, str], *, filename: str, content_type: str, file_bytes: bytes) -> tuple[str, bytes]:
+    boundary = "----recorder-next-" + os.urandom(16).hex()
+    chunks: list[bytes] = []
+    for name, value in fields.items():
+        if not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", name) or any(ord(char) < 0x20 for char in value):
+            raise ValueError("multipart field is invalid")
+        chunks.extend([f"--{boundary}\r\n".encode("ascii"), f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode("ascii"), value.encode("utf-8"), b"\r\n"])
+    chunks.extend([
+        f"--{boundary}\r\n".encode("ascii"),
+        f'Content-Disposition: form-data; name="file"; filename="{filename}"\r\n'.encode("ascii"),
+        f"Content-Type: {content_type}\r\n\r\n".encode("ascii"),
+        file_bytes,
+        b"\r\n",
+        f"--{boundary}--\r\n".encode("ascii"),
+    ])
+    return f"multipart/form-data; boundary={boundary}", b"".join(chunks)
+
+
 class HttpASRProvider(_HTTPProvider):
     """Production HTTP ASR adapter with fail-closed response parsing."""
 
@@ -1290,18 +1449,19 @@ class HttpASRProvider(_HTTPProvider):
         self.language = language
         self.max_bytes = max_bytes
         self.media_types = tuple(media_types or ("audio/wav", "audio/x-wav"))
-        if any(not isinstance(media_type, str) or not media_type.startswith("audio/") for media_type in self.media_types):
+        if any(not isinstance(media_type, str) or media_type.lower() not in {"audio/wav", "audio/x-wav"} for media_type in self.media_types):
             raise ValueError("ASR media types must be audio MIME types")
         super().__init__(endpoint, timeout=timeout, credential_file=credential_file, health_path=health_path, capability_path=capability_path)
 
-    def transcribe(self, audio: bytes, *, turn_id: str, generation: int, timeout_seconds: float | None = None) -> AsrResult:
-        if not isinstance(audio, bytes) or not audio or (self.max_bytes is not None and len(audio) > self.max_bytes):
+    def transcribe(self, audio: ASRInput | bytes, *, turn_id: str, generation: int, timeout_seconds: float | None = None) -> AsrResult:
+        value = _coerce_asr_input(audio)
+        if value.canonical_mime not in {item.lower() for item in self.media_types} or (self.max_bytes is not None and value.byte_count > self.max_bytes):
             raise ProviderFailure("unsupported_media", retryable=False)
         content_type, raw = self._request(
             {
                 "model": self.model,
                 "language": self.language,
-                "audio_base64": base64.b64encode(audio).decode("ascii"),
+                "audio_base64": base64.b64encode(value.data).decode("ascii"),
                 "turn_id": turn_id,
                 "generation": generation,
             },
@@ -1324,9 +1484,10 @@ class HttpASRProvider(_HTTPProvider):
                     "endpoint_contract": self.endpoint,
                     "provider": self.name,
                     "model": self.model,
-                    "input_sha256": sha256_bytes(audio),
+                    "input_sha256": value.sha256,
                     "content_type": "audio/wav",
-                    "byte_size": len(audio),
+                    "byte_size": value.byte_count,
+                    "media_revision": "wav-pcm-s16le-16k-mono-v1",
                     "attempt_identity": f"{turn_id}:{generation}",
                 },
             )
@@ -1339,10 +1500,11 @@ class HttpASRProvider(_HTTPProvider):
                 "endpoint_contract": self.endpoint,
                 "provider": self.name,
                 "model": self.model,
-                "input_sha256": sha256_bytes(audio),
+                "input_sha256": value.sha256,
                 "output_sha256": sha256_bytes(text.encode("utf-8")),
                 "content_type": "audio/wav",
-                "byte_size": len(audio),
+                "byte_size": value.byte_count,
+                "media_revision": "wav-pcm-s16le-16k-mono-v1",
                 "attempt_identity": f"{turn_id}:{generation}",
             },
         )
@@ -1360,6 +1522,46 @@ class WhisperASRProvider(HttpASRProvider):
 
     name = "whisper-compatible"
     mode = "whisper"
+
+    def transcribe(
+        self,
+        audio: ASRInput | bytes,
+        *,
+        turn_id: str,
+        generation: int,
+        timeout_seconds: float | None = None,
+    ) -> AsrResult:
+        value = _coerce_asr_input(audio)
+        if value.canonical_mime not in {item.lower() for item in self.media_types} or (self.max_bytes is not None and value.byte_count > self.max_bytes):
+            raise ProviderFailure("unsupported_media", retryable=False)
+        fields = {"model": self.model, "response_format": "json"}
+        if self.language:
+            fields["language"] = _language_code(self.language)
+        content_type, body = _multipart_form(fields, filename="audio.wav", content_type="audio/wav", file_bytes=value.data)
+        _response_type, raw = self._request_bytes(body, content_type=content_type, timeout_seconds=timeout_seconds)
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            raise ProviderFailure("malformed_success", retryable=False) from None
+        if not isinstance(payload, Mapping) or "text" not in payload or not isinstance(payload["text"], str):
+            raise ProviderFailure("malformed_success", retryable=False)
+        text = payload["text"].strip()
+        metadata = {
+            "mode": self.mode,
+            "provider": self.name,
+            "model": self.model,
+            "endpoint_contract": self.endpoint,
+            "input_sha256": value.sha256,
+            "output_sha256": sha256_bytes(text.encode("utf-8")),
+            "content_type": "audio/wav",
+            "byte_size": value.byte_count,
+            "media_revision": "wav-pcm-s16le-16k-mono-v1",
+            "wire_revision": "whisper-multipart-v1",
+            "attempt_identity": f"{turn_id}:{generation}",
+        }
+        if not text:
+            return AsrResult("NO_SPEECH", metadata=metadata)
+        return AsrResult("VALID_TRANSCRIPT", transcript=text, metadata=metadata)
 
 
 PROFILE_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
@@ -1419,15 +1621,16 @@ class HermesAudioASRProvider(_HTTPProvider):
 
     def transcribe(
         self,
-        audio: bytes,
+        audio: ASRInput | bytes,
         *,
         turn_id: str,
         generation: int,
         timeout_seconds: float | None = None,
     ) -> AsrResult:
-        if not isinstance(audio, bytes) or not audio or (self.max_bytes is not None and len(audio) > self.max_bytes):
+        value = _coerce_asr_input(audio)
+        if self.max_bytes is not None and value.byte_count > self.max_bytes:
             raise ProviderFailure("oversized_or_empty_media", retryable=False)
-        data_url = "data:audio/wav;base64," + base64.b64encode(audio).decode("ascii")
+        data_url = "data:audio/wav;base64," + base64.b64encode(value.data).decode("ascii")
         request_kwargs: dict[str, Any] = {"max_response_bytes": 16 * 1024 * 1024}
         if timeout_seconds is not None:
             request_kwargs["timeout_seconds"] = timeout_seconds
@@ -1440,7 +1643,7 @@ class HermesAudioASRProvider(_HTTPProvider):
             raise ProviderFailure("malformed_response", retryable=False)
         outcome, text, provider_value = _asr_payload_details(payload)
         if outcome == "NO_SPEECH":
-            return AsrResult("NO_SPEECH", metadata={"mode": self.mode, "provider": _safe_provider_name(provider_value or payload.get("provider")), "hermes_profile": self.profile, "endpoint_contract": self.endpoint_contract, "input_sha256": sha256_bytes(audio), "content_type": "audio/wav", "byte_size": len(audio), "attempt_identity": f"{turn_id}:{generation}"})
+            return AsrResult("NO_SPEECH", metadata={"mode": self.mode, "provider": _safe_provider_name(provider_value or payload.get("provider")), "hermes_profile": self.profile, "endpoint_contract": self.endpoint_contract, "input_sha256": value.sha256, "content_type": "audio/wav", "byte_size": value.byte_count, "media_revision": "wav-pcm-s16le-16k-mono-v1", "attempt_identity": f"{turn_id}:{generation}"})
         assert text is not None
         normalized = text.strip()
         return AsrResult(
@@ -1451,10 +1654,11 @@ class HermesAudioASRProvider(_HTTPProvider):
                 "hermes_profile": self.profile,
                 "endpoint_contract": self.endpoint_contract,
                 "provider": _safe_provider_name(provider_value or payload.get("provider")),
-                "input_sha256": sha256_bytes(audio),
+                "input_sha256": value.sha256,
                 "output_sha256": sha256_bytes(normalized.encode("utf-8")),
                 "content_type": "audio/wav",
-                "byte_size": len(audio),
+                "byte_size": value.byte_count,
+                "media_revision": "wav-pcm-s16le-16k-mono-v1",
                 "attempt_identity": f"{turn_id}:{generation}",
             },
         )
@@ -1912,7 +2116,7 @@ class ProviderChain:
                         if isinstance(provider, _HTTPProvider):
                             result = getattr(provider, "transcribe")(value, turn_id=identifier, generation=request_generation, timeout_seconds=request_timeout)
                         else:
-                            result = provider.transcribe(value, turn_id=identifier, generation=request_generation)
+                            result = provider.transcribe(value.data if isinstance(value, ASRInput) else value, turn_id=identifier, generation=request_generation)
                     else:
                         if isinstance(provider, _HTTPProvider):
                             result = getattr(provider, "synthesize")(value, artifact_id=identifier, timeout_seconds=request_timeout)
@@ -1985,7 +2189,7 @@ class ProviderChain:
         retryable = bool(statuses) and all(item.get("status") == "retryable_failure" for item in statuses)
         raise ChainFailure(terminal_kind, statuses, retryable=retryable)
 
-    def execute_asr(self, audio: bytes, *, turn_id: str, frozen: Mapping[str, Any] | None = None) -> AsrResult:
+    def execute_asr(self, audio: ASRInput | bytes, *, turn_id: str, frozen: Mapping[str, Any] | None = None) -> AsrResult:
         return self._execute("asr", audio, turn_id, frozen=frozen)
 
     def execute_tts(self, text: str, *, artifact_id: str, frozen: Mapping[str, Any] | None = None) -> TTSResult:

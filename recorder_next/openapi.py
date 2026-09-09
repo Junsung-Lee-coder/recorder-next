@@ -220,7 +220,7 @@ def _add_owner_contract(document: dict) -> None:
     parameters.setdefault(
         "PrincipalUserHeader",
         {
-            "name": "X-Recorder-User-ID",
+            "name": "X-Recorder-Principal-User",
             "in": "header",
             "required": True,
             "description": "Authenticated Recorder owner identity.",
@@ -230,7 +230,7 @@ def _add_owner_contract(document: dict) -> None:
     parameters.setdefault(
         "PrincipalDeviceHeader",
         {
-            "name": "X-Recorder-Device-ID",
+            "name": "X-Recorder-Principal-Device",
             "in": "header",
             "required": True,
             "description": "Authenticated registered Recorder device identity.",
@@ -450,11 +450,13 @@ def _add_owner_contract(document: dict) -> None:
         },
     )
     query_owner_paths = {
+        "/v1/devices/register": {"post"},
         "/v1/turns/{turn_id}": {"get"},
         "/v1/turns/{turn_id}/parts/{part_id}/chunks/{sequence}": {"put", "post"},
         "/v1/turns/{turn_id}/parts/{part_id}/missing": {"get"},
         "/v1/turns/{turn_id}/parts/{part_id}/finish": {"post"},
         "/v1/turns/{turn_id}/archive": {"post"},
+        "/v1/turns/{turn_id}/events/{event_id}": {"post"},
         "/v1/outbox": {"get"},
         "/v1/tts/{artifact_id}": {"get"},
         "/v1/tts/{artifact_id}/bridge-read": {"get"},
@@ -541,6 +543,127 @@ def _add_security_contract(document: dict) -> None:
                 operation["security"] = [{"RecorderPrincipal": []}]
 
 
+def _add_runtime_aliases(document: dict) -> None:
+    """Document intentionally supported compatibility routes explicitly."""
+
+    paths = document.setdefault("paths", {})
+    paths.pop("/v1/eavesdrop/{session_id}/{action}", None)
+    paths.setdefault(
+        "/healthz",
+        {"get": {"operationId": "HealthAlias", "deprecated": True, "responses": {"200": {"description": "Readiness alias"}}}},
+    )
+    paths.setdefault(
+        "/v1/devices/register",
+        {
+            "post": {
+                "operationId": "DeviceConfirm",
+                "deprecated": True,
+                "requestBody": {
+                    "required": True,
+                    "content": {"application/json": {"schema": {"$ref": "#/components/schemas/DeviceRegister"}}},
+                },
+                "responses": {"201": {"description": "Confirmed device"}},
+            }
+        },
+    )
+    paths.setdefault(
+        "/v1/turns/{turn_id}/parts/{part_id}/chunks/{sequence}",
+        {},
+    ).setdefault(
+        "post",
+        {
+            "operationId": "ChunkUploadPost",
+            "deprecated": True,
+            "requestBody": {
+                "required": True,
+                "content": {"application/octet-stream": {"schema": {"$ref": "#/components/schemas/ChunkUpload"}}},
+            },
+            "responses": {"200": {"description": "Chunk receipt"}, "409": {"description": "Chunk conflict"}},
+        },
+    )
+    paths.setdefault(
+        "/v1/turns/{turn_id}/events/{event_id}",
+        {
+            "post": {
+                "operationId": "EventAckAlias",
+                "deprecated": True,
+                "requestBody": {
+                    "required": True,
+                    "content": {"application/json": {"schema": {"$ref": "#/components/schemas/EventAck"}}},
+                },
+                "responses": {"200": {"description": "Event ACK"}},
+            }
+        },
+    )
+    paths.setdefault(
+        "/v1/updates/{channel}/manifest.json",
+        {
+            "get": {
+                "operationId": "UpdateManifestJson",
+                "deprecated": True,
+                "responses": {"200": {"description": "Update manifest alias"}, "304": {"description": "ETag matched"}},
+            }
+        },
+    )
+
+
+def _schema_nullable_30(node: object) -> None:
+    """Convert JSON Schema union-null notation to valid OpenAPI 3.0.3."""
+
+    if isinstance(node, dict):
+        value = node.get("type")
+        if isinstance(value, list) and len(value) == 2 and "null" in value:
+            node["type"] = next(item for item in value if item != "null")
+            node["nullable"] = True
+        for child in node.values():
+            _schema_nullable_30(child)
+    elif isinstance(node, list):
+        for child in node:
+            _schema_nullable_30(child)
+
+
+def _add_executable_contract(document: dict) -> None:
+    """Give every operation a stable id and typed response/error content."""
+
+    components = document.setdefault("components", {}).setdefault("schemas", {})
+    components.setdefault("ApiResponse", {"type": "object", "additionalProperties": True})
+    components.setdefault("BinaryBody", {"type": "string", "format": "binary"})
+    components.setdefault("Error", {"type": "object", "additionalProperties": False, "properties": {"error": {"type": "object"}}})
+    seen_ids: set[str] = set()
+    for path, item in document.get("paths", {}).items():
+        if not isinstance(item, dict):
+            continue
+        for method, operation in item.items():
+            if method not in _OPENAPI_METHODS or not isinstance(operation, dict):
+                continue
+            raw_name = operation.get("operationId") or method + "_" + path
+            operation_id = re.sub(r"[^A-Za-z0-9]+", "_", str(raw_name)).strip("_") or "operation"
+            base_id = operation_id
+            suffix = 2
+            while operation_id in seen_ids:
+                operation_id = f"{base_id}_{suffix}"
+                suffix += 1
+            seen_ids.add(operation_id)
+            operation["operationId"] = operation_id
+            responses = operation.setdefault("responses", {})
+            for status, response in list(responses.items()):
+                if not isinstance(response, dict) or status in {"204", "304"} or "content" in response:
+                    continue
+                is_binary = path.startswith("/v1/updates/") and path.count("/") == 4 and method in {"get", "head"}
+                media_type = "application/octet-stream" if is_binary else "application/json"
+                ref = "#/components/schemas/BinaryBody" if is_binary else "#/components/schemas/ApiResponse"
+                response["content"] = {media_type: {"schema": {"$ref": ref}}}
+            for status in ("400", "401", "403", "404", "409", "413", "415", "416", "500"):
+                responses.setdefault(
+                    status,
+                    {
+                        "description": "Recorder API error",
+                        "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}},
+                    },
+                )
+    _schema_nullable_30(document)
+
+
 def validate_openapi_contract(document: dict | None = None) -> bool:
     """Validate resolved path parameters and the exact worker operation set."""
 
@@ -558,6 +681,7 @@ def validate_openapi_contract(document: dict | None = None) -> bool:
     }
     if not required_worker_paths.issubset(document["paths"]):
         raise ValueError("OpenAPI worker contract is incomplete")
+    operation_ids: set[str] = set()
     for path, item in document["paths"].items():
         variables = set(_PATH_VARIABLE.findall(path))
         declared: dict[str, int] = {}
@@ -573,6 +697,18 @@ def validate_openapi_contract(document: dict | None = None) -> bool:
         for operation_name, operation in item.items():
             if operation_name not in _OPENAPI_METHODS or not isinstance(operation, dict):
                 continue
+            operation_id = operation.get("operationId")
+            if not isinstance(operation_id, str) or not operation_id or operation_id in operation_ids:
+                raise ValueError(f"OpenAPI operationId is missing or duplicated: {path} {operation_name}")
+            operation_ids.add(operation_id)
+            responses = operation.get("responses")
+            if not isinstance(responses, dict) or not responses:
+                raise ValueError(f"OpenAPI operation responses are missing: {path} {operation_name}")
+            for status, response in responses.items():
+                if not isinstance(response, dict):
+                    raise ValueError(f"OpenAPI response is not an object: {path} {operation_name} {status}")
+                if status not in {"204", "304"} and "content" not in response:
+                    raise ValueError(f"OpenAPI response content is missing: {path} {operation_name} {status}")
             operation_parameters = operation.get("parameters", [])
             if not isinstance(operation_parameters, list):
                 raise ValueError(f"OpenAPI operation parameters must be a list: {path} {operation_name}")
@@ -589,5 +725,9 @@ def validate_openapi_contract(document: dict | None = None) -> bool:
 
 _add_path_parameters(OPENAPI)
 _add_owner_contract(OPENAPI)
+_add_runtime_aliases(OPENAPI)
+_add_path_parameters(OPENAPI)
+_add_owner_contract(OPENAPI)
 _add_security_contract(OPENAPI)
+_add_executable_contract(OPENAPI)
 validate_openapi_contract(OPENAPI)

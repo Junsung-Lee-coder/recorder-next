@@ -20,6 +20,7 @@ from recorder_next.models import AsrResult, HermesResult
 from recorder_next.service import RecorderService
 from recorder_next.store import RecorderStore
 from tests.test_feature_groups import complete_turn
+from tests.r25_test_helpers import canonical_wav
 
 
 class _Response(io.BytesIO):
@@ -76,14 +77,14 @@ class R23AdapterRepairTests(unittest.TestCase):
         for payload in payloads:
             with patch.object(adapters, "_urlopen_no_redirect", return_value=_Response(payload)):
                 with self.assertRaises(ProviderFailure) as caught:
-                    provider.transcribe(b"wav", turn_id="turn", generation=1)
+                    provider.transcribe(canonical_wav(), turn_id="turn", generation=1)
             self.assertIn(caught.exception.kind, {"provider_error", "malformed_success"})
 
     def test_hermes_asr_failure_status_is_rejected_without_an_outcome(self):
         provider = adapters.HermesAudioASRProvider("https://fixture.invalid", credential_file=None)
         with patch.object(adapters, "_urlopen_no_redirect", return_value=_Response({"result": {"status": "failed", "text": "diagnostic"}})):
             with self.assertRaises(ProviderFailure):
-                provider.transcribe(b"wav", turn_id="turn", generation=1)
+                provider.transcribe(canonical_wav(), turn_id="turn", generation=1)
 
     def test_tts_reserved_options_are_rejected(self):
         with self.assertRaises(ValueError):
@@ -112,7 +113,7 @@ class R23AdapterRepairTests(unittest.TestCase):
 
         with patch.object(adapters, "_urlopen_no_redirect", side_effect=transport):
             with self.assertRaises(adapters.ChainFailure) as caught:
-                chain.execute_asr(b"audio", turn_id="turn")
+                chain.execute_asr(canonical_wav(), turn_id="turn")
         self.assertLessEqual(seen[0], 0.05)
         self.assertEqual(caught.exception.kind, "deadline")
 
@@ -255,7 +256,7 @@ class R23FeatureBoundaryTests(unittest.TestCase):
             store.register_device("u", "phone", "phone")
             store.record_diagnostics_opt_in("u", "phone", event_id="opt")
             for index in range(501):
-                store.ingest_diagnostic_event("u", "phone", event_id=f"ev-{index}", idempotency_key=f"key-{index}", payload={"category": "fixture", "stage": "test"})
+                store.ingest_diagnostic_event("u", "phone", event_id=f"ev-{index}", idempotency_key=f"key-{index}", payload={"category": "other", "stage": "other"})
             exported = store.export_diagnostics("u", "phone", limit=100)
             all_items = list(exported["items"])
             pages = 1

@@ -763,7 +763,7 @@ class ScheduledFinalHTTPAndMigrationTests(unittest.TestCase):
             conn.close()
             store = RecorderStore(db, storage_root=root / "data")
             with store._read() as conn:
-                self.assertEqual(conn.execute("SELECT value FROM schema_meta WHERE key='schema_version'").fetchone()[0], "4")
+                self.assertEqual(conn.execute("SELECT value FROM schema_meta WHERE key='schema_version'").fetchone()[0], "5")
                 columns = {row[1] for row in conn.execute("PRAGMA table_info(turns)")}
                 self.assertTrue(
                     {

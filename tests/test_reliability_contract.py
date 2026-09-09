@@ -39,6 +39,31 @@ def setup_text_flow(tmp, *, user="u", turn_id="018f5a2e-7b6e-7abc-8d11-123456789
     return store, turn_id, project, submission_id
 
 
+def bind_hermes_result(store, submission_id, assistant_message_id, content):
+    ingress = store.get_ingress(submission_id)
+    binding = store.get_hermes_binding(submission_id)
+    if binding["run_id"] is None:
+        claim = store.claim_session_ingress(ingress["target_session_id"], "fixture-hermes", lease_seconds=600)
+        assert claim is not None
+        binding = store.bind_hermes_run(
+            submission_id,
+            f"fixture-run-{assistant_message_id}",
+            owner="fixture-hermes",
+            lease_token=claim["lease_token"],
+        )
+    return HermesResult(
+        assistant_message_id,
+        content,
+        submission_id=submission_id,
+        turn_id=ingress["turn_id"],
+        marker=binding["marker"],
+        session_key=binding["gateway_session_key"],
+        run_id=binding["run_id"],
+        request_sha256=binding["canonical_request_sha256"],
+        subject_kind="turn",
+    )
+
+
 class RecoveryAndConcurrencyTests(unittest.TestCase):
     def test_restart_recovery_requeues_expired_router_and_ingress_leases(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -119,17 +144,17 @@ class GraceAndCASRegressionTests(unittest.TestCase):
     def test_late_result_can_rebuild_cumulative_payload_from_hermes_reference(self):
         with tempfile.TemporaryDirectory() as tmp:
             store, turn_id, _, submission_id = setup_text_flow(tmp, turn_id="018f5a2e-7b6e-7abc-8d11-1234567890d3")
-            first = store.commit_hermes_result(submission_id, HermesResult("assistant-1", "old body"))
+            first = store.commit_hermes_result(submission_id, bind_hermes_result(store, submission_id, "assistant-1", "old body"))
             final_v1 = [event for event in first["events"] if event["event_kind"] == "FINAL"][0]
             store.ack_event(turn_id, final_v1["event_id"], device_id="device-1", event_version=1, payload_sha256=final_v1["payload_sha256"])
-            rebuilt = store.commit_hermes_result(submission_id, HermesResult("assistant-2", "new body"), combined_content="old body\nnew body")
+            rebuilt = store.commit_hermes_result(submission_id, bind_hermes_result(store, submission_id, "assistant-2", "new body"), combined_content="old body\nnew body")
             self.assertEqual(rebuilt["final_content"], "old body\nnew body")
             self.assertEqual(rebuilt["final_event_version"], 2)
 
     def test_delivered_hermes_body_is_purged_but_reference_hashes_remain(self):
         with tempfile.TemporaryDirectory() as tmp:
             store, turn_id, _, submission_id = setup_text_flow(tmp, turn_id="018f5a2e-7b6e-7abc-8d11-1234567890cf")
-            store.commit_hermes_result(submission_id, HermesResult("assistant-1", "temporary body"))
+            store.commit_hermes_result(submission_id, bind_hermes_result(store, submission_id, "assistant-1", "temporary body"))
             final = [event for event in store.get_turn(turn_id)["events"] if event["event_kind"] == "FINAL"][0]
             store.ack_event(turn_id, final["event_id"], device_id="device-1", event_version=1, payload_sha256=final["payload_sha256"])
             with store._read() as conn:
@@ -167,19 +192,21 @@ class GraceAndCASRegressionTests(unittest.TestCase):
     def test_result_after_grace_expiry_is_ignored(self):
         with tempfile.TemporaryDirectory() as tmp:
             store, turn_id, _, submission_id = setup_text_flow(tmp, turn_id="018f5a2e-7b6e-7abc-8d11-1234567890c4")
+            late_result = bind_hermes_result(store, submission_id, "too-late", "late")
             failed = store.commit_hermes_error(submission_id, grace_seconds=1)
             self.assertEqual(failed["state"], "LATE_RESULT_GRACE")
             expired = store.expire_grace(turn_id, now="2999-01-01T00:00:00+00:00")
             self.assertEqual(expired["state"], "EXPIRED")
-            late = store.commit_hermes_result(submission_id, HermesResult("too-late", "late"))
+            late = store.commit_hermes_result(submission_id, late_result)
             self.assertEqual(late["final_event_version"], 1)
             self.assertEqual(late["state"], "EXPIRED")
 
     def test_acknowledging_old_hermes_error_does_not_regress_recovered_success(self):
         with tempfile.TemporaryDirectory() as tmp:
             store, turn_id, _, submission_id = setup_text_flow(tmp, turn_id="018f5a2e-7b6e-7abc-8d11-1234567890c5")
+            recovered_result = bind_hermes_result(store, submission_id, "late-success", "success")
             store.commit_hermes_error(submission_id, grace_seconds=600)
-            recovered = store.commit_hermes_result(submission_id, HermesResult("late-success", "success"))
+            recovered = store.commit_hermes_result(submission_id, recovered_result)
             self.assertEqual(recovered["final_outcome"], "success")
             error_event = [event for event in recovered["events"] if event["event_kind"] == "FINAL" and event["event_version"] == 1][0]
             after_ack = store.ack_event(turn_id, error_event["event_id"], device_id="device-1", event_version=1, payload_sha256=error_event["payload_sha256"])

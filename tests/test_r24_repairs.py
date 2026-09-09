@@ -13,6 +13,7 @@ from recorder_next.config import RecorderConfig
 from recorder_next.openapi import OPENAPI, validate_openapi_contract
 from recorder_next.service import RecorderService
 from recorder_next.store import RecorderStore
+from tests.r25_test_helpers import canonical_wav
 
 
 class R24HermesContractTests(unittest.TestCase):
@@ -27,7 +28,7 @@ class R24HermesContractTests(unittest.TestCase):
                 return "application/json", json.dumps({"ok": True, "transcript": "hello"}).encode()
 
         provider = ProbeProvider()
-        audio = b"RIFFfixture"
+        audio = canonical_wav()
         result = provider.transcribe(audio, turn_id="turn-1", generation=2)
 
         self.assertEqual(result.transcript, "hello")
@@ -254,7 +255,6 @@ class R24HermesContractTests(unittest.TestCase):
             self.assertEqual(ingress["payload"]["request"]["input"], "hello")
 
             document = b"pdf"
-            document_project = store.create_project("user-1", project_number="P-2", name="Document project")
             document_id = "018f5a2e-7b6e-7abc-8d11-1234567890ac"
             document_manifest = {
                 **text_manifest,
@@ -262,17 +262,10 @@ class R24HermesContractTests(unittest.TestCase):
                 "current_project_number": "P-2",
                 "parts": [{"part_id": "document-1", "kind": "attachment", "mime": "application/pdf", "declared_bytes": len(document), "declared_sha256": hashlib.sha256(document).hexdigest()}],
             }
-            store.create_turn(document_manifest)
-            store.put_chunk(document_id, "document-1", 0, document)
-            store.finish_part(document_id, "document-1", total_chunks=1, total_bytes=len(document), whole_stream_sha256=hashlib.sha256(document).hexdigest())
-            store.accept_turn(document_id)
-            routed_document = service.route_next("user-1")
-            self.assertEqual(routed_document["state"], "HERMES_PENDING")
-            rejected = service.process_next_hermes(document_project["stable_project_id"])
-            self.assertEqual(rejected["state"], "FINAL_READY")
-            self.assertEqual(rejected["final_outcome"], "error")
-            self.assertEqual(rejected["final_error_kind"], "hermes")
-            self.assertIn("첨부 파일 형식", rejected["final_content"])
+            with self.assertRaises(Exception):
+                store.create_turn(document_manifest)
+            with store._read() as conn:
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM turns WHERE turn_id=?", (document_id,)).fetchone()[0], 0)
             self.assertEqual(gateway.calls, [])
 
     def test_isolated_audio_readiness_rejects_disabled_stt_capability(self):
@@ -415,9 +408,11 @@ class R24DiagnosticsAndOpenAPITests(unittest.TestCase):
 
     def test_diagnostics_export_is_count_bounded_cursorable_and_tombstones_expire(self):
         with tempfile.TemporaryDirectory() as tmp:
+            current_time = ["2026-09-09T00:00:00+00:00"]
             store = RecorderStore(
                 Path(tmp) / "state.sqlite3",
                 storage_root=Path(tmp) / "data",
+                clock=lambda: current_time[0],
                 diagnostics_retention_seconds=1,
                 diagnostics_tombstone_retention_seconds=1,
             )
@@ -432,8 +427,8 @@ class R24DiagnosticsAndOpenAPITests(unittest.TestCase):
                     "phone-1",
                     event_id=event_id,
                     idempotency_key=f"diag-{index}",
-                    payload={"category": "voice", "stage": f"stage-{index}", "index": index},
-                    now="2026-09-09T00:00:00+00:00",
+                    payload={"category": "voice", "stage": "other", "index": index},
+                    now=current_time[0],
                 )
 
             first = store.export_diagnostics("user-1", "phone-1", limit=2, max_bytes=100_000)
@@ -450,12 +445,14 @@ class R24DiagnosticsAndOpenAPITests(unittest.TestCase):
             self.assertEqual(len(second["items"]), 2)
             self.assertFalse({item["event_id"] for item in first["items"]} & {item["event_id"] for item in second["items"]})
 
-            deleted = store.delete_diagnostics("user-1", "phone-1", now="2026-09-09T00:00:01+00:00")
+            deleted = store.delete_diagnostics("user-1", "phone-1", now="2026-09-09T00:00:00.500+00:00")
             self.assertEqual(deleted["tombstones"], 4)
+            current_time[0] = "2026-09-09T00:00:01+00:00"
             export_with_tombstones = store.export_diagnostics("user-1", "phone-1", limit=10, max_bytes=100_000)
             self.assertEqual(len(export_with_tombstones["tombstones"]), 4)
             purged = store.purge_diagnostics(now="2026-09-09T00:00:03+00:00")
             self.assertEqual(purged["tombstones"], 4)
+            current_time[0] = "2026-09-09T00:00:03+00:00"
             self.assertEqual(store.export_diagnostics("user-1", "phone-1", limit=10, max_bytes=100_000)["tombstones"], [])
             self.assertEqual(consent["device_id"], "phone-1")
 

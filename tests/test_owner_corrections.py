@@ -10,9 +10,11 @@ from pathlib import Path
 from recorder_next.adapters import ChainFailure, HermesAudioASRProvider, HttpASRProvider, HttpHermesGateway, MemoryHermesGateway, ProviderChain, ProviderFailure, ProviderTarget, StaticASRProvider, StaticTTSProvider
 from recorder_next.config import ProviderConfig, RecorderConfig
 from recorder_next.errors import ConflictError, UnauthorizedError, ValidationError
+from recorder_next.ingress_contract import UnsupportedManifestMediaError
 from recorder_next.models import AsrResult, HermesResult, TTSResult
 from recorder_next.service import RecorderService
 from recorder_next.store import RecorderStore
+from tests.r25_test_helpers import canonical_wav
 
 
 class OwnerCorrectionTests(unittest.TestCase):
@@ -48,7 +50,7 @@ class OwnerCorrectionTests(unittest.TestCase):
                 columns = {row["name"] for row in read_conn.execute("PRAGMA table_info(eavesdrop_decisions)")}
                 version = read_conn.execute("SELECT value FROM schema_meta WHERE key='schema_version'").fetchone()[0]
             self.assertTrue({"policy_version", "covered_start_sequence", "covered_end_sequence", "dedupe_key", "result_state", "effect_receipt_json"}.issubset(columns))
-            self.assertEqual(version, "4")
+            self.assertEqual(version, "5")
 
     def test_config_defaults_to_declared_hermes_and_does_not_auto_discover_targets(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -292,7 +294,7 @@ voice = "ko-KR-SunHiNeural"
             store = RecorderStore(root / "db.sqlite3", storage_root=root / "data")
             store.register_device("user", "phone", "phone")
             store.create_project("user", project_number="P-1", name="Project")
-            audio = b"wav-bytes"
+            audio = canonical_wav()
             turn_id = "018f5a2e-7b6e-7abc-8d11-1234567890ae"
             manifest = {
                 "schema_version": 1,
@@ -392,7 +394,7 @@ voice = "ko-KR-SunHiNeural"
             def _request(self, payload, *, max_response_bytes=None):
                 return "application/json", json.dumps({"result": {"text": "ok", "provider": "nested"}}).encode("utf-8")
 
-        result = ProbeHermesASR("http://127.0.0.1:8642", credential_file=None).transcribe(b"audio", turn_id="turn", generation=1)
+        result = ProbeHermesASR("http://127.0.0.1:8642", credential_file=None).transcribe(canonical_wav(), turn_id="turn", generation=1)
         self.assertEqual(result.metadata["provider"], "nested")
 
     def test_attachment_reference_rejects_unbound_query_parameters(self):
@@ -415,12 +417,8 @@ voice = "ko-KR-SunHiNeural"
                     "declared_sha256": hashlib.sha256(payload).hexdigest(),
                 }],
             }
-            store.create_turn(manifest)
-            store.put_chunk(turn_id, "document-1", 0, payload)
-            store.finish_part(turn_id, "document-1", total_chunks=1, total_bytes=len(payload), whole_stream_sha256=hashlib.sha256(payload).hexdigest())
-            reference = store.attachment_reference(turn_id, "document-1")
-            with self.assertRaises(UnauthorizedError):
-                store.resolve_attachment_reference(reference + "&extra=1")
+            with self.assertRaises(UnsupportedManifestMediaError):
+                store.create_turn(manifest)
 
     def test_update_manifest_hash_binds_channel_and_generation(self):
         with tempfile.TemporaryDirectory() as tmp:

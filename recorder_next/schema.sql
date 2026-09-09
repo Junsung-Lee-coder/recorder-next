@@ -88,6 +88,7 @@ CREATE TABLE IF NOT EXISTS turn_parts (
     duration_ms INTEGER,
     status TEXT NOT NULL DEFAULT 'RECEIVING',
     source_path TEXT,
+    source_deleted_at TEXT,
     archived_at TEXT,
     PRIMARY KEY(turn_id, part_id),
     FOREIGN KEY(turn_id) REFERENCES turns(turn_id) ON DELETE CASCADE
@@ -203,11 +204,37 @@ CREATE TABLE IF NOT EXISTS session_ingress (
     lease_token TEXT,
     lease_expires_at TEXT,
     attempt_count INTEGER NOT NULL DEFAULT 0,
+    run_id TEXT,
+    wire_revision TEXT NOT NULL DEFAULT 'hermes-runs-v1',
+    gateway_identity TEXT NOT NULL DEFAULT 'default',
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     FOREIGN KEY(turn_id) REFERENCES turns(turn_id) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS idx_ingress_order ON session_ingress(target_session_id, status, accepted_seq);
+
+CREATE TABLE IF NOT EXISTS hermes_run_bindings (
+    submission_id TEXT PRIMARY KEY,
+    subject_kind TEXT NOT NULL CHECK(subject_kind IN ('turn','eavesdrop')),
+    turn_id TEXT,
+    eavesdrop_session_id TEXT,
+    segment_sequence INTEGER,
+    segment_sha256 TEXT,
+    marker TEXT NOT NULL,
+    gateway_session_key TEXT NOT NULL,
+    gateway_identity TEXT NOT NULL,
+    canonical_request_sha256 TEXT NOT NULL,
+    wire_revision TEXT NOT NULL,
+    request_json TEXT NOT NULL,
+    run_id TEXT,
+    created_at TEXT NOT NULL,
+    bound_at TEXT,
+    CHECK ((subject_kind='turn' AND turn_id IS NOT NULL AND eavesdrop_session_id IS NULL AND segment_sequence IS NULL AND segment_sha256 IS NULL) OR
+           (subject_kind='eavesdrop' AND turn_id IS NULL AND eavesdrop_session_id IS NOT NULL AND segment_sequence IS NOT NULL AND segment_sha256 IS NOT NULL)),
+    UNIQUE(gateway_identity, run_id),
+    FOREIGN KEY(turn_id) REFERENCES turns(turn_id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_hermes_binding_subject ON hermes_run_bindings(subject_kind, turn_id, eavesdrop_session_id, segment_sequence);
 
 CREATE TABLE IF NOT EXISTS hermes_results (
     result_id TEXT PRIMARY KEY,
@@ -400,6 +427,7 @@ CREATE TABLE IF NOT EXISTS worker_attempts (
     job_id TEXT NOT NULL,
     attempt_number INTEGER NOT NULL,
     owner TEXT NOT NULL,
+    lease_token TEXT,
     stage TEXT NOT NULL,
     started_at TEXT NOT NULL,
     finished_at TEXT,
@@ -495,6 +523,7 @@ CREATE TABLE IF NOT EXISTS diagnostics_consents (
     user_id TEXT NOT NULL,
     device_id TEXT NOT NULL,
     event_id TEXT PRIMARY KEY,
+    alias_digest TEXT,
     enabled INTEGER NOT NULL,
     created_at TEXT NOT NULL,
     expires_at TEXT,
@@ -504,7 +533,8 @@ CREATE INDEX IF NOT EXISTS idx_diagnostics_consents_owner ON diagnostics_consent
 
 CREATE TABLE IF NOT EXISTS diagnostic_events (
     event_id TEXT PRIMARY KEY,
-    idempotency_key TEXT NOT NULL UNIQUE,
+    idempotency_key TEXT NOT NULL,
+    alias_digest TEXT,
     user_id TEXT NOT NULL,
     device_id TEXT NOT NULL,
     category TEXT NOT NULL,
@@ -512,12 +542,16 @@ CREATE TABLE IF NOT EXISTS diagnostic_events (
     metadata_json TEXT NOT NULL,
     occurred_at TEXT NOT NULL,
     retention_deadline TEXT NOT NULL,
-    deleted_at TEXT
+    deleted_at TEXT,
+    privacy_version INTEGER NOT NULL DEFAULT 2,
+    migration_state TEXT NOT NULL DEFAULT 'READY',
+    UNIQUE(user_id, device_id, idempotency_key)
 );
 CREATE INDEX IF NOT EXISTS idx_diagnostic_events_owner ON diagnostic_events(user_id, device_id, occurred_at);
 
 CREATE TABLE IF NOT EXISTS diagnostic_bundles (
     bundle_id TEXT PRIMARY KEY,
+    alias_digest TEXT,
     user_id TEXT NOT NULL,
     device_id TEXT NOT NULL,
     opt_in_event_id TEXT NOT NULL,
@@ -528,7 +562,8 @@ CREATE TABLE IF NOT EXISTS diagnostic_bundles (
     created_at TEXT NOT NULL,
     retention_deadline TEXT NOT NULL,
     deleted_at TEXT,
-    UNIQUE(user_id, device_id, payload_sha256),
+    privacy_version INTEGER NOT NULL DEFAULT 2,
+    migration_state TEXT NOT NULL DEFAULT 'READY',
     FOREIGN KEY(opt_in_event_id) REFERENCES diagnostics_consents(event_id) ON DELETE RESTRICT
 );
 CREATE INDEX IF NOT EXISTS idx_diagnostic_bundles_owner ON diagnostic_bundles(user_id, device_id, created_at);
@@ -561,6 +596,7 @@ CREATE TABLE IF NOT EXISTS diagnostic_tombstones (
     entity_type TEXT NOT NULL CHECK(entity_type IN ('event','bundle')),
     entity_id TEXT NOT NULL,
     deleted_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
     UNIQUE(entity_type, entity_id)
 );
 
@@ -587,4 +623,4 @@ CREATE INDEX IF NOT EXISTS idx_storage_cleanup_receipts_pending
 CREATE INDEX IF NOT EXISTS idx_storage_cleanup_receipts_owner
     ON storage_cleanup_receipts(user_id, device_id, status);
 
-INSERT OR IGNORE INTO schema_meta(key, value) VALUES ('schema_version', '4');
+INSERT OR IGNORE INTO schema_meta(key, value) VALUES ('schema_version', '5');

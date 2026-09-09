@@ -4,6 +4,7 @@ import base64
 import binascii
 import hashlib
 import hmac
+import inspect
 import json
 import math
 import os
@@ -11,9 +12,9 @@ import sqlite3
 import threading
 import time
 import uuid
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from typing import Any, Mapping, Sequence
-from urllib.parse import parse_qs, unquote, urlsplit
+from urllib.parse import parse_qsl, unquote, urlsplit
 
 from .adapters import (
     ASRProvider,
@@ -37,10 +38,15 @@ from .adapters import (
     TTSProvider,
     WhisperASRProvider,
 )
+from .api_models import WORKER_CLAIM, WORKER_COMPLETE, WORKER_FAIL, WORKER_RECOVER, WORKER_RUN
 from .canonical import hermes_content_hash, normalize_hermes_text
 from .config import RecorderConfig
-from .errors import LeaseConflict, NotFoundError, RecorderError, UnauthorizedError, UnsupportedMediaType, ValidationError
+from .errors import ForbiddenError, GatewayRequestTooLargeError, LeaseConflict, NotFoundError, RecorderError, UnauthorizedError, UnsupportedMediaType, ValidationError
 from .features import DurableWorker
+from .hermes_wire import GatewayRequestTooLarge, SubmissionContext, WirePolicy, estimate_run_body_upper_bound, serialize_json
+from .http_contract import match_operation
+from .ingress_contract import strict_json_loads
+from .media import MediaValidationError, validate_wav
 from .models import AsrResult, HermesResult, RouterDecision, TTSResult
 from .store import DEFAULT_MISSING_PAGE_SIZE, MAX_MISSING_PAGE_SIZE, FINAL_ERROR_MESSAGES, RecorderStore
 
@@ -67,6 +73,8 @@ class RecorderService:
         hermes_max_attempts: int = 2,
         hermes_grace_seconds: int = 30,
         ingress_secret: str | None = None,
+        internal_worker_principals: Sequence[tuple[str, str]] = (),
+        gateway_max_request_bytes: int = 10_000_000,
     ):
         self.store = store
         self.router = router or DeterministicRouter()
@@ -88,6 +96,8 @@ class RecorderService:
         self.hermes_grace_seconds = max(0, hermes_grace_seconds)
         configured_ingress_secret = ingress_secret if ingress_secret is not None else os.environ.get("RECORDER_INGRESS_SECRET")
         self._ingress_secret = configured_ingress_secret if isinstance(configured_ingress_secret, str) and configured_ingress_secret else None
+        self._internal_worker_principals = frozenset((str(user), str(device)) for user, device in internal_worker_principals)
+        self._wire_policy = WirePolicy(gateway_max_request_bytes=gateway_max_request_bytes)
         self._lock = threading.RLock()
         self._background_stop: threading.Event | None = None
         self._background_threads: list[threading.Thread] = []
@@ -311,76 +321,60 @@ class RecorderService:
         if not conversation:
             self.store.mark_eavesdrop_decision(session_id, segment_sequence, result_state="NO_SPEECH", reason="conversation_has_no_transcript", now=effective_now, worker_claim=worker_claim)
             return {"session_id": session_id, "segment_sequence": segment_sequence, "state": "NO_SPEECH"}
-        request = {"input": conversation}
-        result: HermesResult | None = None
         try:
-            result = self.hermes.submit(
-                session_key=str(decision["gateway_session_key"]),
-                request=request,
-                submission_id=str(decision["hermes_submission_id"]),
-                marker=f"eavesdrop:default:{session_id}:{segment_sequence}",
-            )
-        except Exception:
-            result = None
-        if result is None:
-            try:
-                result = self.hermes.history(session_key=str(decision["gateway_session_key"]), marker=f"eavesdrop:default:{session_id}:{segment_sequence}")
-            except Exception:
-                result = None
-        if result is None:
-            raise ProviderFailure("transport", retryable=True)
-        if not result.terminal or not isinstance(result.content, str) or not result.content.strip():
-            raise ProviderFailure("malformed_response", retryable=False)
-        # The remote call can outlive the session and worker deadline.  Read
-        # both authorities again before recording a reply or publishing
-        # DELIVERED, rather than treating the initial snapshot as a lease.
-        session = self.store.get_eavesdrop_session(session_id, now=effective_now)
-        self._assert_worker_effect(worker_claim, stage="hermes", now=effective_now)
-        if session.get("state") != "ACTIVE":
-            reason = "session_expired" if session.get("state") == "EXPIRED" else "session_inactive"
-            failed = self.store.mark_eavesdrop_decision(
-                session_id,
-                segment_sequence,
-                result_state="FAILED",
-                reason=reason,
-                now=effective_now,
+            context = self.store.submission_context(str(decision["hermes_submission_id"]))
+            if context.subject_kind != "eavesdrop" or context.eavesdrop_session_id != session_id or context.segment_sequence != segment_sequence or context.segment_sha256 != segment.get("sha256"):
+                raise ValidationError("eavesdrop submission binding does not match the segment")
+            result = self._submit_hermes(
+                context=context,
+                payload=context.request,
                 worker_claim=worker_claim,
             )
-            return {"session_id": session_id, "segment_sequence": segment_sequence, "state": failed.get("result_state", "FAILED"), "outcome": failed.get("decision"), "reason": failed.get("reason")}
-        reply = None
-        if session.get("response_enabled") and result.content:
-            reply = self.store.record_eavesdrop_reply(session_id, segment_sequence=segment_sequence, text=result.content, now=effective_now, worker_claim=worker_claim)
-        effect_receipt: dict[str, Any] = {
-            "submission_id": decision["hermes_submission_id"],
+            # The run-acceptance callback binds the returned run ID in a
+            # separate transaction.  Re-read the immutable context before
+            # validating the terminal envelope so eavesdrop forwarding does
+            # not compare it with the pre-submit ``run_id=None`` snapshot.
+            context = self.store.submission_context(context.submission_id)
+        except ValidationError:
+            raise
+        except Exception as exc:
+            raise ProviderFailure("transport", retryable=True) from exc
+        result = self._valid_terminal_hermes_result(
+            result,
+            expected={
+                "submission_id": context.submission_id,
+                "marker": context.marker,
+                "session_key": context.gateway_session_key,
+                "run_id": context.run_id,
+                "request_sha256": context.canonical_request_sha256,
+                "subject_kind": "eavesdrop",
+                "eavesdrop_session_id": session_id,
+                "segment_sequence": segment_sequence,
+                "segment_sha256": segment.get("sha256"),
+            },
+        )
+        if result is None:
+            raise ProviderFailure("malformed_response", retryable=False)
+        delivered = self.store.commit_eavesdrop_result(
+            context.submission_id,
+            result,
+            worker_claim=worker_claim,
+            now=effective_now,
+        )
+        receipt = delivered.get("effect_receipt_json") or {}
+        return {
             "session_id": session_id,
             "segment_sequence": segment_sequence,
-            "segment_sha256": segment.get("sha256"),
-            "gateway_profile": "default",
-            "input_sha256": hashlib.sha256(conversation.encode("utf-8")).hexdigest(),
+            "state": "DELIVERED",
+            "reply_id": receipt.get("reply_id") if isinstance(receipt, Mapping) else None,
             "content_hash": hermes_content_hash(result.content),
-            "assistant_message_id": result.assistant_message_id,
-            "provider": result.source,
         }
-        if reply is not None:
-            effect_receipt["reply_id"] = reply["reply_id"]
-        self.store.mark_eavesdrop_decision(
-            session_id,
-            segment_sequence,
-            result_state="DELIVERED",
-            reason="hermes_response_available",
-            effect_receipt=effect_receipt,
-            now=effective_now,
-            worker_claim=worker_claim,
-        )
-        return {"session_id": session_id, "segment_sequence": segment_sequence, "state": "DELIVERED", "reply_id": reply.get("reply_id") if reply else None, "content_hash": hermes_content_hash(result.content)}
 
     @staticmethod
     def _valid_terminal_hermes_result(
         result: Any,
         *,
-        submission_id: str | None = None,
-        turn_id: str | None = None,
-        marker: str | None = None,
+        expected: Mapping[str, Any],
     ) -> HermesResult | None:
         if not isinstance(result, HermesResult):
             return None
@@ -388,13 +382,117 @@ class RecorderService:
             return None
         if not isinstance(result.source, str) or not result.source.startswith("hermes"):
             return None
-        if result.submission_id is not None and result.submission_id != submission_id:
+        required = ("submission_id", "marker", "session_key", "run_id", "request_sha256", "subject_kind")
+        if any(key not in expected or not isinstance(expected[key], str) or not expected[key] for key in required):
             return None
-        if result.turn_id is not None and result.turn_id != turn_id:
+        if expected["subject_kind"] == "turn":
+            if not isinstance(expected.get("turn_id"), str) or not expected["turn_id"]:
+                return None
+            required = (*required, "turn_id")
+        elif expected["subject_kind"] == "eavesdrop":
+            if not isinstance(expected.get("eavesdrop_session_id"), str) or not expected["eavesdrop_session_id"] or not isinstance(expected.get("segment_sequence"), int) or isinstance(expected["segment_sequence"], bool) or expected["segment_sequence"] < 0 or not isinstance(expected.get("segment_sha256"), str) or not expected["segment_sha256"]:
+                return None
+            required = (*required, "eavesdrop_session_id", "segment_sequence", "segment_sha256")
+        else:
             return None
-        if result.marker is not None and result.marker != marker:
+        if any(getattr(result, key, None) != expected[key] for key in required):
             return None
         return result
+
+    def _submit_hermes(
+        self,
+        *,
+        context: SubmissionContext,
+        payload: Mapping[str, Any],
+        owner: str | None = None,
+        lease_token: str | None = None,
+        worker_claim: Mapping[str, Any] | None = None,
+    ) -> HermesResult | None:
+        """Submit through the durable run-binding callback, with old-fixture compatibility."""
+        submit = self.hermes.submit
+        parameters = inspect.signature(submit).parameters
+
+        def bind(run_id: str) -> bool:
+            binding_now = worker_claim.get("_worker_now") if isinstance(worker_claim, Mapping) else None
+            if context.subject_kind == "turn":
+                self.store.bind_hermes_run(
+                    context.submission_id,
+                    run_id,
+                    owner=owner,
+                    lease_token=lease_token,
+                    worker_claim=worker_claim,
+                    now=binding_now if isinstance(binding_now, str) else None,
+                )
+            else:
+                self.store.bind_hermes_run(
+                    context.submission_id,
+                    run_id,
+                    worker_claim=worker_claim,
+                    now=binding_now if isinstance(binding_now, str) else None,
+                )
+            return True
+
+        def project_bound_result(result: Any) -> Any:
+            """Attach only the run identity proven by the durable callback.
+
+            Some in-process/test gateways return the terminal content without
+            copying the callback context onto their result envelope.  The
+            callback has already committed the run binding, so filling only
+            absent identity fields is safe; a non-empty conflicting field is
+            preserved and will fail the strict validator below.
+            """
+            if not isinstance(result, HermesResult):
+                return result
+            bound = self.store.submission_context(context.submission_id)
+            expected = {
+                "submission_id": bound.submission_id,
+                "turn_id": bound.turn_id,
+                "marker": bound.marker,
+                "session_key": bound.gateway_session_key,
+                "run_id": bound.run_id,
+                "request_sha256": bound.canonical_request_sha256,
+                "subject_kind": bound.subject_kind,
+                "eavesdrop_session_id": bound.eavesdrop_session_id,
+                "segment_sequence": bound.segment_sequence,
+                "segment_sha256": bound.segment_sha256,
+            }
+            for field, value in expected.items():
+                if getattr(result, field, None) is not None and getattr(result, field) != value:
+                    return result
+            return replace(result, **expected)
+
+        kwargs = {
+            "session_key": context.gateway_session_key,
+            "request": payload,
+            "submission_id": context.submission_id,
+            "marker": context.marker,
+        }
+        if "context" in parameters:
+            result = submit(**kwargs, context=context, on_run_accepted=bind)
+            return project_bound_result(result) if result is not None else None
+        if getattr(self.hermes, "durable_correlation", False):
+            raise ValidationError("Hermes adapter does not expose the R25 run-binding contract")
+        result = submit(**kwargs)
+        if result is None:
+            return None
+        run_id = result.run_id or f"legacy:{context.submission_id}"
+        bind(run_id)
+        return HermesResult(
+            result.assistant_message_id,
+            result.content,
+            result.terminal,
+            result.source,
+            submission_id=context.submission_id,
+            turn_id=context.turn_id,
+            marker=context.marker,
+            session_key=context.gateway_session_key,
+            run_id=run_id,
+            request_sha256=context.canonical_request_sha256,
+            subject_kind=context.subject_kind,
+            eavesdrop_session_id=context.eavesdrop_session_id,
+            segment_sequence=context.segment_sequence,
+            segment_sha256=context.segment_sha256,
+        )
 
     def process_next_hermes(
         self,
@@ -440,6 +538,26 @@ class RecorderService:
                 worker_claim=worker_claim,
             )
             raise ValidationError("Hermes ingress payload turn binding is invalid")
+        try:
+            context = self.store.submission_context(ingress["hermes_submission_id"])
+        except Exception as exc:
+            self.store.release_session_ingress(
+                ingress["hermes_submission_id"],
+                owner=owner,
+                lease_token=ingress["lease_token"],
+                now=effective_now,
+                worker_claim=worker_claim,
+            )
+            raise ValidationError("Hermes submission binding is unavailable") from exc
+        if context.turn_id != ingress["turn_id"] or context.gateway_session_key != ingress["gateway_session_key"]:
+            self.store.release_session_ingress(
+                ingress["hermes_submission_id"],
+                owner=owner,
+                lease_token=ingress["lease_token"],
+                now=effective_now,
+                worker_claim=worker_claim,
+            )
+            raise ValidationError("Hermes submission binding does not match ingress")
         def call_with_ingress_lease(callback: Any) -> Any:
             stop = threading.Event()
             lost = threading.Event()
@@ -473,13 +591,22 @@ class RecorderService:
         try:
             def submit_hermes() -> Any:
                 self._validate_hermes_projection(payload)
-                return self.hermes.submit(
-                    session_key=ingress["gateway_session_key"],
-                    request=payload,
-                    submission_id=ingress["hermes_submission_id"],
-                    marker=ingress["marker"],
+                return self._submit_hermes(
+                    context=context,
+                    payload=payload,
+                    owner=owner,
+                    lease_token=ingress["lease_token"],
                 )
             result = call_with_ingress_lease(submit_hermes)
+            if result is not None:
+                # The run-binding callback commits the authoritative run ID in
+                # its own transaction.  The claimed ingress snapshot above is
+                # intentionally pre-submit state, so refresh it before
+                # validating the result; otherwise an accepted legacy/memory
+                # adapter response is compared with a stale ``run_id=None``
+                # and is incorrectly left pending.
+                bound_ingress = self.store.get_ingress(ingress["hermes_submission_id"])
+                ingress = {**ingress, **bound_ingress}
         except ValueError:
             failed = self.store.commit_hermes_error(
                 ingress["hermes_submission_id"],
@@ -494,16 +621,17 @@ class RecorderService:
             return failed
         except Exception:
             result = None
-        if result is None:
-            try:
-                result = call_with_ingress_lease(lambda: self.hermes.history(session_key=ingress["gateway_session_key"], marker=ingress["marker"]))
-            except Exception:
-                result = None
         result = self._valid_terminal_hermes_result(
             result,
-            submission_id=ingress["hermes_submission_id"],
-            turn_id=ingress["turn_id"],
-            marker=ingress["marker"],
+            expected={
+                "submission_id": ingress["hermes_submission_id"],
+                "turn_id": ingress["turn_id"],
+                "marker": ingress["marker"],
+                "session_key": ingress["gateway_session_key"],
+                "run_id": ingress.get("run_id") or ingress.get("hermes_run_id"),
+                "request_sha256": context.canonical_request_sha256,
+                "subject_kind": "turn",
+            },
         )
         if result is not None:
             self._assert_worker_effect(worker_claim, stage="hermes", turn_id=str(ingress["turn_id"]), now=effective_now)
@@ -541,17 +669,17 @@ class RecorderService:
         )
         return self.store.get_turn(ingress["turn_id"])
 
-    @staticmethod
-    def _validate_hermes_projection(payload: Mapping[str, Any]) -> None:
+    def _validate_hermes_projection(self, payload: Mapping[str, Any]) -> None:
         """Reject attachment shapes the downstream Hermes input contract cannot consume."""
         projected = payload.get("request") if isinstance(payload.get("request"), Mapping) else payload
         if not isinstance(projected, Mapping):
             raise ValueError("Hermes request projection must be an object")
         parts = projected.get("parts")
         if parts is None:
-            return
+            parts = []
         if not isinstance(parts, list):
             raise ValueError("Hermes request parts must be an array")
+        image_sizes: list[int] = []
         for part in parts:
             if not isinstance(part, Mapping):
                 raise ValueError("Hermes request part must be an object")
@@ -564,6 +692,16 @@ class RecorderService:
                 raise ValueError("unsupported Hermes attachment input")
             if part.get("status") != "COMPLETE":
                 raise ValueError("incomplete Hermes attachment input")
+            declared_bytes = part.get("declared_bytes", part.get("total_bytes"))
+            if not isinstance(declared_bytes, int) or isinstance(declared_bytes, bool) or declared_bytes < 0 or declared_bytes > 8 * 1024 * 1024:
+                raise ValueError("Hermes image exceeds the configured attachment limit")
+            image_sizes.append(declared_bytes)
+        estimate = estimate_run_body_upper_bound(
+            {"input": projected.get("input") or projected.get("text") or "", "parts": parts},
+            image_declared_bytes=image_sizes,
+        )
+        if estimate > self._wire_policy.gateway_max_request_bytes:
+            raise GatewayRequestTooLarge("Hermes request exceeds the configured Gateway limit")
 
     def _requery_combined_content(self, ingress: Mapping[str, Any], result: HermesResult) -> str | None:
         turn = self.store.get_turn(ingress["turn_id"])
@@ -585,9 +723,15 @@ class RecorderService:
         for item in list(messages or []) + [result]:
             terminal = self._valid_terminal_hermes_result(
                 item,
-                submission_id=ingress["hermes_submission_id"],
-                turn_id=ingress["turn_id"],
-                marker=ingress["marker"],
+                expected={
+                    "submission_id": ingress["hermes_submission_id"],
+                    "turn_id": ingress["turn_id"],
+                    "marker": ingress["marker"],
+                    "session_key": ingress["gateway_session_key"],
+                    "run_id": ingress.get("run_id") or ingress.get("hermes_run_id"),
+                    "request_sha256": ingress["payload_sha256"],
+                    "subject_kind": "turn",
+                },
             )
             if terminal is None:
                 continue
@@ -624,6 +768,45 @@ class RecorderService:
         claimed_now = worker_claim.get("_worker_now")
         return claimed_now if isinstance(claimed_now, str) and claimed_now else None
 
+    def _commit_unsupported_audio(
+        self,
+        turn: Mapping[str, Any],
+        *,
+        worker_claim: Mapping[str, Any] | None = None,
+        detail: str | None = None,
+    ) -> dict[str, Any]:
+        del detail
+        turn_id = str(turn["turn_id"])
+        generation = int(turn["asr_generation"])
+        self._assert_worker_effect(worker_claim, stage="asr", turn_id=turn_id)
+        next_generation = self.store.set_asr_stage(
+            turn_id,
+            expected_generation=generation,
+            stage="media-validation",
+            worker_claim=worker_claim,
+        )
+        if next_generation is None:
+            return self.store.get_turn(turn_id)
+        result = AsrResult(
+            "PROVIDER_ERROR",
+            detail="unsupported_media",
+            metadata={
+                "error_kind": "unsupported_media",
+                "media_revision": "wav-pcm-s16le-16k-mono-v1",
+            },
+        )
+        self.store.commit_asr_result(
+            turn_id,
+            expected_generation=next_generation,
+            stage="media-validation",
+            result=result,
+            authoritative=True,
+            worker_claim=worker_claim,
+        )
+        self._assert_worker_effect(worker_claim, stage="asr", turn_id=turn_id)
+        self.store.commit_protocol_error(turn_id, "asr", message=FINAL_ERROR_MESSAGES["asr"], worker_claim=worker_claim)
+        return self.store.get_turn(turn_id)
+
     def run_asr(self, turn_id: str, *, frozen: Mapping[str, Any] | None = None, worker_claim: Mapping[str, Any] | None = None) -> dict[str, Any]:
         self._assert_worker_effect(worker_claim, stage="asr", turn_id=turn_id)
         turn = self.store.get_turn(turn_id)
@@ -632,7 +815,19 @@ class RecorderService:
         audio_parts = [part for part in turn["parts"] if part["kind"] == "audio"]
         if not audio_parts:
             return turn
-        audio = b"".join(self.store.read_part(turn_id, part["part_id"]) for part in audio_parts)
+        if len(audio_parts) != 1:
+            return self._commit_unsupported_audio(turn, worker_claim=worker_claim, detail="exactly one audio part is required")
+        audio_part = audio_parts[0]
+        audio_bytes = self.store.read_part(turn_id, audio_part["part_id"])
+        try:
+            audio = validate_wav(
+                audio_bytes,
+                part_id=str(audio_part["part_id"]),
+                mime=str(audio_part["mime"]),
+                duration_ms=audio_part.get("duration_ms"),
+            )
+        except (MediaValidationError, TypeError, ValueError) as exc:
+            return self._commit_unsupported_audio(turn, worker_claim=worker_claim, detail=str(exc))
         chain = self._chain_for_turn("asr", turn)
         if chain is not None:
             generation = int(turn["asr_generation"])
@@ -1069,7 +1264,16 @@ class RecorderService:
             if self.hermes is None:
                 raise ProviderFailure("provider_unavailable", retryable=True)
             result = self._valid_terminal_hermes_result(
-                self.hermes.history(session_key=ingress["gateway_session_key"], marker=ingress["marker"])
+                self.hermes.history(session_key=ingress["gateway_session_key"], marker=ingress["marker"]),
+                expected={
+                    "submission_id": ingress["hermes_submission_id"],
+                    "turn_id": ingress["turn_id"],
+                    "marker": ingress["marker"],
+                    "session_key": ingress["gateway_session_key"],
+                    "run_id": ingress.get("run_id") or ingress.get("hermes_run_id"),
+                    "request_sha256": ingress["payload_sha256"],
+                    "subject_kind": "turn",
+                },
             )
             if result is None:
                 raise ProviderFailure("transport", retryable=True)
@@ -1176,6 +1380,7 @@ class RecorderService:
         if not isinstance(text, str):
             raise ValidationError("text must be a JSON string")
         payload = text.encode("utf-8")
+        manifest.pop("text", None)
         manifest["parts"] = [
             {
                 "part_id": "text-1",
@@ -1219,7 +1424,8 @@ class RecorderService:
         except RecorderError as exc:
             return exc.status, {"Content-Type": "application/json"}, {"error": {"code": exc.code, "message": exc.message}}
         except (ValueError, KeyError, json.JSONDecodeError) as exc:
-            return 400, {"Content-Type": "application/json"}, {"error": {"code": "INVALID_JSON", "message": str(exc)}}
+            del exc
+            return 400, {"Content-Type": "application/json"}, {"error": {"code": "INVALID_REQUEST", "message": "request is invalid"}}
         except Exception:
             return 500, {"Content-Type": "application/json"}, {"error": {"code": "INTERNAL_ERROR", "message": "request failed"}}
 
@@ -1229,7 +1435,7 @@ class RecorderService:
             return decoded
         if not body:
             return {}
-        value = json.loads(body.decode("utf-8"))
+        value = strict_json_loads(body)
         if not isinstance(value, dict):
             raise ValidationError("JSON body must be an object")
         return value
@@ -1239,6 +1445,11 @@ class RecorderService:
         wanted = name.lower()
         values = [value for key, value in headers.items() if str(key).lower() == wanted]
         return values[0] if len(values) == 1 else None
+
+    @staticmethod
+    def _header_values(headers: Mapping[str, str], name: str) -> list[str]:
+        wanted = name.lower()
+        return [value for key, value in headers.items() if str(key).lower() == wanted]
 
     @staticmethod
     def _json_string(payload: Mapping[str, Any], key: str) -> str:
@@ -1317,6 +1528,13 @@ class RecorderService:
     ) -> dict[str, Any] | None:
         if self._ingress_secret is None:
             raise UnauthorizedError("authenticated ingress is not configured")
+        principal_names = (
+            "X-Recorder-Principal-User",
+            "X-Recorder-Principal-Device",
+            "X-Recorder-Principal-Signature",
+        )
+        if any(len(self._header_values(headers, name)) > 1 for name in principal_names):
+            raise ValidationError("duplicate principal headers are not permitted")
         principal_user = self._header_value(headers, "X-Recorder-Principal-User")
         principal_device = self._header_value(headers, "X-Recorder-Principal-Device")
         proof = self._header_value(headers, "X-Recorder-Principal-Signature")
@@ -1328,6 +1546,10 @@ class RecorderService:
         expected = hmac.new(self._ingress_secret.encode("utf-8"), message, hashlib.sha256).hexdigest()
         if not hmac.compare_digest(proof, expected):
             raise UnauthorizedError("verified request principal is invalid")
+        # HMAC verifies the asserted tuple; the device row is the second
+        # authority boundary.  In particular this prevents a revoked identity
+        # from reaching the registration/worker handlers.
+        self.store.assert_active_device(principal_user, principal_device)
         query_pairs = {key: query.get(key) for key in ("user_id", "device_id", "phone_device_id")}
         claimed_header_user = self._header_value(headers, "X-Recorder-User-ID")
         claimed_header_device = self._header_value(headers, "X-Recorder-Device-ID")
@@ -1349,8 +1571,8 @@ class RecorderService:
             raise UnsupportedMediaType("chunk routes require an octet-stream body")
         if body and not raw_chunk:
             try:
-                decoded = json.loads(body.decode("utf-8"))
-            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                decoded = strict_json_loads(body)
+            except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
                 raise ValidationError("request body is not valid JSON") from exc
             if not isinstance(decoded, dict):
                 raise ValidationError("request body must be a JSON object")
@@ -1366,6 +1588,12 @@ class RecorderService:
             return decoded
         return None
 
+    def _assert_worker_principal(self, headers: Mapping[str, str]) -> None:
+        user = self._header_value(headers, "X-Recorder-Principal-User")
+        device = self._header_value(headers, "X-Recorder-Principal-Device")
+        if not self._internal_worker_principals or (user, device) not in self._internal_worker_principals:
+            raise ForbiddenError("worker controls are not enabled for this principal")
+
     def _handle_http(
         self,
         method: str,
@@ -1375,12 +1603,20 @@ class RecorderService:
         *,
         peer_addr: tuple[str, int] | None = None,
     ) -> tuple[int, dict[str, str], Any]:
+        requested_method = method.upper()
         if method == "HEAD":
             method = "GET"
         parsed = urlsplit(target)
         path = parsed.path.rstrip("/") or "/"
-        query = {key: values[-1] for key, values in parse_qs(parsed.query).items()}
+        query_pairs = parse_qsl(parsed.query, keep_blank_values=True, strict_parsing=False)
+        query_counts: dict[str, int] = {}
+        for key, _value in query_pairs:
+            query_counts[key] = query_counts.get(key, 0) + 1
+        if any(count > 1 for count in query_counts.values()):
+            raise ValidationError("duplicate query parameters are not permitted")
+        query = dict(query_pairs)
         segments = [unquote(item) for item in path.split("/") if item]
+        match_operation(path, requested_method)
         if method == "GET" and path in {"/healthz", "/v1/health"}:
             return 200, {}, {"status": "ok", "product_identity": "recorder-next-server-product-items-1-through-8", "api_version": "v1", "worker": self.store.worker_health()}
         if method == "GET" and path == "/v1/openapi.json":
@@ -1400,40 +1636,61 @@ class RecorderService:
             decoded_payload = self._verify_network_principal(query, headers, body, path=path, raw_chunk=raw_chunk)
             if "now" in query:
                 raise ValidationError("server time cannot be supplied by a client")
-        if segments[:3] == ["v1", "internal", "worker"] and method == "POST":
+        if segments[:3] == ["v1", "internal", "worker"] and len(segments) == 4 and method == "POST":
+            if peer_addr is not None:
+                self._assert_worker_principal(headers)
             payload = json_body()
-            action = segments[3] if len(segments) > 3 else "claim"
+            action = segments[3]
             if action == "claim":
+                WORKER_CLAIM.validate(payload)
+                if set(payload) - {"owner", "lease_seconds"}:
+                    raise ValidationError("worker claim contains unsupported fields")
                 owner = self._json_string(payload, "owner") if "owner" in payload else "worker-1"
                 lease_seconds = self._json_integer(payload, "lease_seconds") if "lease_seconds" in payload else 30
                 assert lease_seconds is not None
-                return 200, {}, self.store.claim_worker_job(owner, now=payload.get("now"), lease_seconds=lease_seconds) or {"job": None}
+                return 200, {}, self.store.claim_worker_job(owner, lease_seconds=lease_seconds) or {"job": None}
             if action == "recover":
-                return 200, {}, self.store.recover_worker_jobs(now=payload.get("now"))
+                WORKER_RECOVER.validate(payload)
+                if payload:
+                    raise ValidationError("worker recover body must be empty")
+                return 200, {}, self.store.recover_worker_jobs()
             if action == "complete":
+                WORKER_COMPLETE.validate(payload)
+                if set(payload) != {"job_id", "owner", "lease_token", "receipt"} or not isinstance(payload.get("receipt"), Mapping):
+                    raise ValidationError("worker completion requires job_id, owner, lease_token, and receipt")
                 return 200, {}, self.store.complete_worker_job(
                     self._json_string(payload, "job_id"),
                     self._json_string(payload, "owner"),
                     payload["receipt"],
-                    now=payload.get("now"),
+                    lease_token=self._json_string(payload, "lease_token"),
                 )
             if action == "fail":
+                WORKER_FAIL.validate(payload)
+                if set(payload) - {"job_id", "owner", "lease_token", "error_kind", "retryable", "status_code", "retry_after_seconds"}:
+                    raise ValidationError("worker failure contains unsupported fields")
                 error_kind = self._json_string(payload, "error_kind") if "error_kind" in payload else "internal"
                 retryable = payload.get("retryable", False)
                 if not isinstance(retryable, bool):
                     raise ValidationError("retryable must be boolean")
+                status_code = self._json_integer(payload, "status_code", allow_none=True) if "status_code" in payload else None
+                retry_after = self._json_integer(payload, "retry_after_seconds", allow_none=True) if "retry_after_seconds" in payload else None
                 return 200, {}, self.store.fail_worker_job(
                     self._json_string(payload, "job_id"),
                     self._json_string(payload, "owner"),
                     error_kind=error_kind,
                     retryable=retryable,
-                    now=payload.get("now"),
+                    lease_token=self._json_string(payload, "lease_token"),
+                    status_code=status_code,
+                    retry_after_seconds=retry_after,
                 )
             if action == "run":
+                WORKER_RUN.validate(payload)
+                if set(payload) - {"owner", "lease_seconds"}:
+                    raise ValidationError("worker run contains unsupported fields")
                 owner = self._json_string(payload, "owner") if "owner" in payload else "worker-1"
                 lease_seconds = self._json_integer(payload, "lease_seconds") if "lease_seconds" in payload else 30
                 assert lease_seconds is not None
-                return 200, {}, self.run_background_worker_once(owner=owner, now=payload.get("now"), lease_seconds=lease_seconds) or {"job": None}
+                return 200, {}, self.run_background_worker_once(owner=owner, lease_seconds=lease_seconds) or {"job": None}
         if segments[:2] == ["v1", "updates"] and len(segments) == 4 and segments[3] in {"manifest", "manifest.json"} and method == "GET":
             manifest = self.store.get_update_manifest(segments[2])
             if_none_match = self._header_value(headers, "If-None-Match")
@@ -1451,6 +1708,8 @@ class RecorderService:
             )
             return result["status"], result["headers"], result["body"]
         if segments[:4] == ["v1", "internal", "worker", "health"] and method == "GET":
+            if peer_addr is not None:
+                self._assert_worker_principal(headers)
             return 200, {}, self.store.worker_health(now=query.get("now"))
         if segments[:2] == ["v1", "history"] and len(segments) == 2 and method == "GET":
             user_id, _device_id = self._authenticated_owner(query, headers)
@@ -1598,9 +1857,18 @@ class RecorderService:
         if segments[:2] == ["v1", "schedules"] and len(segments) == 3 and method == "GET":
             user_id, device_id = self._authenticated_owner(query, headers)
             return 200, {}, self.store.get_schedule(segments[2], user_id=user_id, device_id=device_id)
+        if segments[:3] == ["v1", "devices", "register"] and len(segments) == 3 and method == "POST":
+            payload = json_body()
+            return 201, {}, self.store.confirm_device(
+                self._json_string(payload, "user_id"),
+                self._json_string(payload, "device_id"),
+                self._json_string(payload, "kind"),
+            )
         if segments[:2] == ["v1", "devices"] and len(segments) == 2 and method == "POST":
             payload = json_body()
-            return 201, {}, self.store.register_device(self._json_string(payload, "user_id"), self._json_string(payload, "device_id"), self._json_string(payload, "kind"))
+            if peer_addr is None:
+                return 201, {}, self.store.register_device(self._json_string(payload, "user_id"), self._json_string(payload, "device_id"), self._json_string(payload, "kind"))
+            return 201, {}, self.store.confirm_device(self._json_string(payload, "user_id"), self._json_string(payload, "device_id"), self._json_string(payload, "kind"))
         if segments[:2] == ["v1", "devices"] and len(segments) == 4 and segments[3] == "revoke" and method == "POST":
             payload = json_body()
             user_id = self._json_string(payload, "user_id")
@@ -1941,7 +2209,11 @@ def create_configured_service(config: "RecorderConfig", *, ingress_secret: str |
     if config.hermes_base_url or config.hermes_api_key_file:
         if not config.hermes_base_url or not config.hermes_api_key_file:
             raise CredentialError("Hermes API credential path and endpoint are required")
-        hermes = HttpHermesGateway(config.hermes_base_url, api_key_file=config.hermes_api_key_file)
+        hermes = HttpHermesGateway(
+            config.hermes_base_url,
+            api_key_file=config.hermes_api_key_file,
+            max_request_bytes=config.gateway_max_request_bytes,
+        )
 
     store = RecorderStore(
         config.database,
@@ -1976,4 +2248,6 @@ def create_configured_service(config: "RecorderConfig", *, ingress_secret: str |
         hermes_max_attempts=config.hermes_max_attempts,
         hermes_grace_seconds=config.hermes_grace_seconds,
         ingress_secret=ingress_secret,
+        internal_worker_principals=config.internal_worker_principals,
+        gateway_max_request_bytes=config.gateway_max_request_bytes,
     )

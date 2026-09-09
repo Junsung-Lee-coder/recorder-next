@@ -15,6 +15,7 @@ from recorder_next.http import create_http_server
 from recorder_next.models import RouterDecision, TTSResult
 from recorder_next.service import RecorderService
 from recorder_next.store import RecorderStore
+from tests.r25_test_helpers import canonical_wav
 
 
 BASE_TURN = {
@@ -150,7 +151,7 @@ class RecorderR1RepairTests(unittest.TestCase):
                         {
                             "part_id": "audio-1",
                             "kind": "audio",
-                            "mime": "audio/pcm",
+                            "mime": "audio/wav",
                             "declared_bytes": None,
                             "declared_sha256": None,
                             "streaming": True,
@@ -198,7 +199,7 @@ class RecorderR1RepairTests(unittest.TestCase):
             audio_part = {
                 "part_id": "audio-1",
                 "kind": "audio",
-                "mime": "audio/pcm",
+                "mime": "audio/wav",
                 "declared_bytes": None,
                 "declared_sha256": None,
                 "streaming": True,
@@ -246,7 +247,7 @@ class RecorderR1RepairTests(unittest.TestCase):
                 turn_id = f"018f5a2e-7b6e-7abc-8d11-12345678994{index}"
                 part_id = "audio-1" if field == "duration_ms" else "text-1"
                 kind = "audio" if field == "duration_ms" else "text"
-                store.create_turn(manifest(turn_id, [{"part_id": part_id, "kind": kind, "mime": "audio/pcm" if kind == "audio" else "text/plain", "declared_bytes": 1, "declared_sha256": hashlib.sha256(b"x").hexdigest()}]))
+                store.create_turn(manifest(turn_id, [{"part_id": part_id, "kind": kind, "mime": "audio/wav" if kind == "audio" else "text/plain", "declared_bytes": 1, "declared_sha256": hashlib.sha256(b"x").hexdigest()}]))
                 store.put_chunk(turn_id, part_id, 0, b"x")
                 finish = {"total_chunks": 1, "total_bytes": 1, "whole_stream_sha256": hashlib.sha256(b"x").hexdigest()}
                 finish[field] = value
@@ -430,12 +431,12 @@ class RecorderR1RepairTests(unittest.TestCase):
             service = RecorderService(store, ingress_secret=INGRESS_SECRET)
             store.register_device("diag-user", "diag-phone", "phone")
             store.record_diagnostics_opt_in("diag-user", "diag-phone", event_id="consent-g2")
-            store.ingest_diagnostic_event(
+            event = store.ingest_diagnostic_event(
                 "diag-user",
                 "diag-phone",
                 event_id="diag-event-g2",
                 idempotency_key="diag-idem-g2",
-                payload={"category": "transport", "stage": "test", "status": "ok"},
+                payload={"category": "transport", "stage": "other", "status": "ok"},
             )
             server = create_http_server(service, port=0)
             thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -459,7 +460,7 @@ class RecorderR1RepairTests(unittest.TestCase):
                 readback = json.loads(connection.getresponse().read().decode())
                 self.assertEqual(readback["items"], [])
                 self.assertEqual(len(readback["tombstones"]), 1)
-                self.assertEqual(readback["tombstones"][0]["entity_id"], "diag-event-g2")
+                self.assertEqual(readback["tombstones"][0]["entity_id"], event["event_id"])
                 self.assertEqual(readback["tombstones"][0]["entity_type"], "event")
                 connection.close()
             finally:
@@ -597,7 +598,7 @@ class RecorderR1RepairTests(unittest.TestCase):
                 "diag-device",
                 event_id="diag-types-g2",
                 idempotency_key="diag-types-idem-g2",
-                payload={"category": "transport", "stage": "test"},
+                payload={"category": "transport", "stage": "other"},
             )
             for method, target, payload in (
                 ("POST", "/v1/diagnostics/delete", {"user_id": 7, "device_id": "diag-device"}),
@@ -670,7 +671,7 @@ class RecorderR1RepairTests(unittest.TestCase):
                     with self.subTest(adapter=type(adapter).__name__):
                         try:
                             if isinstance(adapter, (HttpASRProvider, HermesAudioASRProvider)):
-                                adapter.transcribe(b"audio", turn_id="turn-g2", generation=1)
+                                adapter.transcribe(canonical_wav(), turn_id="turn-g2", generation=1)
                             elif isinstance(adapter, (HttpTTSProvider, HermesAudioTTSProvider)):
                                 adapter.synthesize("text", artifact_id="artifact-g2")
                             else:

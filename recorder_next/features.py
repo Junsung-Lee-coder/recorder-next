@@ -24,7 +24,8 @@ from pathlib import Path
 from typing import Any, Callable, Mapping
 from urllib.parse import parse_qs, quote, unquote, urlsplit
 
-from .canonical import canonical_json, normalize_hermes_text, sha256_bytes, sha256_json
+from .canonical import canonical_json, hermes_content_hash, normalize_hermes_text, sha256_bytes, sha256_json
+from .diagnostics_contract import MetadataValidationError, project_bundle, project_metadata
 from .errors import CleanupIncompleteError, ConflictError, LeaseConflict, NotFoundError, NotReadyError, RangeNotSatisfiable, RecorderError, UnauthorizedError, ValidationError
 
 
@@ -96,6 +97,12 @@ class FeatureGroups:
         if not isinstance(value, str) or not FEATURE_ID_RE.fullmatch(value):
             raise ValidationError(f"{field} must be a bounded identifier")
         return value
+
+    @staticmethod
+    def _alias_digest(namespace: str, user_id: str, device_id: str, alias: str) -> str:
+        parts = (namespace, user_id, device_id, alias)
+        payload = b"".join(len(part.encode("utf-8")).to_bytes(8, "big") + part.encode("utf-8") for part in parts)
+        return hashlib.sha256(payload).hexdigest()
 
     @staticmethod
     def _digest(value: Any, field: str) -> str:
@@ -930,6 +937,7 @@ class FeatureGroups:
                 return None
             attempt = int(row["attempt_count"]) + 1
             attempt_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"recorder-next:worker-attempt:{row['job_id']}:{attempt}"))
+            lease_token = attempt_id
             changed = conn.execute(
                 "UPDATE worker_jobs SET status='CLAIMED', owner=?, lease_token=?, lease_expires_at=?, attempt_count=?, updated_at=? WHERE job_id=? AND ((status IN ('PENDING','RETRY_WAIT') AND next_attempt_at <= ?) OR (status='CLAIMED' AND lease_expires_at <= ?)) AND (overall_deadline_at IS NULL OR overall_deadline_at > ?) AND attempt_count < max_attempts",
                 (owner, attempt_id, expires, attempt, timestamp, row["job_id"], timestamp, timestamp, timestamp),
@@ -942,8 +950,8 @@ class FeatureGroups:
                     (timestamp, row["job_id"]),
                 )
             conn.execute(
-                "INSERT OR REPLACE INTO worker_attempts(attempt_id, job_id, attempt_number, owner, stage, started_at, outcome) VALUES (?, ?, ?, ?, ?, ?, 'RUNNING')",
-                (attempt_id, row["job_id"], attempt, owner, row["stage"], timestamp),
+                "INSERT OR REPLACE INTO worker_attempts(attempt_id, job_id, attempt_number, owner, lease_token, stage, started_at, outcome) VALUES (?, ?, ?, ?, ?, ?, ?, 'RUNNING')",
+                (attempt_id, row["job_id"], attempt, owner, lease_token, row["stage"], timestamp),
             )
             return self._job_payload(conn.execute("SELECT * FROM worker_jobs WHERE job_id=?", (row["job_id"],)).fetchone())
 
@@ -1031,7 +1039,7 @@ class FeatureGroups:
             value = receipt[key]
             if not isinstance(value, str) or not FEATURE_ID_RE.fullmatch(value):
                 raise ValidationError(f"effect receipt {key} is invalid")
-        if "count" in receipt and (not isinstance(receipt["count"], int) or isinstance(receipt["count"], bool) or receipt["count"] < 0):
+        if "count" in receipt and (not isinstance(receipt["count"], int) or isinstance(receipt["count"], bool) or not 0 <= receipt["count"] <= 1_000_000):
             raise ValidationError("effect receipt count is invalid")
         for key in {"outcome", "state"} & set(receipt):
             value = receipt[key]
@@ -1046,39 +1054,42 @@ class FeatureGroups:
     def complete_worker_job(self, job_id: str, owner: str, receipt: Mapping[str, Any], *, lease_token: str, now: str | None = None) -> dict[str, Any]:
         self._identifier(job_id, "job_id")
         self._identifier(owner, "owner")
+        self._identifier(lease_token, "lease_token")
         timestamp = self._time(now, self.store)
         with self.store._tx() as conn:
             existing = conn.execute("SELECT * FROM worker_jobs WHERE job_id=?", (job_id,)).fetchone()
             if existing is None:
                 raise NotFoundError("worker job not found")
+            bound_receipt = dict(receipt)
+            if "job_id" in bound_receipt and bound_receipt["job_id"] != existing["job_id"]:
+                raise ConflictError("effect receipt job binding does not match worker job")
+            if "idempotency_key" in bound_receipt and bound_receipt["idempotency_key"] != existing["idempotency_key"]:
+                raise ConflictError("effect receipt idempotency binding does not match worker job")
+            bound_receipt.setdefault("job_id", existing["job_id"])
+            bound_receipt.setdefault("idempotency_key", existing["idempotency_key"])
+            bound_receipt.setdefault("stage", existing["stage"])
+            receipt_json, receipt_sha = self._receipt(bound_receipt)
+            winning = conn.execute(
+                "SELECT owner, lease_token, outcome, effect_receipt_sha256 FROM worker_attempts "
+                "WHERE job_id=? AND outcome IN ('SUCCEEDED','FAILED_PERMANENT') ORDER BY attempt_number DESC LIMIT 1",
+                (job_id,),
+            ).fetchone()
             if existing["status"] == "SUCCEEDED":
-                candidate = dict(receipt)
-                if "job_id" in candidate and candidate["job_id"] != existing["job_id"]:
-                    raise ConflictError("effect receipt job binding does not match worker job")
-                if "idempotency_key" in candidate and candidate["idempotency_key"] != existing["idempotency_key"]:
-                    raise ConflictError("effect receipt idempotency binding does not match worker job")
-                candidate.setdefault("job_id", existing["job_id"])
-                candidate.setdefault("idempotency_key", existing["idempotency_key"])
-                candidate.setdefault("stage", existing["stage"])
-                _candidate_json, candidate_sha = self._receipt(candidate)
-                if candidate_sha != existing["effect_receipt_sha256"]:
+                if winning is None or winning["owner"] != owner or winning["lease_token"] != lease_token:
+                    raise LeaseConflict("worker job winning attempt is not owned by this token")
+                if receipt_sha != existing["effect_receipt_sha256"]:
                     raise ConflictError("worker job already succeeded with a different effect receipt")
                 return self._job_payload(existing)
             if existing["status"] == "FAILED_PERMANENT" and existing["last_error_kind"] in {"deadline", "max_attempts"}:
+                if winning is None or winning["owner"] != owner or winning["lease_token"] != lease_token:
+                    raise LeaseConflict("worker job terminal attempt is not owned by this token")
                 return self._job_payload(existing)
             if existing["status"] == "CLAIMED" and existing["owner"] == owner and existing["lease_token"] == lease_token and existing["overall_deadline_at"] is not None and existing["overall_deadline_at"] <= timestamp:
                 self._terminalize_claimed_deadline_tx(conn, existing, timestamp)
                 return self._job_payload(conn.execute("SELECT * FROM worker_jobs WHERE job_id=?", (job_id,)).fetchone())
             row = self._assert_worker_claim(conn, job_id, owner, lease_token, timestamp)
-            bound_receipt = dict(receipt)
-            if "job_id" in bound_receipt and bound_receipt["job_id"] != row["job_id"]:
-                raise ConflictError("effect receipt job binding does not match worker job")
-            if "idempotency_key" in bound_receipt and bound_receipt["idempotency_key"] != row["idempotency_key"]:
-                raise ConflictError("effect receipt idempotency binding does not match worker job")
-            bound_receipt.setdefault("job_id", row["job_id"])
-            bound_receipt.setdefault("idempotency_key", row["idempotency_key"])
-            bound_receipt.setdefault("stage", row["stage"])
-            receipt_json, receipt_sha = self._receipt(bound_receipt)
+            # The receipt was validated and bound before the live-claim check;
+            # retain this exact canonical digest for the winning attempt.
             conn.execute(
                 "UPDATE worker_jobs SET status='SUCCEEDED', owner=NULL, lease_token=NULL, lease_expires_at=NULL, effect_receipt_json=?, effect_receipt_sha256=?, updated_at=?, completed_at=? WHERE job_id=?",
                 (receipt_json, receipt_sha, timestamp, timestamp, job_id),
@@ -1108,6 +1119,8 @@ class FeatureGroups:
             raise ValidationError("retryable must be boolean")
         if status_code is not None and (not isinstance(status_code, int) or isinstance(status_code, bool) or not 100 <= status_code <= 599):
             raise ValidationError("status_code must be an HTTP status integer")
+        if retry_after_seconds is not None and (not isinstance(retry_after_seconds, int) or isinstance(retry_after_seconds, bool) or not 0 <= retry_after_seconds <= 86400):
+            raise ValidationError("retry_after_seconds is out of bounds")
         timestamp = self._time(now, self.store)
         with self.store._tx() as conn:
             current = conn.execute("SELECT * FROM worker_jobs WHERE job_id=?", (job_id,)).fetchone()
@@ -1119,8 +1132,6 @@ class FeatureGroups:
             can_retry = retryable and attempt_count < int(row["max_attempts"]) and (row["overall_deadline_at"] is None or row["overall_deadline_at"] > timestamp)
             if can_retry:
                 delay = retry_after_seconds if retry_after_seconds is not None else min(300, 2 ** min(attempt_count, 8))
-                if not isinstance(delay, int) or isinstance(delay, bool) or delay < 0 or delay > 86400:
-                    raise ValidationError("retry_after_seconds is out of bounds")
                 state = "RETRY_WAIT"
                 next_attempt_at = self._plus_seconds(timestamp, delay)
                 outcome = "RETRY_WAIT"
@@ -1916,6 +1927,21 @@ class FeatureGroups:
         else:
             gateway_session_key = f"recorder:eavesdrop:{session['session_id']}"
             submission_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"recorder-next:eavesdrop-hermes:{session['session_id']}:{segment['sequence']}"))
+            history = conn.execute(
+                "SELECT transcript FROM eavesdrop_segments WHERE session_id=? AND sequence<=? ORDER BY sequence",
+                (session["session_id"], segment["sequence"]),
+            ).fetchall()
+            conversation = "\n".join(
+                str(item["transcript"]).strip()
+                for item in history
+                if isinstance(item["transcript"], str) and item["transcript"].strip()
+            )
+            request_snapshot = {"input": conversation}
+            marker = f"eavesdrop:default:{session['session_id']}:{segment['sequence']}"
+            conn.execute(
+                "INSERT INTO hermes_run_bindings(submission_id, subject_kind, eavesdrop_session_id, segment_sequence, segment_sha256, marker, gateway_session_key, gateway_identity, canonical_request_sha256, wire_revision, request_json, created_at) VALUES (?, 'eavesdrop', ?, ?, ?, ?, ?, 'default', ?, 'hermes-runs-v1', ?, ?)",
+                (submission_id, session["session_id"], segment["sequence"], segment["audio_sha256"], marker, gateway_session_key, sha256_json(request_snapshot), canonical_json(request_snapshot).decode("utf-8"), now),
+            )
             self._enqueue_worker_job_tx(
                 conn,
                 kind="eavesdrop",
@@ -1965,6 +1991,95 @@ class FeatureGroups:
                 if owner["user_id"] != user_id or owner["phone_device_id"] != phone_device_id:
                     raise UnauthorizedError("eavesdrop session owner mismatch")
             return [self._eavesdrop_decision_payload(item) for item in conn.execute("SELECT * FROM eavesdrop_decisions WHERE session_id=? ORDER BY segment_sequence", (session_id,)).fetchall()]
+
+    def commit_eavesdrop_result(
+        self,
+        submission_id: str,
+        result: Any,
+        *,
+        worker_claim: Mapping[str, Any] | None = None,
+        now: str | None = None,
+    ) -> dict[str, Any]:
+        """Atomically bind, validate, reply, and deliver one eavesdrop run."""
+        if not isinstance(submission_id, str) or not submission_id:
+            raise ValidationError("eavesdrop submission_id is required")
+        timestamp = self._time(now, self.store)
+        values = result if isinstance(result, Mapping) else getattr(result, "__dict__", None)
+        if not isinstance(values, Mapping):
+            raise ValidationError("eavesdrop Hermes result is malformed")
+        content = values.get("content")
+        assistant_message_id = values.get("assistant_message_id")
+        run_id = values.get("run_id")
+        if values.get("terminal") is not True or not isinstance(content, str) or not content.strip() or not isinstance(assistant_message_id, str) or not assistant_message_id or not isinstance(run_id, str) or not run_id:
+            raise ValidationError("only a bound terminal eavesdrop result is accepted")
+        with self.store._tx() as conn:
+            if worker_claim is None or not self._assert_worker_effect_tx(conn, worker_claim, now=timestamp, stage="hermes"):
+                raise LeaseConflict("worker eavesdrop result authority has expired")
+            binding = conn.execute("SELECT * FROM hermes_run_bindings WHERE submission_id=?", (submission_id,)).fetchone()
+            if binding is None or binding["subject_kind"] != "eavesdrop":
+                raise ConflictError("eavesdrop result has no matching durable binding")
+            expected = {
+                "submission_id": submission_id,
+                "eavesdrop_session_id": binding["eavesdrop_session_id"],
+                "segment_sequence": binding["segment_sequence"],
+                "segment_sha256": binding["segment_sha256"],
+                "marker": binding["marker"],
+                "session_key": binding["gateway_session_key"],
+                "run_id": binding["run_id"],
+                "request_sha256": binding["canonical_request_sha256"],
+                "subject_kind": "eavesdrop",
+            }
+            if expected["run_id"] != run_id or any(values.get(key) is not None and values.get(key) != value for key, value in expected.items() if key in values):
+                raise ConflictError("eavesdrop result provenance does not match the durable binding")
+            if binding["run_id"] is None:
+                raise ConflictError("eavesdrop result arrived before its run was bound")
+            session = conn.execute("SELECT * FROM eavesdrop_sessions WHERE session_id=?", (binding["eavesdrop_session_id"],)).fetchone()
+            segment = conn.execute("SELECT * FROM eavesdrop_segments WHERE session_id=? AND sequence=?", (binding["eavesdrop_session_id"], binding["segment_sequence"])).fetchone()
+            decision = conn.execute("SELECT * FROM eavesdrop_decisions WHERE session_id=? AND segment_sequence=?", (binding["eavesdrop_session_id"], binding["segment_sequence"])).fetchone()
+            if session is None or segment is None or decision is None:
+                raise NotFoundError("eavesdrop result subject is missing")
+            if segment["audio_sha256"] != binding["segment_sha256"]:
+                raise ConflictError("eavesdrop segment identity changed")
+            if session["state"] not in {"ACTIVE", "PAUSED", "STOPPING"} or session["expires_at"] <= timestamp:
+                raise ConflictError("eavesdrop session is no longer active")
+            if decision["decision"] != "FORWARD_DEFAULT":
+                raise ConflictError("eavesdrop result is not authorized for forwarding")
+            content_hash = hermes_content_hash(content)
+            receipt = {
+                "submission_id": submission_id,
+                "session_id": binding["eavesdrop_session_id"],
+                "segment_sequence": binding["segment_sequence"],
+                "segment_sha256": binding["segment_sha256"],
+                "gateway_profile": binding["gateway_identity"],
+                "input_sha256": binding["canonical_request_sha256"],
+                "content_hash": content_hash,
+                "assistant_message_id": assistant_message_id,
+                "provider": values.get("source") or "hermes-run",
+            }
+            if decision["result_state"] == "DELIVERED":
+                previous = json.loads(decision["effect_receipt_json"] or "{}")
+                if previous.get("content_hash") != content_hash or previous.get("assistant_message_id") != assistant_message_id or previous.get("submission_id") != submission_id:
+                    raise ConflictError("eavesdrop result conflicts with the delivered receipt")
+                return self._eavesdrop_decision_payload(decision)
+            if decision["result_state"] != "QUEUED":
+                raise ConflictError("eavesdrop decision is not awaiting a Hermes result")
+            if session["response_enabled"]:
+                reply_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"recorder-next:eavesdrop-reply:{binding['eavesdrop_session_id']}:{binding['segment_sequence']}:{content_hash}"))
+                existing_reply = conn.execute("SELECT * FROM eavesdrop_replies WHERE session_id=? AND segment_sequence=?", (binding["eavesdrop_session_id"], binding["segment_sequence"])).fetchone()
+                if existing_reply is not None and (existing_reply["text_hash"] != content_hash or existing_reply["reply_text"] != content):
+                    raise ConflictError("eavesdrop reply conflicts with the delivered result")
+                if existing_reply is None:
+                    conn.execute(
+                        "INSERT INTO eavesdrop_replies(reply_id, session_id, segment_sequence, text_hash, reply_text, tts_requested, hermes_requested, created_at) VALUES (?, ?, ?, ?, ?, 0, 1, ?)",
+                        (reply_id, binding["eavesdrop_session_id"], binding["segment_sequence"], content_hash, content, timestamp),
+                    )
+                receipt["reply_id"] = existing_reply["reply_id"] if existing_reply is not None else reply_id
+            receipt_json = canonical_json(self._safe_eavesdrop_receipt(receipt)).decode("utf-8")
+            conn.execute(
+                "UPDATE eavesdrop_decisions SET result_state='DELIVERED', reason='hermes_response_available', effect_receipt_json=? WHERE session_id=? AND segment_sequence=? AND result_state='QUEUED'",
+                (receipt_json, binding["eavesdrop_session_id"], binding["segment_sequence"]),
+            )
+            return self._eavesdrop_decision_payload(conn.execute("SELECT * FROM eavesdrop_decisions WHERE session_id=? AND segment_sequence=?", (binding["eavesdrop_session_id"], binding["segment_sequence"])).fetchone())
 
     def mark_eavesdrop_decision(
         self,
@@ -2206,17 +2321,11 @@ class FeatureGroups:
 
     @classmethod
     def _sanitize_diagnostic(cls, payload: Mapping[str, Any]) -> dict[str, Any]:
-        if not isinstance(payload, Mapping):
-            raise ValidationError("diagnostic metadata must be an object")
-        result: dict[str, Any] = {}
-        for key, value in list(payload.items())[:64]:
-            if not isinstance(key, str) or cls.DIAGNOSTIC_BANNED.search(key) or key not in cls.DIAGNOSTIC_KEYS:
-                continue
-            cleaned = cls._sanitize_diagnostic_value(key, value)
-            if cleaned is not None:
-                result[key] = cleaned
-        encoded = canonical_json(result)
-        if len(encoded) > 16 * 1024:
+        try:
+            result = project_metadata(payload)
+        except MetadataValidationError as exc:
+            raise ValidationError("diagnostic metadata is invalid") from exc
+        if len(canonical_json(result)) > 16 * 1024:
             raise ValidationError("diagnostic metadata exceeds the bounded limit")
         return result
 
@@ -2247,17 +2356,20 @@ class FeatureGroups:
         self._identifier(device_id, "device_id")
         if not isinstance(enabled, bool):
             raise ValidationError("enabled must be boolean")
-        event_id = event_id or str(uuid.uuid4())
-        self._identifier(event_id, "event_id")
+        alias_digest = None
+        if event_id is not None:
+            self._identifier(event_id, "event_id")
+            alias_digest = self._alias_digest("consent", user_id, device_id, event_id)
+        handle = str(uuid.uuid4())
         timestamp = self._time(now, self.store)
         expiry = self._time(expires_at, self.store) if expires_at is not None else None
         with self.store._tx() as conn:
             self.store._assert_device(conn, user_id, device_id)
-            existing = conn.execute("SELECT * FROM diagnostics_consents WHERE event_id=?", (event_id,)).fetchone()
+            existing = conn.execute("SELECT * FROM diagnostics_consents WHERE user_id=? AND device_id=? AND alias_digest=?", (user_id, device_id, alias_digest)).fetchone() if alias_digest else None
             if existing is not None:
                 if existing["user_id"] != user_id or existing["device_id"] != device_id or bool(existing["enabled"]) != enabled or existing["expires_at"] != expiry:
                     raise ConflictError("diagnostics consent event is immutable")
-                return {"event_id": event_id, "user_id": user_id, "device_id": device_id, "enabled": bool(existing["enabled"]), "created_at": existing["created_at"], "expires_at": existing["expires_at"]}
+                return {"event_id": existing["event_id"], "user_id": user_id, "device_id": device_id, "enabled": bool(existing["enabled"]), "created_at": existing["created_at"], "expires_at": existing["expires_at"]}
             # Consent is a single current authority.  Revoke every older
             # event before publishing either a new opt-in or an opt-out so a
             # caller cannot reuse a historical authorization after a later
@@ -2267,8 +2379,8 @@ class FeatureGroups:
                 "WHERE user_id=? AND device_id=? AND revoked_at IS NULL",
                 (timestamp, user_id, device_id),
             )
-            conn.execute("INSERT INTO diagnostics_consents(user_id, device_id, event_id, enabled, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?)", (user_id, device_id, event_id, int(enabled), timestamp, expiry))
-            return {"event_id": event_id, "user_id": user_id, "device_id": device_id, "enabled": enabled, "created_at": timestamp, "expires_at": expiry}
+            conn.execute("INSERT INTO diagnostics_consents(user_id, device_id, event_id, alias_digest, enabled, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?)", (user_id, device_id, handle, alias_digest, int(enabled), timestamp, expiry))
+            return {"event_id": handle, "user_id": user_id, "device_id": device_id, "enabled": enabled, "created_at": timestamp, "expires_at": expiry}
 
     def ingest_diagnostic_event(
         self,
@@ -2283,6 +2395,8 @@ class FeatureGroups:
     ) -> dict[str, Any]:
         self._identifier(event_id, "event_id")
         self._identifier(idempotency_key, "idempotency_key")
+        event_alias_digest = self._alias_digest("event", user_id, device_id, event_id)
+        idempotency_digest = self._alias_digest("idempotency", user_id, device_id, idempotency_key)
         metadata = self._sanitize_diagnostic(payload)
         category = metadata.get("category")
         stage = metadata.get("stage")
@@ -2296,15 +2410,16 @@ class FeatureGroups:
             self.store._assert_device(conn, user_id, device_id)
             if not self._diagnostics_enabled_tx(conn, user_id, device_id, timestamp):
                 raise UnauthorizedError("diagnostics requires an active opt-in")
-            existing = conn.execute("SELECT * FROM diagnostic_events WHERE idempotency_key=?", (idempotency_key,)).fetchone()
+            existing = conn.execute("SELECT * FROM diagnostic_events WHERE user_id=? AND device_id=? AND idempotency_key=?", (user_id, device_id, idempotency_digest)).fetchone()
             if existing is not None:
+                if existing["deleted_at"] is not None or existing["retention_deadline"] <= timestamp or existing["privacy_version"] != 2 or existing["migration_state"] != "READY":
+                    raise ConflictError("diagnostic event is expired or deleted")
                 if existing["metadata_json"] != metadata_json or existing["user_id"] != user_id or existing["device_id"] != device_id:
                     raise ConflictError("diagnostic event idempotency key has a different payload")
                 return {"event_id": existing["event_id"], "category": existing["category"], "stage": existing["stage"], "metadata": json.loads(existing["metadata_json"]), "occurred_at": existing["occurred_at"], "retention_deadline": existing["retention_deadline"]}
-            if conn.execute("SELECT 1 FROM diagnostic_events WHERE event_id=?", (event_id,)).fetchone() is not None:
-                raise ConflictError("diagnostic event_id is already used")
-            conn.execute("INSERT INTO diagnostic_events(event_id, idempotency_key, user_id, device_id, category, stage, metadata_json, occurred_at, retention_deadline) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", (event_id, idempotency_key, user_id, device_id, category, stage, metadata_json, occurred, deadline))
-            return {"event_id": event_id, "category": category, "stage": stage, "metadata": metadata, "occurred_at": occurred, "retention_deadline": deadline}
+            handle = str(uuid.uuid4())
+            conn.execute("INSERT INTO diagnostic_events(event_id, idempotency_key, alias_digest, user_id, device_id, category, stage, metadata_json, occurred_at, retention_deadline, privacy_version, migration_state) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 2, 'READY')", (handle, idempotency_digest, event_alias_digest, user_id, device_id, category, stage, metadata_json, occurred, deadline))
+            return {"event_id": handle, "category": category, "stage": stage, "metadata": metadata, "occurred_at": occurred, "retention_deadline": deadline}
 
     def ingest_diagnostic_bundle(
         self,
@@ -2344,6 +2459,7 @@ class FeatureGroups:
     ) -> dict[str, Any]:
         self._identifier(bundle_id, "bundle_id")
         self._identifier(opt_in_event_id, "opt_in_event_id")
+        alias_digest = self._alias_digest("bundle", user_id, device_id, bundle_id)
         if not isinstance(compressed, bytes) or not compressed:
             raise ValidationError("diagnostic bundle must be non-empty bytes")
         max_compressed = int(getattr(self.store, "diagnostics_max_compressed_bytes", 2 * 1024 * 1024))
@@ -2364,14 +2480,9 @@ class FeatureGroups:
             decoded = json.loads(expanded.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise ValidationError("diagnostic bundle must contain structured JSON") from exc
-        if isinstance(decoded, Mapping):
-            if isinstance(decoded.get("events"), list):
-                redacted: Any = {"events": [self._sanitize_diagnostic(item) for item in decoded["events"][:64] if isinstance(item, Mapping)]}
-            else:
-                redacted = self._sanitize_diagnostic(decoded)
-        elif isinstance(decoded, list):
-            redacted = [self._sanitize_diagnostic(item) for item in decoded[:64] if isinstance(item, Mapping)]
-        else:
+        try:
+            redacted: Any = project_bundle(decoded)
+        except MetadataValidationError as exc:
             raise ValidationError("diagnostic bundle must contain an object or array")
         redacted_expanded = canonical_json(redacted)
         if len(redacted_expanded) > max_expanded:
@@ -2380,7 +2491,8 @@ class FeatureGroups:
         digest = sha256_bytes(redacted_compressed)
         timestamp = self._time(now, self.store)
         deadline = self._plus_seconds(timestamp, int(getattr(self.store, "diagnostics_retention_seconds", 7 * 86400)))
-        path = self.store.storage_root / "diagnostics" / hashlib.sha256(user_id.encode("utf-8")).hexdigest() / f"{bundle_id}.z"
+        handle = str(uuid.uuid4())
+        path = self.store.storage_root / "diagnostics" / hashlib.sha256(user_id.encode("utf-8")).hexdigest() / f"{handle}.z"
         with self.store._read() as conn:
             self.store._assert_device(conn, user_id, device_id)
             if not self._diagnostics_enabled_tx(conn, user_id, device_id, timestamp, opt_in_event_id):
@@ -2402,33 +2514,53 @@ class FeatureGroups:
                 self.store._assert_device(conn, user_id, device_id)
                 if not self._diagnostics_enabled_tx(conn, user_id, device_id, timestamp, opt_in_event_id):
                     raise UnauthorizedError("diagnostic bundle requires the exact active opt-in event")
-                existing = conn.execute("SELECT * FROM diagnostic_bundles WHERE bundle_id=?", (bundle_id,)).fetchone()
+                existing = conn.execute("SELECT * FROM diagnostic_bundles WHERE user_id=? AND device_id=? AND (alias_digest=? OR bundle_id=?)", (user_id, device_id, alias_digest, bundle_id)).fetchone()
                 if existing is not None:
+                    if existing["deleted_at"] is not None or existing["retention_deadline"] <= timestamp or existing["privacy_version"] != 2 or existing["migration_state"] != "READY":
+                        raise ConflictError("diagnostic bundle is expired or deleted")
                     if existing["payload_sha256"] != digest or existing["user_id"] != user_id or existing["device_id"] != device_id:
                         raise ConflictError("diagnostic bundle is immutable")
                     self.store._complete_cleanup_receipt_tx(conn, receipt_id, now=timestamp)
-                    return {"bundle_id": bundle_id, "compressed_size": existing["compressed_size"], "expanded_size": existing["expanded_size"], "payload_sha256": existing["payload_sha256"], "created_at": existing["created_at"], "retention_deadline": existing["retention_deadline"]}
-                same_payload = conn.execute("SELECT * FROM diagnostic_bundles WHERE user_id=? AND device_id=? AND payload_sha256=?", (user_id, device_id, digest)).fetchone()
-                if same_payload is not None:
-                    self.store._complete_cleanup_receipt_tx(conn, receipt_id, now=timestamp)
-                    return {"bundle_id": same_payload["bundle_id"], "compressed_size": same_payload["compressed_size"], "expanded_size": same_payload["expanded_size"], "payload_sha256": same_payload["payload_sha256"], "created_at": same_payload["created_at"], "retention_deadline": same_payload["retention_deadline"]}
+                    return {"bundle_id": existing["bundle_id"], "compressed_size": existing["compressed_size"], "expanded_size": existing["expanded_size"], "created_at": existing["created_at"], "retention_deadline": existing["retention_deadline"]}
                 path_existed = path.exists()
                 if path_existed and self._read_managed_bytes(self.store.storage_root, path) != redacted_compressed:
                     raise ConflictError("diagnostic bundle path already contains different bytes")
                 if not path_existed:
                     self.store._safe_write(path, redacted_compressed)
-                conn.execute("INSERT INTO diagnostic_bundles(bundle_id, user_id, device_id, opt_in_event_id, compressed_size, expanded_size, payload_sha256, storage_path, created_at, retention_deadline) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", (bundle_id, user_id, device_id, opt_in_event_id, len(redacted_compressed), len(expanded), digest, str(path), timestamp, deadline))
+                conn.execute("INSERT INTO diagnostic_bundles(bundle_id, alias_digest, user_id, device_id, opt_in_event_id, compressed_size, expanded_size, payload_sha256, storage_path, created_at, retention_deadline, privacy_version, migration_state) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 2, 'READY')", (handle, alias_digest, user_id, device_id, opt_in_event_id, len(redacted_compressed), len(redacted_expanded), digest, str(path), timestamp, deadline))
                 self.store._complete_cleanup_receipt_tx(conn, receipt_id, now=timestamp)
-                return {"bundle_id": bundle_id, "compressed_size": len(redacted_compressed), "expanded_size": len(expanded), "payload_sha256": digest, "created_at": timestamp, "retention_deadline": deadline}
+                return {"bundle_id": handle, "compressed_size": len(redacted_compressed), "expanded_size": len(redacted_expanded), "created_at": timestamp, "retention_deadline": deadline}
         except Exception as exc:
             cleanup = self.store.recover_cleanup_receipts(receipt_ids=[receipt_id], now=timestamp)
             if cleanup["pending"] or cleanup["blocked"]:
                 raise CleanupIncompleteError("diagnostic bundle rollback cleanup is incomplete") from exc
             raise
 
-    def _diagnostic_listing_items(self, conn: Any, user_id: str, device_id: str, *, category: str | None = None, stage: str | None = None, limit: int | None = 100) -> list[dict[str, Any]]:
-        clauses = ["user_id=?", "device_id=?", "deleted_at IS NULL"]
+    def _expire_diagnostics_tx(self, conn: Any, *, user_id: str | None, device_id: str | None, as_of: str) -> dict[str, int]:
+        scope_sql = ""
+        scope_args: tuple[Any, ...] = ()
+        if user_id is not None and device_id is not None:
+            scope_sql = " AND user_id=? AND device_id=?"
+            scope_args = (user_id, device_id)
+        events = conn.execute("SELECT event_id, user_id, device_id, retention_deadline FROM diagnostic_events WHERE deleted_at IS NULL AND retention_deadline <= ? AND privacy_version=2 AND migration_state='READY'" + scope_sql, (as_of, *scope_args)).fetchall()
+        bundles = conn.execute("SELECT bundle_id, user_id, device_id, storage_path, payload_sha256, compressed_size, retention_deadline FROM diagnostic_bundles WHERE deleted_at IS NULL AND retention_deadline <= ? AND privacy_version=2 AND migration_state='READY'" + scope_sql, (as_of, *scope_args)).fetchall()
+        tombstone_seconds = int(self.store.diagnostics_tombstone_retention_seconds)
+        for row in events:
+            expires_at = self._plus_seconds(row["retention_deadline"], tombstone_seconds)
+            conn.execute("UPDATE diagnostic_events SET metadata_json='{}', deleted_at=? WHERE event_id=?", (as_of, row["event_id"]))
+            conn.execute("INSERT OR IGNORE INTO diagnostic_tombstones(tombstone_id, user_id, device_id, entity_type, entity_id, deleted_at, expires_at) VALUES (?, ?, ?, 'event', ?, ?, ?)", (str(uuid.uuid4()), row["user_id"], row["device_id"], row["event_id"], as_of, expires_at))
+        for row in bundles:
+            expires_at = self._plus_seconds(row["retention_deadline"], tombstone_seconds)
+            conn.execute("UPDATE diagnostic_bundles SET compressed_size=0, expanded_size=0, storage_path='', deleted_at=? WHERE bundle_id=?", (as_of, row["bundle_id"]))
+            conn.execute("INSERT OR IGNORE INTO diagnostic_tombstones(tombstone_id, user_id, device_id, entity_type, entity_id, deleted_at, expires_at) VALUES (?, ?, ?, 'bundle', ?, ?, ?)", (str(uuid.uuid4()), row["user_id"], row["device_id"], row["bundle_id"], as_of, expires_at))
+            self.store._prepare_cleanup_receipt_tx(conn, operation="diagnostic_purge", path=Path(row["storage_path"]), expected_sha256=row["payload_sha256"], expected_size=int(row["compressed_size"]), user_id=row["user_id"], device_id=row["device_id"], entity_type="diagnostic_bundle", entity_id=row["bundle_id"], now=as_of)
+        return {"events": len(events), "bundles": len(bundles)}
+
+    def _diagnostic_listing_items(self, conn: Any, user_id: str, device_id: str, *, category: str | None = None, stage: str | None = None, limit: int | None = 100, as_of: str | None = None) -> list[dict[str, Any]]:
+        clauses = ["user_id=?", "device_id=?", "deleted_at IS NULL", "retention_deadline > ?", "privacy_version=2", "migration_state='READY'"]
         args: list[Any] = [user_id, device_id]
+        as_of = as_of or self.store._now()
+        args.append(as_of)
         if category is not None:
             clauses.append("category=?")
             args.append(category)
@@ -2436,7 +2568,7 @@ class FeatureGroups:
             clauses.append("stage=?")
             args.append(stage)
         event_query = "SELECT * FROM diagnostic_events WHERE " + " AND ".join(clauses) + " ORDER BY occurred_at, event_id"
-        bundle_query = "SELECT * FROM diagnostic_bundles WHERE user_id=? AND device_id=? AND deleted_at IS NULL ORDER BY created_at, bundle_id"
+        bundle_query = "SELECT * FROM diagnostic_bundles WHERE user_id=? AND device_id=? AND deleted_at IS NULL AND retention_deadline > ? AND privacy_version=2 AND migration_state='READY' ORDER BY created_at, bundle_id"
         if limit is not None:
             event_query += " LIMIT ?"
             bundle_query += " LIMIT ?"
@@ -2444,15 +2576,15 @@ class FeatureGroups:
             # truthful when one source alone reaches the page boundary.
             fetch_limit = limit + 1
             events = conn.execute(event_query, (*args, fetch_limit)).fetchall()
-            bundles = conn.execute(bundle_query, (user_id, device_id, fetch_limit)).fetchall()
+            bundles = conn.execute(bundle_query, (user_id, device_id, as_of, fetch_limit)).fetchall()
         else:
             events = conn.execute(event_query, args).fetchall()
-            bundles = conn.execute(bundle_query, (user_id, device_id)).fetchall()
+            bundles = conn.execute(bundle_query, (user_id, device_id, as_of)).fetchall()
         items = [
             {"type": "event", "event_id": row["event_id"], "category": row["category"], "stage": row["stage"], "metadata": json.loads(row["metadata_json"]), "occurred_at": row["occurred_at"], "retention_deadline": row["retention_deadline"]}
             for row in events
         ] + [
-            {"type": "bundle", "bundle_id": row["bundle_id"], "compressed_size": row["compressed_size"], "expanded_size": row["expanded_size"], "payload_sha256": row["payload_sha256"], "created_at": row["created_at"], "retention_deadline": row["retention_deadline"]}
+            {"type": "bundle", "bundle_id": row["bundle_id"], "compressed_size": row["compressed_size"], "expanded_size": row["expanded_size"], "created_at": row["created_at"], "retention_deadline": row["retention_deadline"]}
             for row in bundles
         ]
         items.sort(key=lambda item: (item.get("occurred_at") or item.get("created_at") or "", item.get("event_id") or item.get("bundle_id") or ""))
@@ -2462,17 +2594,15 @@ class FeatureGroups:
         self._identifier(device_id, "device_id")
         if not isinstance(limit, int) or not 1 <= limit <= 500:
             raise ValidationError("diagnostic limit must be between 1 and 500")
-        # Reads enforce logical expiry, but must not opportunistically retry a
-        # failed physical cleanup. Recovery remains an explicit maintenance
-        # operation so callers can observe a pending receipt.
-        self.purge_diagnostics(_recover_cleanup=False)
-        with self.store._read() as conn:
+        with self.store._tx() as conn:
             self.store._assert_device(conn, user_id, device_id)
-            items = self._diagnostic_listing_items(conn, user_id, device_id, category=category, stage=stage, limit=limit)
+            as_of = self.store._now()
+            self._expire_diagnostics_tx(conn, user_id=user_id, device_id=device_id, as_of=as_of)
+            items = self._diagnostic_listing_items(conn, user_id, device_id, category=category, stage=stage, limit=limit, as_of=as_of)
             return {"items": items[:limit], "has_more": len(items) > limit}
 
     @staticmethod
-    def _decode_diagnostics_cursor(cursor: str | None) -> tuple[str, int, str] | None:
+    def _decode_diagnostics_cursor(cursor: str | None, *, scope: str) -> tuple[str, int, str] | None:
         if cursor is None:
             return None
         if not isinstance(cursor, str) or not cursor or len(cursor) > 512:
@@ -2483,7 +2613,7 @@ class FeatureGroups:
             payload = json.loads(base64.b64decode(encoded, altchars=b"-_", validate=True).decode("utf-8"))
         except (ValueError, UnicodeError, json.JSONDecodeError, binascii.Error) as exc:
             raise ValidationError("diagnostic cursor is invalid") from exc
-        if not isinstance(payload, dict) or set(payload) != {"sort_at", "sort_type", "entity_id"}:
+        if not isinstance(payload, dict) or set(payload) != {"version", "scope", "sort_at", "sort_type", "entity_id"} or payload.get("version") != 2 or payload.get("scope") != scope:
             raise ValidationError("diagnostic cursor is invalid")
         sort_at = payload["sort_at"]
         sort_type = payload["sort_type"]
@@ -2501,8 +2631,8 @@ class FeatureGroups:
         return sort_at, sort_type, entity_id
 
     @staticmethod
-    def _encode_diagnostics_cursor(sort_at: str, sort_type: int, entity_id: str) -> str:
-        payload = {"entity_id": entity_id, "sort_at": sort_at, "sort_type": sort_type}
+    def _encode_diagnostics_cursor(sort_at: str, sort_type: int, entity_id: str, *, scope: str) -> str:
+        payload = {"entity_id": entity_id, "scope": scope, "sort_at": sort_at, "sort_type": sort_type, "version": 2}
         return base64.urlsafe_b64encode(canonical_json(payload)).decode("ascii").rstrip("=")
 
     @staticmethod
@@ -2522,7 +2652,6 @@ class FeatureGroups:
             "bundle_id": row["entity_id"],
             "compressed_size": row["compressed_size"],
             "expanded_size": row["expanded_size"],
-            "payload_sha256": row["payload_sha256"],
             "created_at": row["sort_at"],
             "retention_deadline": row["retention_deadline"],
         }
@@ -2544,21 +2673,24 @@ class FeatureGroups:
         byte_limit = self.store.diagnostics_export_max_bytes if max_bytes is None else max_bytes
         if not isinstance(byte_limit, int) or isinstance(byte_limit, bool) or not 1024 <= byte_limit <= 64 * 1024 * 1024:
             raise ValidationError("diagnostic export byte limit is invalid")
-        decoded_cursor = self._decode_diagnostics_cursor(cursor)
-        with self.store._read() as conn:
+        scope = self._alias_digest("cursor", user_id, device_id, f"{category or ''}\x00{stage or ''}")
+        decoded_cursor = self._decode_diagnostics_cursor(cursor, scope=scope)
+        with self.store._tx() as conn:
             self.store._assert_device(conn, user_id, device_id)
-            event_clauses = ["e.user_id=?", "e.device_id=?", "e.deleted_at IS NULL"]
-            event_args: list[Any] = [user_id, device_id]
+            as_of = self.store._now()
+            self._expire_diagnostics_tx(conn, user_id=user_id, device_id=device_id, as_of=as_of)
+            event_clauses = ["e.user_id=?", "e.device_id=?", "e.deleted_at IS NULL", "e.retention_deadline > ?", "e.privacy_version=2", "e.migration_state='READY'"]
+            event_args: list[Any] = [user_id, device_id, as_of]
             if category is not None:
                 event_clauses.append("e.category=?")
                 event_args.append(category)
             if stage is not None:
                 event_clauses.append("e.stage=?")
                 event_args.append(stage)
-            bundle_clauses = ["b.user_id=?", "b.device_id=?", "b.deleted_at IS NULL"]
-            bundle_args: list[Any] = [user_id, device_id]
-            tombstone_clauses = ["t.user_id=?", "t.device_id=?"]
-            tombstone_args: list[Any] = [user_id, device_id]
+            bundle_clauses = ["b.user_id=?", "b.device_id=?", "b.deleted_at IS NULL", "b.retention_deadline > ?", "b.privacy_version=2", "b.migration_state='READY'"]
+            bundle_args: list[Any] = [user_id, device_id, as_of]
+            tombstone_clauses = ["t.user_id=?", "t.device_id=?", "t.expires_at > ?"]
+            tombstone_args: list[Any] = [user_id, device_id, as_of]
             union_sql = (
                 "SELECT 'event' AS entity_type, 0 AS sort_type, e.event_id AS entity_id, e.occurred_at AS sort_at, "
                 "e.category AS category, e.stage AS stage, e.metadata_json AS metadata_json, "
@@ -2570,7 +2702,7 @@ class FeatureGroups:
                 "FROM diagnostic_bundles b WHERE " + " AND ".join(bundle_clauses) + " UNION ALL "
                 "SELECT 'tombstone' AS entity_type, 2 AS sort_type, t.entity_id AS entity_id, t.deleted_at AS sort_at, "
                 "t.entity_type AS category, NULL AS stage, NULL AS metadata_json, NULL AS compressed_size, "
-                "NULL AS expanded_size, NULL AS payload_sha256, NULL AS retention_deadline "
+                "NULL AS expanded_size, NULL AS payload_sha256, t.expires_at AS retention_deadline "
                 "FROM diagnostic_tombstones t WHERE " + " AND ".join(tombstone_clauses)
             )
             args = [*event_args, *bundle_args, *tombstone_args]
@@ -2606,7 +2738,7 @@ class FeatureGroups:
             if index >= limit:
                 truncated = True
                 if last_key is not None:
-                    next_cursor = self._encode_diagnostics_cursor(*last_key)
+                    next_cursor = self._encode_diagnostics_cursor(*last_key, scope=scope)
                 break
             if row["entity_type"] == "tombstone":
                 item = {"entity_type": row["category"], "entity_id": row["entity_id"], "deleted_at": row["sort_at"]}
@@ -2627,7 +2759,7 @@ class FeatureGroups:
                     raise ValidationError("diagnostic export item exceeds byte limit")
                 truncated = True
                 if previous_key is not None:
-                    next_cursor = self._encode_diagnostics_cursor(*previous_key)
+                    next_cursor = self._encode_diagnostics_cursor(*previous_key, scope=scope)
                 last_key = previous_key
                 break
 
@@ -2642,14 +2774,17 @@ class FeatureGroups:
         timestamp = self._time(now, self.store)
         with self.store._tx() as conn:
             self.store._assert_device(conn, user_id, device_id)
-            events = conn.execute("SELECT event_id FROM diagnostic_events WHERE user_id=? AND device_id=? AND deleted_at IS NULL", (user_id, device_id)).fetchall()
-            bundles = conn.execute("SELECT bundle_id, storage_path, payload_sha256, compressed_size FROM diagnostic_bundles WHERE user_id=? AND device_id=? AND deleted_at IS NULL", (user_id, device_id)).fetchall()
+            as_of = timestamp
+            self._expire_diagnostics_tx(conn, user_id=user_id, device_id=device_id, as_of=as_of)
+            events = conn.execute("SELECT event_id, retention_deadline FROM diagnostic_events WHERE user_id=? AND device_id=? AND deleted_at IS NULL AND retention_deadline > ? AND privacy_version=2 AND migration_state='READY'", (user_id, device_id, as_of)).fetchall()
+            bundles = conn.execute("SELECT bundle_id, storage_path, payload_sha256, compressed_size, retention_deadline FROM diagnostic_bundles WHERE user_id=? AND device_id=? AND deleted_at IS NULL AND retention_deadline > ? AND privacy_version=2 AND migration_state='READY'", (user_id, device_id, as_of)).fetchall()
+            tombstone_expiry = self._plus_seconds(timestamp, self.store.diagnostics_tombstone_retention_seconds)
             for row in events:
-                conn.execute("UPDATE diagnostic_events SET category='deleted', stage='deleted', metadata_json='{}', occurred_at=?, retention_deadline=?, deleted_at=? WHERE event_id=?", (timestamp, timestamp, timestamp, row["event_id"]))
-                conn.execute("INSERT OR IGNORE INTO diagnostic_tombstones(tombstone_id, user_id, device_id, entity_type, entity_id, deleted_at) VALUES (?, ?, ?, 'event', ?, ?)", (str(uuid.uuid5(uuid.NAMESPACE_URL, f"recorder-next:diagnostic-tombstone:event:{row['event_id']}")), user_id, device_id, row["event_id"], timestamp))
+                conn.execute("UPDATE diagnostic_events SET category='other', stage='other', metadata_json='{}', deleted_at=? WHERE event_id=?", (timestamp, row["event_id"]))
+                conn.execute("INSERT OR IGNORE INTO diagnostic_tombstones(tombstone_id, user_id, device_id, entity_type, entity_id, deleted_at, expires_at) VALUES (?, ?, ?, 'event', ?, ?, ?)", (str(uuid.uuid4()), user_id, device_id, row["event_id"], timestamp, tombstone_expiry))
             for row in bundles:
-                conn.execute("UPDATE diagnostic_bundles SET compressed_size=0, expanded_size=0, payload_sha256=?, storage_path='', retention_deadline=?, deleted_at=? WHERE bundle_id=?", (sha256_bytes(f"deleted:{row['bundle_id']}".encode("utf-8")), timestamp, timestamp, row["bundle_id"]))
-                conn.execute("INSERT OR IGNORE INTO diagnostic_tombstones(tombstone_id, user_id, device_id, entity_type, entity_id, deleted_at) VALUES (?, ?, ?, 'bundle', ?, ?)", (str(uuid.uuid5(uuid.NAMESPACE_URL, f"recorder-next:diagnostic-tombstone:bundle:{row['bundle_id']}")), user_id, device_id, row["bundle_id"], timestamp))
+                conn.execute("UPDATE diagnostic_bundles SET compressed_size=0, expanded_size=0, storage_path='', deleted_at=? WHERE bundle_id=?", (timestamp, row["bundle_id"]))
+                conn.execute("INSERT OR IGNORE INTO diagnostic_tombstones(tombstone_id, user_id, device_id, entity_type, entity_id, deleted_at, expires_at) VALUES (?, ?, ?, 'bundle', ?, ?, ?)", (str(uuid.uuid4()), user_id, device_id, row["bundle_id"], timestamp, tombstone_expiry))
                 self.store._prepare_cleanup_receipt_tx(
                     conn,
                     operation="diagnostic_delete",
@@ -2675,32 +2810,9 @@ class FeatureGroups:
 
     def purge_diagnostics(self, *, now: str | None = None, _recover_cleanup: bool = True) -> dict[str, int]:
         timestamp = self._time(now, self.store)
-        tombstone_cutoff = self._plus_seconds(timestamp, -self.store.diagnostics_tombstone_retention_seconds)
         with self.store._tx() as conn:
-            expired_events = conn.execute("SELECT event_id FROM diagnostic_events WHERE deleted_at IS NULL AND retention_deadline <= ?", (timestamp,)).fetchall()
-            expired_bundles = conn.execute("SELECT bundle_id, user_id, device_id, storage_path, payload_sha256, compressed_size FROM diagnostic_bundles WHERE deleted_at IS NULL AND retention_deadline <= ?", (timestamp,)).fetchall()
-            for row in expired_events:
-                conn.execute("UPDATE diagnostic_events SET category='deleted', stage='deleted', metadata_json='{}', occurred_at=?, retention_deadline=?, deleted_at=? WHERE event_id=?", (timestamp, timestamp, timestamp, row["event_id"]))
-                conn.execute("INSERT OR IGNORE INTO diagnostic_tombstones(tombstone_id, user_id, device_id, entity_type, entity_id, deleted_at) SELECT ?, user_id, device_id, 'event', event_id, ? FROM diagnostic_events WHERE event_id=?", (str(uuid.uuid5(uuid.NAMESPACE_URL, f"recorder-next:diagnostic-tombstone:event:{row['event_id']}")), timestamp, row["event_id"]))
-            for row in expired_bundles:
-                conn.execute("UPDATE diagnostic_bundles SET compressed_size=0, expanded_size=0, payload_sha256=?, storage_path='', retention_deadline=?, deleted_at=? WHERE bundle_id=?", (sha256_bytes(f"deleted:{row['bundle_id']}".encode("utf-8")), timestamp, timestamp, row["bundle_id"]))
-                conn.execute("INSERT OR IGNORE INTO diagnostic_tombstones(tombstone_id, user_id, device_id, entity_type, entity_id, deleted_at) SELECT ?, user_id, device_id, 'bundle', bundle_id, ? FROM diagnostic_bundles WHERE bundle_id=?", (str(uuid.uuid5(uuid.NAMESPACE_URL, f"recorder-next:diagnostic-tombstone:bundle:{row['bundle_id']}")), timestamp, row["bundle_id"]))
-                self.store._prepare_cleanup_receipt_tx(
-                    conn,
-                    operation="diagnostic_purge",
-                    path=Path(row["storage_path"]),
-                    expected_sha256=row["payload_sha256"],
-                    expected_size=int(row["compressed_size"]),
-                    user_id=row["user_id"],
-                    device_id=row["device_id"],
-                    entity_type="diagnostic_bundle",
-                    entity_id=row["bundle_id"],
-                    now=timestamp,
-                )
-            expired_tombstones = conn.execute(
-                "SELECT tombstone_id FROM diagnostic_tombstones WHERE deleted_at <= ?",
-                (tombstone_cutoff,),
-            ).fetchall()
+            expired = self._expire_diagnostics_tx(conn, user_id=None, device_id=None, as_of=timestamp)
+            expired_tombstones = conn.execute("SELECT tombstone_id FROM diagnostic_tombstones WHERE expires_at <= ?", (timestamp,)).fetchall()
             if expired_tombstones:
                 conn.executemany(
                     "DELETE FROM diagnostic_tombstones WHERE tombstone_id=?",
@@ -2709,14 +2821,14 @@ class FeatureGroups:
         if _recover_cleanup:
             self.store.recover_cleanup_receipts(now=timestamp)
         if not _recover_cleanup:
-            return {"events": len(expired_events), "bundles": len(expired_bundles), "tombstones": len(expired_tombstones)}
+            return {"events": expired["events"], "bundles": expired["bundles"], "tombstones": len(expired_tombstones)}
         with self.store._read() as conn:
             pending = conn.execute(
                 "SELECT COUNT(*) FROM storage_cleanup_receipts WHERE operation IN ('diagnostic_delete', 'diagnostic_purge') AND status IN ('PENDING', 'BLOCKED')",
             ).fetchone()[0]
         if pending:
             raise CleanupIncompleteError("diagnostic purge cleanup is incomplete")
-        result = {"events": len(expired_events), "bundles": len(expired_bundles)}
+        result = {"events": expired["events"], "bundles": expired["bundles"]}
         if expired_tombstones:
             result["tombstones"] = len(expired_tombstones)
         return result

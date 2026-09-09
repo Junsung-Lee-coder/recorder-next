@@ -72,6 +72,26 @@ TTS_RESERVED_OPTIONS = {
 }
 
 
+def _reject_unknown_fields(value: Mapping[str, Any], allowed: set[str], context: str) -> None:
+    if any(not isinstance(key, str) for key in value):
+        raise ValueError(f"{context} field names must be strings")
+    unknown = sorted(set(value) - allowed)
+    if unknown:
+        raise ValueError(f"unknown {context} field: {unknown[0]}")
+
+
+def _validate_principal_id(value: Any, field: str) -> str:
+    if not isinstance(value, str) or not value or not value.strip() or len(value.encode("utf-8")) > 128:
+        raise ValueError(f"{field} must be a bounded non-empty string")
+    if any(ord(char) < 0x20 or ord(char) == 0x7F for char in value):
+        raise ValueError(f"{field} contains a control character")
+    try:
+        value.encode("utf-8", "strict")
+    except UnicodeEncodeError as exc:
+        raise ValueError(f"{field} contains an invalid Unicode scalar") from exc
+    return value
+
+
 @dataclass(frozen=True)
 class ProviderConfig:
     """Redaction-safe declaration for one configured ASR or TTS target."""
@@ -114,6 +134,43 @@ class ProviderConfig:
             spec = {"adapter": spec}
         if not isinstance(spec, Mapping):
             raise ValueError("provider declaration must be a table")
+        _reject_unknown_fields(
+            spec,
+            {
+                "name",
+                "adapter",
+                "provider",
+                "type",
+                "endpoint",
+                "url",
+                "model",
+                "voice",
+                "language",
+                "profile",
+                "credential_file",
+                "enabled",
+                "retries",
+                "timeout_seconds",
+                "timeout",
+                "fallback_of",
+                "health_path",
+                "health_probe",
+                "capability_path",
+                "capability_probe",
+                "max_bytes",
+                "media_max_bytes",
+                "media_types",
+                "accepted_media_types",
+                "priority",
+                "rate",
+                "pitch",
+                "volume",
+                "output_format",
+                "format",
+                "options",
+            },
+            f"{kind} provider",
+        )
         forbidden = {"api_key", "authorization", "password", "secret", "token", "inline_key", "credential"}
         if forbidden.intersection(str(key).lower() for key in spec):
             raise ValueError("inline provider secrets are not allowed")
@@ -318,6 +375,8 @@ class RecorderConfig:
     max_attachment_bytes: int = 250 * 1024 * 1024
     max_turn_bytes: int = 1024 * 1024 * 1024
     max_parts: int = 20
+    gateway_max_request_bytes: int = 10_000_000
+    internal_worker_principals: tuple[tuple[str, str], ...] = ()
     hermes_max_attempts: int = 2
     hermes_grace_seconds: int = 30
     asr_provider_timeout_seconds: int = 10
@@ -354,7 +413,7 @@ class RecorderConfig:
     diagnostics_max_compressed_bytes: int = 2 * 1024 * 1024
     diagnostics_max_expanded_bytes: int = 16 * 1024 * 1024
     diagnostics_retention_seconds: int = 7 * 86400
-    diagnostics_tombstone_retention_seconds: int = 7 * 86400
+    diagnostics_tombstone_retention_seconds: int = 30 * 86400
     diagnostics_export_max_bytes: int = 2 * 1024 * 1024
     asr_providers: tuple[ProviderConfig, ...] = ()
     tts_providers: tuple[ProviderConfig, ...] = ()
@@ -386,6 +445,27 @@ class RecorderConfig:
         object.__setattr__(self, "tts_chain", normalize_chain(self.tts_chain, "tts"))
         object.__setattr__(self, "asr_overrides", normalize_overrides(self.asr_overrides, "asr"))
         object.__setattr__(self, "tts_overrides", normalize_overrides(self.tts_overrides, "tts"))
+        principals = self.internal_worker_principals
+        if isinstance(principals, Mapping):
+            principals = tuple(principals.items())
+        else:
+            if isinstance(principals, (str, bytes, bytearray)):
+                raise ValueError("internal_worker_principals must be a sequence of pairs")
+            try:
+                principals = tuple(principals)
+            except TypeError as exc:
+                raise ValueError("internal_worker_principals must be a sequence of pairs") from exc
+        normalized_principals: list[tuple[str, str]] = []
+        for index, item in enumerate(principals):
+            if isinstance(item, (str, bytes, bytearray)) or not isinstance(item, Sequence) or len(item) != 2:
+                raise ValueError(f"internal_worker_principals[{index}] must be a pair")
+            normalized_principals.append(
+                (
+                    _validate_principal_id(item[0], f"internal_worker_principals[{index}].user_id"),
+                    _validate_principal_id(item[1], f"internal_worker_principals[{index}].device_id"),
+                )
+            )
+        object.__setattr__(self, "internal_worker_principals", tuple(normalized_principals))
 
         def materialize_primary(kind: str, source: str, endpoint: str | None, model: str | None, voice: str | None, credential: str | None, timeout_seconds: float) -> None:
             providers_field = "asr_providers" if kind == "asr" else "tts_providers"
@@ -567,13 +647,97 @@ class RecorderConfig:
         path = Path(path)
         with path.open("rb") as handle:
             data: dict[str, Any] = tomllib.load(handle)
+        _reject_unknown_fields(data, {"server", "storage", "limits", "retries", "diagnostics", "providers", "auth"}, "top-level")
         server = data.get("server", {})
         storage = data.get("storage", {})
         limits = data.get("limits", {})
         retries = data.get("retries", {})
+        diagnostics = data.get("diagnostics", {})
         providers = data.get("providers", {})
+        auth = data.get("auth", {})
+        for section, name in ((server, "server"), (storage, "storage"), (limits, "limits"), (retries, "retries"), (diagnostics, "diagnostics"), (auth, "auth")):
+            if not isinstance(section, Mapping):
+                raise ValueError(f"{name} must be a TOML table")
+        _reject_unknown_fields(server, {"host", "port", "internal_worker_principals"}, "server")
+        _reject_unknown_fields(storage, {"database", "root", "min_free_bytes"}, "storage")
+        _reject_unknown_fields(
+            limits,
+            {
+                "max_audio_minutes",
+                "max_audio_bytes",
+                "max_chunk_bytes",
+                "max_text_bytes",
+                "max_attachment_bytes",
+                "max_turn_bytes",
+                "max_parts",
+                "gateway_max_request_bytes",
+                "diagnostics_max_compressed_bytes",
+                "diagnostics_max_expanded_bytes",
+                "diagnostics_retention_seconds",
+                "diagnostics_tombstone_retention_seconds",
+                "diagnostics_export_max_bytes",
+            },
+            "limits",
+        )
+        _reject_unknown_fields(retries, {"hermes_max_attempts", "hermes_late_result_grace_seconds", "asr_provider_timeout_seconds", "tts_retry_seconds"}, "retries")
+        _reject_unknown_fields(diagnostics, {"max_compressed_bytes", "max_expanded_bytes", "retention_seconds", "tombstone_retention_seconds", "export_max_bytes"}, "diagnostics")
+        _reject_unknown_fields(auth, {"internal_worker_principals"}, "auth")
         if not isinstance(providers, Mapping):
             raise ValueError("providers must be a TOML table")
+        if not isinstance(diagnostics, Mapping):
+            raise ValueError("diagnostics must be a TOML table")
+        _reject_unknown_fields(
+            providers,
+            {
+                "hermes_base_url",
+                "hermes_audio_base_url",
+                "hermes_api_key_file",
+                "hermes_profile",
+                "asr_source",
+                "tts_source",
+                "asr_mode",
+                "tts_mode",
+                "asr_fallback_source",
+                "tts_fallback_source",
+                "realtime_asr",
+                "realtime_asr_provider",
+                "realtime_asr_endpoint",
+                "realtime_asr_model",
+                "realtime_asr_credential_file",
+                "batch_asr",
+                "batch_asr_provider",
+                "batch_asr_endpoint",
+                "batch_asr_model",
+                "batch_asr_credential_file",
+                "local_asr",
+                "local_asr_provider",
+                "local_asr_endpoint",
+                "local_asr_model",
+                "local_asr_credential_file",
+                "tts",
+                "tts_provider",
+                "tts_endpoint",
+                "tts_url",
+                "tts_model",
+                "tts_voice",
+                "tts_credential_file",
+                "tts_timeout_seconds",
+                "tts_artifact_ttl_seconds",
+                "asr_providers",
+                "tts_providers",
+                "asr",
+                "tts",
+                "asr_chain",
+                "tts_chain",
+                "asr_deadline_seconds",
+                "tts_deadline_seconds",
+                "asr_fallback_order",
+                "asr_overrides",
+                "tts_overrides",
+                "overrides",
+            },
+            "providers",
+        )
         provider_values = dict(providers)
         if "hermes_api_key_file" not in provider_values and os.environ.get("RECORDER_NEXT_HERMES_API_KEY_FILE"):
             provider_values["hermes_api_key_file"] = os.environ["RECORDER_NEXT_HERMES_API_KEY_FILE"]
@@ -614,10 +778,13 @@ class RecorderConfig:
             max_attachment_bytes=int(limits.get("max_attachment_bytes", cls.max_attachment_bytes)),
             max_turn_bytes=int(limits.get("max_turn_bytes", cls.max_turn_bytes)),
             max_parts=int(limits.get("max_parts", cls.max_parts)),
+            gateway_max_request_bytes=int(limits.get("gateway_max_request_bytes", cls.gateway_max_request_bytes)),
+            internal_worker_principals=server.get("internal_worker_principals", auth.get("internal_worker_principals", cls.internal_worker_principals)),
             hermes_max_attempts=int(retries.get("hermes_max_attempts", cls.hermes_max_attempts)),
             hermes_grace_seconds=int(retries.get("hermes_late_result_grace_seconds", cls.hermes_grace_seconds)),
             asr_provider_timeout_seconds=int(retries.get("asr_provider_timeout_seconds", cls.asr_provider_timeout_seconds)),
             tts_retry_seconds=int(retries.get("tts_retry_seconds", cls.tts_retry_seconds)),
+
             hermes_base_url=providers.get("hermes_base_url"),
             hermes_audio_base_url=providers.get("hermes_audio_base_url"),
             hermes_api_key_file=providers.get(
@@ -649,11 +816,11 @@ class RecorderConfig:
             tts_credential_file=str(tts_credential) if tts_credential is not None else None,
             tts_timeout_seconds=int(providers.get("tts_timeout_seconds", cls.tts_timeout_seconds)),
             tts_artifact_ttl_seconds=int(providers.get("tts_artifact_ttl_seconds", cls.tts_artifact_ttl_seconds)),
-            diagnostics_max_compressed_bytes=int(limits.get("diagnostics_max_compressed_bytes", cls.diagnostics_max_compressed_bytes)),
-            diagnostics_max_expanded_bytes=int(limits.get("diagnostics_max_expanded_bytes", cls.diagnostics_max_expanded_bytes)),
-            diagnostics_retention_seconds=int(limits.get("diagnostics_retention_seconds", cls.diagnostics_retention_seconds)),
-            diagnostics_tombstone_retention_seconds=int(limits.get("diagnostics_tombstone_retention_seconds", cls.diagnostics_tombstone_retention_seconds)),
-            diagnostics_export_max_bytes=int(limits.get("diagnostics_export_max_bytes", cls.diagnostics_export_max_bytes)),
+            diagnostics_max_compressed_bytes=int(diagnostics.get("max_compressed_bytes", limits.get("diagnostics_max_compressed_bytes", cls.diagnostics_max_compressed_bytes))),
+            diagnostics_max_expanded_bytes=int(diagnostics.get("max_expanded_bytes", limits.get("diagnostics_max_expanded_bytes", cls.diagnostics_max_expanded_bytes))),
+            diagnostics_retention_seconds=int(diagnostics.get("retention_seconds", limits.get("diagnostics_retention_seconds", cls.diagnostics_retention_seconds))),
+            diagnostics_tombstone_retention_seconds=int(diagnostics.get("tombstone_retention_seconds", limits.get("diagnostics_tombstone_retention_seconds", cls.diagnostics_tombstone_retention_seconds))),
+            diagnostics_export_max_bytes=int(diagnostics.get("export_max_bytes", limits.get("diagnostics_export_max_bytes", cls.diagnostics_export_max_bytes))),
             asr_providers=asr_registry,
             tts_providers=tts_registry,
             asr_chain=asr_chain,
@@ -672,6 +839,13 @@ class RecorderConfig:
             raise ValueError("server port must be between 1 and 65535")
         if not isinstance(self.host, str) or not self.host or any(ord(char) < 0x20 for char in self.host):
             raise ValueError("server host is invalid")
+        if not isinstance(self.gateway_max_request_bytes, int) or isinstance(self.gateway_max_request_bytes, bool) or not 1 <= self.gateway_max_request_bytes <= 10_000_000:
+            raise ValueError("gateway_max_request_bytes cannot exceed the installed Gateway limit")
+        if not isinstance(self.internal_worker_principals, tuple) or any(
+            not isinstance(item, tuple) or len(item) != 2 or any(not isinstance(value, str) or not value or len(value.encode("utf-8")) > 128 for value in item)
+            for item in self.internal_worker_principals
+        ) or len(set(self.internal_worker_principals)) != len(self.internal_worker_principals):
+            raise ValueError("internal_worker_principals is invalid")
         for field_name in ("asr_source", "tts_source", "asr_mode", "tts_mode"):
             value = getattr(self, field_name)
             if value is not None and (not isinstance(value, str) or not PROVIDER_NAME_RE.fullmatch(value)):
@@ -696,6 +870,9 @@ class RecorderConfig:
         if not isinstance(self.tts_deadline_seconds, (int, float)) or isinstance(self.tts_deadline_seconds, bool) or not 0 < float(self.tts_deadline_seconds) <= 1800:
             raise ValueError("TTS deadline is invalid")
         for field_name, minimum, maximum in (
+            ("diagnostics_max_compressed_bytes", 1024, 64 * 1024 * 1024),
+            ("diagnostics_max_expanded_bytes", 1024, 256 * 1024 * 1024),
+            ("diagnostics_retention_seconds", 1, 366 * 86400),
             ("diagnostics_tombstone_retention_seconds", 1, 366 * 86400),
             ("diagnostics_export_max_bytes", 1024, 64 * 1024 * 1024),
         ):

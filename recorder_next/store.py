@@ -8,6 +8,7 @@ import os
 import re
 import shutil
 import sqlite3
+import stat
 import threading
 import uuid
 from pathlib import Path
@@ -15,6 +16,9 @@ from typing import Any, Callable, Iterator, Mapping, Sequence
 from urllib.parse import quote
 
 from .canonical import canonical_json, hermes_content_hash, normalize_hermes_text, sha256_bytes, sha256_json
+from .hermes_wire import SubmissionContext
+from .ingress_contract import ManifestPolicy, validate_turn_manifest
+from .media import validate_wav
 from .errors import (
     ChunkConflict,
     CleanupIncompleteError,
@@ -25,6 +29,7 @@ from .errors import (
     NotReadyError,
     QuotaExceeded,
     RecorderError,
+    SourceUnavailableError,
     TurnIdConflict,
     UnauthorizedError,
     ValidationError,
@@ -102,9 +107,14 @@ class RecorderStore:
         self.max_parts = max_parts
         self.max_user_storage_bytes = max_user_storage_bytes
         self.min_free_bytes = max(0, min_free_bytes)
-        self.diagnostics_max_compressed_bytes = diagnostics_max_compressed_bytes
-        self.diagnostics_max_expanded_bytes = diagnostics_max_expanded_bytes
-        self.diagnostics_retention_seconds = diagnostics_retention_seconds
+        for name, value, lower, upper in (
+            ("diagnostics_max_compressed_bytes", diagnostics_max_compressed_bytes, 1, 64 * 1024 * 1024),
+            ("diagnostics_max_expanded_bytes", diagnostics_max_expanded_bytes, 1, 256 * 1024 * 1024),
+            ("diagnostics_retention_seconds", diagnostics_retention_seconds, 1, 366 * 86400),
+        ):
+            if not isinstance(value, int) or isinstance(value, bool) or not lower <= value <= upper:
+                raise ValueError(f"{name} is invalid")
+            setattr(self, name, value)
         if (
             not isinstance(diagnostics_tombstone_retention_seconds, int)
             or isinstance(diagnostics_tombstone_retention_seconds, bool)
@@ -145,7 +155,7 @@ class RecorderStore:
             conn.executescript(schema)
             version_row = conn.execute("SELECT value FROM schema_meta WHERE key='schema_version'").fetchone()
             version = int(version_row["value"]) if version_row is not None else 1
-            if version > 4:
+            if version > 5:
                 raise RuntimeError(f"unsupported Recorder schema version {version}")
             if version < 2:
                 self._apply_scheduled_migration(conn)
@@ -159,13 +169,21 @@ class RecorderStore:
                 self._apply_eavesdrop_migration(conn)
                 conn.execute("UPDATE schema_meta SET value='4' WHERE key='schema_version'")
                 version = 4
+            if version < 5:
+                self._apply_r25_migration(conn)
+                conn.execute("UPDATE schema_meta SET value='5' WHERE key='schema_version'")
+                version = 5
             # Worker receipt fields are additive to the schema-4 worker
             # tables. Keep startup compatible with an already-created schema
             # without dropping rows or changing the schema version contract.
             self._ensure_worker_receipt_columns(conn)
             self._ensure_lease_token_columns(conn)
+            self._ensure_worker_attempt_lease_token(conn)
             self._ensure_finish_columns(conn)
-            conn.execute("INSERT OR IGNORE INTO schema_meta(key, value) VALUES ('schema_version', '4')")
+            self._apply_r25_migration(conn)
+            self._ensure_c7_columns(conn)
+            conn.execute("INSERT OR IGNORE INTO schema_meta(key, value) VALUES ('schema_version', '5')")
+            conn.execute("UPDATE schema_meta SET value='5' WHERE key='schema_version'")
         finally:
             conn.close()
 
@@ -296,10 +314,87 @@ class RecorderStore:
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN lease_token TEXT")
 
     @staticmethod
+    def _ensure_worker_attempt_lease_token(conn: sqlite3.Connection) -> None:
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(worker_attempts)").fetchall()}
+        if "lease_token" not in columns:
+            conn.execute("ALTER TABLE worker_attempts ADD COLUMN lease_token TEXT")
+
+    @staticmethod
+    def _ensure_r25_ingress_columns(conn: sqlite3.Connection) -> None:
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(session_ingress)").fetchall()}
+        for name, definition in (
+            ("run_id", "TEXT"),
+            ("wire_revision", "TEXT NOT NULL DEFAULT 'hermes-runs-v1'"),
+            ("gateway_identity", "TEXT NOT NULL DEFAULT 'default'"),
+        ):
+            if name not in columns:
+                conn.execute(f"ALTER TABLE session_ingress ADD COLUMN {name} {definition}")
+
+    @staticmethod
+    def _ensure_c7_columns(conn: sqlite3.Connection) -> None:
+        """Add diagnostics-v2 state without rewriting or inventing legacy data."""
+        for table, definitions in (
+            ("diagnostics_consents", (("alias_digest", "TEXT"),)),
+            (
+                "diagnostic_events",
+                (("alias_digest", "TEXT"), ("privacy_version", "INTEGER NOT NULL DEFAULT 2"), ("migration_state", "TEXT NOT NULL DEFAULT 'READY'")),
+            ),
+            (
+                "diagnostic_bundles",
+                (("alias_digest", "TEXT"), ("privacy_version", "INTEGER NOT NULL DEFAULT 2"), ("migration_state", "TEXT NOT NULL DEFAULT 'READY'")),
+            ),
+            ("diagnostic_tombstones", (("expires_at", "TEXT"),)),
+        ):
+            columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+            for name, definition in definitions:
+                if name not in columns:
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
+        conn.execute("UPDATE diagnostic_tombstones SET expires_at=datetime(deleted_at, '+30 days') WHERE expires_at IS NULL")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_diagnostic_events_ready ON diagnostic_events(user_id, device_id, retention_deadline, privacy_version, migration_state)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_diagnostic_bundles_ready ON diagnostic_bundles(user_id, device_id, retention_deadline, privacy_version, migration_state)")
+
+    @staticmethod
+    def _apply_r25_migration(conn: sqlite3.Connection) -> None:
+        """Install one shared schema-5 generation for R25 durable contracts."""
+        RecorderStore._ensure_worker_attempt_lease_token(conn)
+        RecorderStore._ensure_r25_ingress_columns(conn)
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(turn_parts)").fetchall()}
+        if "source_deleted_at" not in columns:
+            conn.execute("ALTER TABLE turn_parts ADD COLUMN source_deleted_at TEXT")
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS hermes_run_bindings (
+                submission_id TEXT PRIMARY KEY,
+                subject_kind TEXT NOT NULL CHECK(subject_kind IN ('turn','eavesdrop')),
+                turn_id TEXT,
+                eavesdrop_session_id TEXT,
+                segment_sequence INTEGER,
+                segment_sha256 TEXT,
+                marker TEXT NOT NULL,
+                gateway_session_key TEXT NOT NULL,
+                gateway_identity TEXT NOT NULL,
+                canonical_request_sha256 TEXT NOT NULL,
+                wire_revision TEXT NOT NULL,
+                request_json TEXT NOT NULL,
+                run_id TEXT,
+                created_at TEXT NOT NULL,
+                bound_at TEXT,
+                CHECK ((subject_kind='turn' AND turn_id IS NOT NULL AND eavesdrop_session_id IS NULL AND segment_sequence IS NULL AND segment_sha256 IS NULL) OR
+                       (subject_kind='eavesdrop' AND turn_id IS NULL AND eavesdrop_session_id IS NOT NULL AND segment_sequence IS NOT NULL AND segment_sha256 IS NOT NULL)),
+                UNIQUE(gateway_identity, run_id),
+                FOREIGN KEY(turn_id) REFERENCES turns(turn_id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_hermes_binding_subject ON hermes_run_bindings(subject_kind, turn_id, eavesdrop_session_id, segment_sequence);
+            """
+        )
+
+    @staticmethod
     def _ensure_finish_columns(conn: sqlite3.Connection) -> None:
         columns = {row["name"] for row in conn.execute("PRAGMA table_info(turn_parts)").fetchall()}
         if "duration_ms" not in columns:
             conn.execute("ALTER TABLE turn_parts ADD COLUMN duration_ms INTEGER")
+        if "source_deleted_at" not in columns:
+            conn.execute("ALTER TABLE turn_parts ADD COLUMN source_deleted_at TEXT")
 
     def _now(self) -> str:
         if self._clock is None:
@@ -565,6 +660,11 @@ class RecorderStore:
         ]
         for part in parts:
             part["archived_at"] = part.get("archived_at")
+            part["source_available"] = bool(
+                part.get("status") == "COMPLETE"
+                and part.get("source_path")
+                and not part.get("source_deleted_at")
+            )
         turn["manifest"] = _loads(turn.pop("manifest_json"), {})
         turn["parts"] = parts
         turn["events"] = [
@@ -618,7 +718,17 @@ class RecorderStore:
             return self._turn_payload(conn, turn_id)
 
     def create_turn(self, manifest: Mapping[str, Any], *, require_registered_device: bool = False) -> dict[str, Any]:
-        manifest = dict(manifest)
+        manifest = validate_turn_manifest(
+            manifest,
+            ManifestPolicy(
+                max_parts=self.max_parts,
+                max_turn_bytes=self.max_turn_bytes,
+                max_audio_bytes=self.max_audio_bytes,
+                max_audio_minutes=self.max_audio_minutes,
+                max_text_bytes=self.max_text_bytes,
+                max_attachment_bytes=self.max_attachment_bytes,
+            ),
+        )
         parts = manifest.get("parts")
         if not isinstance(parts, list):
             raise ValidationError("parts must be an array")
@@ -711,11 +821,29 @@ class RecorderStore:
             raise ValidationError("user_id, device_id, and supported device kind are required")
         now = self._now()
         with self._tx() as conn:
-            conn.execute(
-                "INSERT INTO devices(user_id, device_id, kind, status, created_at) VALUES (?, ?, ?, 'active', ?) ON CONFLICT(user_id, device_id) DO UPDATE SET kind=excluded.kind, status='active', revoked_at=NULL",
-                (user_id, device_id, kind, now),
-            )
+            existing = conn.execute("SELECT * FROM devices WHERE user_id=? AND device_id=?", (user_id, device_id)).fetchone()
+            if existing is None:
+                conn.execute(
+                    "INSERT INTO devices(user_id, device_id, kind, status, created_at) VALUES (?, ?, ?, 'active', ?)",
+                    (user_id, device_id, kind, now),
+                )
+            elif existing["status"] == "revoked":
+                raise UnauthorizedError("device has been revoked and cannot be reactivated")
+            elif existing["kind"] != kind:
+                raise ConflictError("device kind is immutable")
         return self.get_device(user_id, device_id)
+
+    def confirm_device(self, user_id: str, device_id: str, kind: str) -> dict[str, Any]:
+        """Confirm an already operator-provisioned active identity."""
+        if kind not in {"phone", "watch", "other"}:
+            raise ValidationError("unsupported device kind")
+        with self._read() as conn:
+            row = conn.execute("SELECT * FROM devices WHERE user_id=? AND device_id=?", (user_id, device_id)).fetchone()
+            if row is None or row["status"] != "active":
+                raise UnauthorizedError("device is not registered or has been revoked")
+            if row["kind"] != kind:
+                raise ConflictError("device kind is immutable")
+            return _row(row) or {}
 
     def get_device(self, user_id: str, device_id: str) -> dict[str, Any]:
         with self._read() as conn:
@@ -958,7 +1086,7 @@ class RecorderStore:
             turn = self._turn_row(conn, turn_id)
             self._assert_turn_owner_tx(conn, turn, user_id, device_id)
             part = conn.execute(
-                "SELECT total_chunks, kind FROM turn_parts WHERE turn_id=? AND part_id=?", (turn_id, part_id)
+                "SELECT total_chunks, kind, source_deleted_at, status FROM turn_parts WHERE turn_id=? AND part_id=?", (turn_id, part_id)
             ).fetchone()
             if part is None:
                 raise NotFoundError("part not found")
@@ -995,10 +1123,22 @@ class RecorderStore:
             turn = self._turn_row(conn, turn_id)
             self._assert_turn_owner_tx(conn, turn, user_id, device_id)
             part = conn.execute(
-                "SELECT total_chunks, kind FROM turn_parts WHERE turn_id=? AND part_id=?", (turn_id, part_id)
+                "SELECT total_chunks, kind, source_deleted_at, status FROM turn_parts WHERE turn_id=? AND part_id=?", (turn_id, part_id)
             ).fetchone()
             if part is None:
                 raise NotFoundError("part not found")
+            if part["kind"] == "audio" and part["source_deleted_at"]:
+                return {
+                    "encoding": encoding,
+                    "offset": offset,
+                    "limit": limit,
+                    "missing": [],
+                    "missing_ranges": [] if encoding == "ranges" else None,
+                    "total_missing": 0,
+                    "next_offset": None,
+                    "complete": True,
+                    "source_available": False,
+                }
             expected = total_chunks if total_chunks is not None else part["total_chunks"]
             if expected is None:
                 return {
@@ -1010,6 +1150,7 @@ class RecorderStore:
                     "total_missing": 0,
                     "next_offset": None,
                     "complete": True,
+                    "source_available": bool(part["status"] == "COMPLETE" and not part["source_deleted_at"]),
                 }
             expected = self._validate_total_chunks(expected, kind=part["kind"])
             rows = conn.execute(
@@ -1039,7 +1180,8 @@ class RecorderStore:
                     "total_missing": total_missing,
                     "next_offset": consumed if consumed < total_missing else None,
                     "complete": consumed >= total_missing,
-                }
+                    "source_available": bool(part["status"] == "COMPLETE" and not part["source_deleted_at"]),
+                    }
 
             ranges: list[dict[str, int]] = []
             range_offset = 0
@@ -1069,6 +1211,7 @@ class RecorderStore:
                 "total_ranges": total_ranges,
                 "next_offset": consumed if consumed < total_ranges else None,
                 "complete": consumed >= total_ranges,
+                "source_available": bool(part["status"] == "COMPLETE" and not part["source_deleted_at"]),
             }
 
     def finish_part(
@@ -1138,10 +1281,17 @@ class RecorderStore:
                 raise ConflictError("declared_bytes does not match completed part")
             if part["declared_sha256"] is not None and part["declared_sha256"] != actual:
                 raise ConflictError("declared_sha256 does not match completed part")
+            if part["kind"] == "audio":
+                validate_wav(
+                    bytes(assembled),
+                    part_id=part_id,
+                    mime=part["mime"],
+                    duration_ms=duration_ms,
+                )
             assembled_path = self._part_dir(turn["user_id"], turn_id, part_id) / "part.bin"
             self._safe_write(assembled_path, bytes(assembled))
             conn.execute(
-                "UPDATE turn_parts SET total_chunks=?, total_bytes=?, whole_stream_sha256=?, duration_ms=?, status='COMPLETE', source_path=? WHERE turn_id=? AND part_id=?",
+                "UPDATE turn_parts SET total_chunks=?, total_bytes=?, whole_stream_sha256=?, duration_ms=?, status='COMPLETE', source_path=?, source_deleted_at=NULL WHERE turn_id=? AND part_id=?",
                 (total_chunks, total_bytes, actual, duration_ms, str(assembled_path), turn_id, part_id),
             )
             return _row(
@@ -1166,6 +1316,8 @@ class RecorderStore:
             ).fetchone()
             if part is None:
                 raise NotFoundError("part not found")
+            if part["source_deleted_at"]:
+                raise SourceUnavailableError("part source is no longer available")
             if part["status"] != "COMPLETE" or not part["source_path"]:
                 raise NotReadyError("part source is not assembled")
             from .features import FeatureGroups
@@ -1478,7 +1630,7 @@ class RecorderStore:
         if row is None or row["state"] != "IN_PROGRESS" or row["lease_owner"] != owner or row["lease_expires_at"] <= now:
             raise LeaseConflict("router lease is not owned or has expired")
 
-    def commit_route(self, turn_id: str, decision: RouterDecision | Mapping[str, Any], *, owner: str | None = None, now: str | None = None, worker_claim: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    def commit_route(self, turn_id: str, decision: RouterDecision | Mapping[str, Any], *, owner: str | None = None, now: str | None = None, worker_claim: Mapping[str, Any] | None = None, gateway_identity: str = "default", wire_revision: str = "hermes-runs-v1") -> dict[str, Any]:
         if not isinstance(decision, RouterDecision):
             decision = RouterDecision(**dict(decision))
         now = now or self._now()
@@ -1563,8 +1715,12 @@ class RecorderStore:
             ingress_hash = sha256_json(ingress_payload)
             gateway_key = decision.session_key
             conn.execute(
-                "INSERT INTO session_ingress(hermes_submission_id, turn_id, user_id, target_session_id, gateway_session_key, accepted_seq, payload_sha256, payload_json, marker, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (submission_id, turn_id, turn["user_id"], decision.project_id, gateway_key, turn["accepted_seq"], ingress_hash, _json(ingress_payload), marker, now, now),
+                "INSERT INTO session_ingress(hermes_submission_id, turn_id, user_id, target_session_id, gateway_session_key, accepted_seq, payload_sha256, payload_json, marker, wire_revision, gateway_identity, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (submission_id, turn_id, turn["user_id"], decision.project_id, gateway_key, turn["accepted_seq"], ingress_hash, _json(ingress_payload), marker, wire_revision, gateway_identity, now, now),
+            )
+            conn.execute(
+                "INSERT INTO hermes_run_bindings(submission_id, subject_kind, turn_id, marker, gateway_session_key, gateway_identity, canonical_request_sha256, wire_revision, request_json, created_at) VALUES (?, 'turn', ?, ?, ?, ?, ?, ?, ?, ?)",
+                (submission_id, turn_id, marker, gateway_key, gateway_identity, sha256_json(hermes_request), wire_revision, _json(hermes_request), now),
             )
             self._create_tts_tx(
                 conn,
@@ -1772,6 +1928,94 @@ class RecorderStore:
             result["payload"] = _loads(result.pop("payload_json"), {})
             return result
 
+    @staticmethod
+    def _submission_context_from_row(row: Mapping[str, Any]) -> SubmissionContext:
+        request = _loads(row.get("request_json"), None)
+        if not isinstance(request, Mapping):
+            raise ConflictError("Hermes submission snapshot is invalid")
+        return SubmissionContext(
+            submission_id=str(row["submission_id"]),
+            subject_kind=str(row["subject_kind"]),
+            turn_id=row.get("turn_id"),
+            eavesdrop_session_id=row.get("eavesdrop_session_id"),
+            segment_sequence=row.get("segment_sequence"),
+            segment_sha256=row.get("segment_sha256"),
+            marker=str(row["marker"]),
+            gateway_session_key=str(row["gateway_session_key"]),
+            gateway_identity=str(row["gateway_identity"]),
+            canonical_request_sha256=str(row["canonical_request_sha256"]),
+            wire_revision=str(row["wire_revision"]),
+            request=dict(request),
+            run_id=row.get("run_id"),
+        )
+
+    def get_hermes_binding(self, submission_id: str) -> dict[str, Any]:
+        if not isinstance(submission_id, str) or not submission_id:
+            raise ValidationError("submission_id is required")
+        with self._read() as conn:
+            row = conn.execute("SELECT * FROM hermes_run_bindings WHERE submission_id=?", (submission_id,)).fetchone()
+            if row is None:
+                raise NotFoundError("Hermes submission binding not found")
+            result = _row(row) or {}
+            result["request"] = _loads(result.pop("request_json"), {})
+            return result
+
+    def submission_context(self, submission_id: str) -> SubmissionContext:
+        binding = self.get_hermes_binding(submission_id)
+        request = binding.pop("request")
+        binding["request_json"] = _json(request)
+        return self._submission_context_from_row(binding)
+
+    def bind_hermes_run(
+        self,
+        submission_id: str,
+        run_id: str,
+        *,
+        owner: str | None = None,
+        lease_token: str | None = None,
+        worker_claim: Mapping[str, Any] | None = None,
+        now: str | None = None,
+    ) -> dict[str, Any]:
+        if not isinstance(submission_id, str) or not submission_id:
+            raise ValidationError("submission_id is required")
+        if not isinstance(run_id, str) or not run_id or len(run_id) > 255 or any(ord(ch) < 33 or ord(ch) > 126 for ch in run_id):
+            raise ValidationError("run_id is invalid")
+        timestamp = now or self._now()
+        with self._tx() as conn:
+            row = conn.execute("SELECT * FROM hermes_run_bindings WHERE submission_id=?", (submission_id,)).fetchone()
+            if row is None:
+                raise NotFoundError("Hermes submission binding not found")
+            if worker_claim is not None and not self._features._assert_worker_effect_tx(conn, worker_claim, now=timestamp, stage="hermes", turn_id=row["turn_id"]):
+                raise LeaseConflict("Hermes run binding worker authority has expired")
+            if row["subject_kind"] == "turn":
+                ingress = conn.execute("SELECT * FROM session_ingress WHERE hermes_submission_id=?", (submission_id,)).fetchone()
+                if ingress is None:
+                    raise ConflictError("Hermes turn ingress is missing")
+                if owner is None or lease_token is None or ingress["status"] != "IN_PROGRESS" or ingress["lease_owner"] != owner or ingress["lease_token"] != lease_token or not ingress["lease_expires_at"] or ingress["lease_expires_at"] <= timestamp:
+                    raise LeaseConflict("Hermes run binding requires the active ingress lease")
+            elif worker_claim is None:
+                raise LeaseConflict("Hermes eavesdrop binding requires the active worker claim")
+            existing_run = row["run_id"]
+            if existing_run is not None:
+                if existing_run != run_id:
+                    raise ConflictError("Hermes submission returned conflicting run IDs")
+                return _row(row) or {}
+            collision = conn.execute(
+                "SELECT submission_id FROM hermes_run_bindings WHERE gateway_identity=? AND run_id=? AND submission_id<>?",
+                (row["gateway_identity"], run_id, submission_id),
+            ).fetchone()
+            if collision is not None:
+                raise ConflictError("Hermes run ID is already bound to another submission")
+            changed = conn.execute(
+                "UPDATE hermes_run_bindings SET run_id=?, bound_at=? WHERE submission_id=? AND run_id IS NULL",
+                (run_id, timestamp, submission_id),
+            ).rowcount
+            if changed != 1:
+                raise ConflictError("Hermes submission run binding changed concurrently")
+            if row["subject_kind"] == "turn":
+                conn.execute("UPDATE session_ingress SET run_id=?, updated_at=? WHERE hermes_submission_id=? AND run_id IS NULL", (run_id, timestamp, submission_id))
+            return _row(conn.execute("SELECT * FROM hermes_run_bindings WHERE submission_id=?", (submission_id,)).fetchone()) or {}
+
     def _get_submission_tx(self, conn: sqlite3.Connection, submission_id: str) -> sqlite3.Row:
         row = conn.execute("SELECT * FROM session_ingress WHERE hermes_submission_id=?", (submission_id,)).fetchone()
         if row is None:
@@ -1812,6 +2056,20 @@ class RecorderStore:
                 ingress = self._assert_ingress_claim_tx(conn, submission_id, owner, lease_token, timestamp)
             else:
                 ingress = self._get_submission_tx(conn, submission_id)
+            binding = conn.execute("SELECT * FROM hermes_run_bindings WHERE submission_id=?", (submission_id,)).fetchone()
+            if binding is None or binding["subject_kind"] != "turn" or binding["turn_id"] != ingress["turn_id"] or binding["run_id"] is None:
+                raise ConflictError("Hermes result has no durable run binding")
+            expected = {
+                "submission_id": submission_id,
+                "turn_id": ingress["turn_id"],
+                "marker": binding["marker"],
+                "session_key": binding["gateway_session_key"],
+                "run_id": binding["run_id"],
+                "request_sha256": binding["canonical_request_sha256"],
+                "subject_kind": "turn",
+            }
+            if any(getattr(result, key, None) != value for key, value in expected.items()):
+                raise ConflictError("Hermes result provenance does not match the durable run binding")
             return self._commit_hermes_result_tx(conn, ingress, result, combined_content=combined_content)
 
     def _commit_hermes_result_tx(self, conn: sqlite3.Connection, ingress: sqlite3.Row, result: HermesResult, *, combined_content: str | None = None) -> dict[str, Any]:
@@ -3054,6 +3312,148 @@ class RecorderStore:
             ).rowcount
             return new_generation if changed else None
 
+    @staticmethod
+    def _audio_cleanup_targets_tx(conn: sqlite3.Connection, turn_id: str) -> list[dict[str, Any]]:
+        """Freeze only files owned by audio parts in this exact turn."""
+        targets: list[dict[str, Any]] = []
+        for row in conn.execute(
+            "SELECT p.part_id, p.source_path, p.total_bytes, p.whole_stream_sha256 FROM turn_parts p "
+            "WHERE p.turn_id=? AND p.kind='audio' AND p.source_path IS NOT NULL",
+            (turn_id,),
+        ).fetchall():
+            targets.append({
+                "kind": "part",
+                "part_id": row["part_id"],
+                "path": row["source_path"],
+                "byte_length": row["total_bytes"],
+                "sha256": row["whole_stream_sha256"],
+            })
+        for row in conn.execute(
+            "SELECT c.part_id, c.sequence, c.storage_path, c.byte_length, c.sha256 FROM turn_chunks c "
+            "JOIN turn_parts p ON p.turn_id=c.turn_id AND p.part_id=c.part_id "
+            "WHERE c.turn_id=? AND p.kind='audio' ORDER BY c.part_id, c.sequence",
+            (turn_id,),
+        ).fetchall():
+            targets.append({
+                "kind": "chunk",
+                "part_id": row["part_id"],
+                "sequence": row["sequence"],
+                "path": row["storage_path"],
+                "byte_length": row["byte_length"],
+                "sha256": row["sha256"],
+            })
+        return targets
+
+    @staticmethod
+    def _cleanup_target_matches(path: Path, target: Mapping[str, Any]) -> bool:
+        """Prove the frozen path still contains the bytes selected in SQL."""
+        try:
+            info = path.lstat()
+            if not stat.S_ISREG(info.st_mode):
+                return False
+            expected_size = target.get("byte_length")
+            if isinstance(expected_size, int) and info.st_size != expected_size:
+                return False
+            expected_hash = target.get("sha256")
+            if not isinstance(expected_hash, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", expected_hash):
+                return False
+            digest = hashlib.sha256()
+            with path.open("rb") as handle:
+                for block in iter(lambda: handle.read(1024 * 1024), b""):
+                    digest.update(block)
+            return digest.hexdigest().lower() == expected_hash.lower()
+        except FileNotFoundError:
+            # A lost managed file is already physically deleted; converge the
+            # owning row without deleting a replacement at the same path.
+            return True
+        except (OSError, ValueError):
+            return False
+
+    def _audio_path_has_foreign_reference_tx(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        turn_id: str,
+        target: Mapping[str, Any],
+    ) -> bool:
+        path = str(target["path"])
+        if target["kind"] == "chunk":
+            chunk_conflict = conn.execute(
+                "SELECT 1 FROM turn_chunks WHERE storage_path=? "
+                "AND NOT (turn_id=? AND part_id=? AND sequence=?) LIMIT 1",
+                (path, turn_id, target["part_id"], target["sequence"]),
+            ).fetchone()
+        else:
+            chunk_conflict = conn.execute(
+                "SELECT 1 FROM turn_chunks WHERE storage_path=? LIMIT 1",
+                (path,),
+            ).fetchone()
+        if chunk_conflict is not None:
+            return True
+        part_conflict = conn.execute(
+            "SELECT 1 FROM turn_parts WHERE source_path=? "
+            "AND NOT (turn_id=? AND part_id=?) LIMIT 1",
+            (path, turn_id, target["part_id"]),
+        ).fetchone()
+        return part_conflict is not None
+
+    def _converge_audio_cleanup(self, turn_id: str, targets: Sequence[Mapping[str, Any]]) -> bool:
+        """Unlink frozen targets and converge only their matching DB rows."""
+        complete = True
+        with self._write_lock:
+            for target in targets:
+                path = Path(str(target["path"]))
+                with self._read() as conn:
+                    if self._audio_path_has_foreign_reference_tx(conn, turn_id=turn_id, target=target):
+                        complete = False
+                        continue
+                try:
+                    if not self._cleanup_target_matches(path, target):
+                        complete = False
+                        continue
+                    self._safe_unlink(path)
+                except FileNotFoundError:
+                    pass
+                except (OSError, RecorderError):
+                    complete = False
+                    continue
+                with self._tx() as conn:
+                    if self._audio_path_has_foreign_reference_tx(conn, turn_id=turn_id, target=target):
+                        complete = False
+                        continue
+                    if target["kind"] == "chunk":
+                        conn.execute(
+                            "DELETE FROM turn_chunks WHERE turn_id=? AND part_id=? AND sequence=? AND storage_path=?",
+                            (turn_id, target["part_id"], target["sequence"], str(target["path"])),
+                        )
+                    else:
+                        conn.execute(
+                            "UPDATE turn_parts SET source_path=NULL, source_deleted_at=? "
+                            "WHERE turn_id=? AND part_id=? AND source_path=?",
+                            (self._now(), turn_id, target["part_id"], str(target["path"])),
+                        )
+            with self._tx() as conn:
+                remaining = conn.execute(
+                    "SELECT 1 FROM turn_parts p WHERE p.turn_id=? AND p.kind='audio' "
+                    "AND p.source_path IS NOT NULL LIMIT 1",
+                    (turn_id,),
+                ).fetchone()
+                remaining_chunks = conn.execute(
+                    "SELECT 1 FROM turn_chunks c JOIN turn_parts p "
+                    "ON p.turn_id=c.turn_id AND p.part_id=c.part_id "
+                    "WHERE c.turn_id=? AND p.kind='audio' LIMIT 1",
+                    (turn_id,),
+                ).fetchone()
+                if remaining is not None or remaining_chunks is not None:
+                    complete = False
+                if complete:
+                    conn.execute(
+                        "UPDATE turns SET source_deleted=1, updated_at=? "
+                        "WHERE turn_id=? AND authoritative_asr_outcome='VALID_TRANSCRIPT'",
+                        (self._now(), turn_id),
+                    )
+        return complete
+
     def commit_asr_result(
         self,
         turn_id: str,
@@ -3064,7 +3464,7 @@ class RecorderStore:
         authoritative: bool = True,
         worker_claim: Mapping[str, Any] | None = None,
     ) -> bool:
-        paths: list[Path] = []
+        cleanup_targets: list[dict[str, Any]] = []
         with self._tx() as conn:
             if worker_claim is not None and not self._features._assert_worker_effect_tx(conn, worker_claim, now=self._now(), stage="asr", turn_id=turn_id):
                 return False
@@ -3090,11 +3490,7 @@ class RecorderStore:
             if not authoritative:
                 return True
             if result.outcome == "VALID_TRANSCRIPT":
-                for part in conn.execute("SELECT source_path FROM turn_parts WHERE turn_id=? AND kind='audio'", (turn_id,)).fetchall():
-                    if part["source_path"]:
-                        paths.append(Path(part["source_path"]))
-                for chunk in conn.execute("SELECT storage_path FROM turn_chunks WHERE turn_id=? AND part_id IN (SELECT part_id FROM turn_parts WHERE kind='audio')", (turn_id,)).fetchall():
-                    paths.append(Path(chunk["storage_path"]))
+                cleanup_targets = self._audio_cleanup_targets_tx(conn, turn_id)
                 conn.execute(
                     "UPDATE turns SET transcript=?, authoritative_asr_outcome='VALID_TRANSCRIPT', source_deleted=0, state=CASE WHEN state IN ('ACCEPTED','PREPROCESSING','RETRY_WAIT') THEN 'ACCEPTED' ELSE state END, updated_at=? WHERE turn_id=?",
                     (result.transcript, self._now(), turn_id),
@@ -3142,31 +3538,19 @@ class RecorderStore:
                         (self._now(), turn_id),
                     )
         if result.outcome == "VALID_TRANSCRIPT":
-            deletion_complete = True
             if worker_claim is not None:
                 try:
                     if not self.assert_worker_effect_authority(worker_claim, stage="asr", turn_id=turn_id):
                         return True
                 except LeaseConflict:
                     return True
-            for path in paths:
-                if worker_claim is not None:
-                    try:
-                        if not self.assert_worker_effect_authority(worker_claim, stage="asr", turn_id=turn_id):
-                            return True
-                    except LeaseConflict:
-                        return True
+            if worker_claim is not None:
                 try:
-                    self._safe_unlink(path)
-                except FileNotFoundError:
-                    pass
-                except (OSError, RecorderError):
-                    deletion_complete = False
-            if deletion_complete:
-                with self._tx() as conn:
-                    if worker_claim is not None and not self._features._assert_worker_effect_tx(conn, worker_claim, now=self._now(), stage="asr", turn_id=turn_id):
+                    if not self.assert_worker_effect_authority(worker_claim, stage="asr", turn_id=turn_id):
                         return True
-                    conn.execute("UPDATE turns SET source_deleted=1, updated_at=? WHERE turn_id=? AND authoritative_asr_outcome='VALID_TRANSCRIPT'", (self._now(), turn_id))
+                except LeaseConflict:
+                    return True
+            self._converge_audio_cleanup(turn_id, cleanup_targets)
         return True
 
     def retry_source_deletion(self, turn_id: str) -> bool:
@@ -3174,20 +3558,8 @@ class RecorderStore:
             turn = conn.execute("SELECT source_deleted, authoritative_asr_outcome FROM turns WHERE turn_id=?", (turn_id,)).fetchone()
             if turn is None or turn["source_deleted"] or turn["authoritative_asr_outcome"] != "VALID_TRANSCRIPT":
                 return bool(turn and turn["source_deleted"])
-            paths = [Path(row["storage_path"]) for row in conn.execute("SELECT storage_path FROM turn_chunks WHERE turn_id=? AND part_id IN (SELECT part_id FROM turn_parts WHERE kind='audio')", (turn_id,)).fetchall()]
-            paths.extend(Path(row["source_path"]) for row in conn.execute("SELECT source_path FROM turn_parts WHERE turn_id=? AND kind='audio' AND source_path IS NOT NULL", (turn_id,)).fetchall())
-        complete = True
-        for path in paths:
-            try:
-                self._safe_unlink(path)
-            except FileNotFoundError:
-                pass
-            except (OSError, RecorderError):
-                complete = False
-        if complete:
-            with self._tx() as conn:
-                conn.execute("UPDATE turns SET source_deleted=1, updated_at=? WHERE turn_id=? AND authoritative_asr_outcome='VALID_TRANSCRIPT'", (self._now(), turn_id))
-        return complete
+            cleanup_targets = self._audio_cleanup_targets_tx(conn, turn_id)
+        return self._converge_audio_cleanup(turn_id, cleanup_targets)
 
     def recover(self, *, now: str | None = None) -> dict[str, int]:
         now = now or self._now()
@@ -3551,6 +3923,9 @@ class RecorderStore:
 
     def record_eavesdrop_reply(self, session_id: str, **kwargs: Any) -> dict[str, Any]:
         return self._features.record_eavesdrop_reply(session_id, **kwargs)
+
+    def commit_eavesdrop_result(self, submission_id: str, result: Any, **kwargs: Any) -> dict[str, Any]:
+        return self._features.commit_eavesdrop_result(submission_id, result, **kwargs)
 
     def list_eavesdrop_replies(self, session_id: str, **kwargs: Any) -> list[dict[str, Any]]:
         return self._features.list_eavesdrop_replies(session_id, **kwargs)

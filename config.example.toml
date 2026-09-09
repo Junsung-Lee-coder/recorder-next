@@ -7,6 +7,9 @@ port = 8643
 # Network API calls require RECORDER_INGRESS_SECRET and a trusted ingress
 # principal signature. Keep the secret in deployment environment/credential
 # plumbing; it is intentionally not represented in this file.
+# Worker-control routes also require an active signed principal listed here.
+# Leave empty unless a dedicated worker identity is provisioned.
+internal_worker_principals = []
 
 [storage]
 database = "./state/recorder-next.sqlite3"
@@ -21,6 +24,17 @@ max_text_bytes = 10485760
 max_attachment_bytes = 262144000
 max_turn_bytes = 1073741824
 max_parts = 20
+# Wire request cap for the pinned Hermes consumer; it may be lowered, not raised.
+gateway_max_request_bytes = 10000000
+
+[diagnostics]
+# Compressed uploads are bounded before decompression; expanded data is
+# redacted, recompressed, and retained only for the configured window.
+max_compressed_bytes = 2097152
+max_expanded_bytes = 16777216
+retention_seconds = 604800
+tombstone_retention_seconds = 2592000
+export_max_bytes = 2097152
 
 [retries]
 hermes_max_attempts = 2

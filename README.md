@@ -24,8 +24,9 @@ Recorder Next is a server-only, SQLite-authoritative adapter between Phone/Watch
 - immutable Phone/Wear update manifests with monotonic generations, CAS
   publication, SHA-256/ETag range serving, and APK identity metadata
 - project-scoped cursor history read model with path-free attachment summaries
-- hash-bound resolver delivery of completed image/document/text attachments into
-  Hermes; incomplete or changed bytes fail closed
+- hash-bound resolver delivery of completed text/image/canonical-WAV inputs into
+  Hermes; PDF, CSV, generic binary, and document delivery are unsupported and
+  rejected before durable acceptance; incomplete or changed bytes fail closed
 - Phone-mediated Watch eavesdrop state machine with a separate routing decision
   agent, `FORWARD_DEFAULT`/`STORE_SILENT` outcomes, and no project auto-switch
 - opt-in diagnostics with consent revocation, bounded compressed bundles,
@@ -34,7 +35,7 @@ Recorder Next is a server-only, SQLite-authoritative adapter between Phone/Watch
 - clean-install schema, config example, service template, OpenAPI JSON, and deterministic fixtures
 - generated multimodal acceptance fixtures under `fixtures/generated/`: offline espeak-ng Korean/English speech, PNG, PDF, UTF-8 text, CSV, and generic binary; each file is hash-bound by `fixtures/generated/manifest.json`
 
-The default candidate uses only Python 3.11+ standard-library modules. Real ASR/TTS/Hermes adapters are injected at the seam. The generated acceptance fixture set contains synthetic speech and files only; no user content is included. Mixed turns are intentionally outside the current Phone/Watch-supported scope.
+The default candidate uses only Python 3.11+ standard-library modules. Real ASR/TTS/Hermes adapters are injected at the seam. The generated acceptance fixture set contains synthetic speech and files only; no user content is included. Supported ingress kinds are text (`text/plain`), image (`image/*`), and canonical PCM16 mono 16 kHz WAV (`audio/wav` or `audio/x-wav`); `documents=false`. Mixed turns are intentionally outside the current Phone/Watch-supported scope.
 
 ## Run a local smoke server
 
@@ -63,7 +64,7 @@ python3 fixtures/generate_multimodal_fixtures.py \\
   --espeak-data /path/to/espeak-ng-data-parent
 ```
 
-The generator uses fixed prompts, fixed voice parameters, deterministic mode, and metadata-stripped 16 kHz mono PCM16 WAV output. The acceptance tests exercise voice, text, image, PDF/TXT/CSV, and generic attachment cases as separate single-input turns; they do not implement mixed multipart turns.
+The generator uses fixed prompts, fixed voice parameters, deterministic mode, and metadata-stripped 16 kHz mono PCM16 WAV output. The acceptance fixtures cover the admitted text, image, and canonical WAV profiles; PDF, CSV, generic binary, and mixed multipart inputs are explicit rejection cases.
 
 The tests use temporary SQLite databases, temporary spool roots, generated fixture bytes, and ephemeral loopback ports. No credentials, devices, AVDs/APKs, legacy databases, or live services are touched.
 
@@ -83,7 +84,7 @@ The machine-readable contract is `api/openapi.json` and is also served at `GET /
 10. `GET /v1/history?user_id=...&project_id=...&cursor=...` returns the path-free project read model with filter-bound keyset cursors.
 11. Phone-owned eavesdrop controls use `POST /v1/eavesdrop`, `POST /v1/eavesdrop/{id}/activate|pause|resume|stop`, `POST /v1/eavesdrop/{id}/segments`, and `POST /v1/eavesdrop/{id}/segments/{sequence}/route`; readback requires the registered Phone owner tuple.
 12. Opt-in diagnostics use `POST /v1/diagnostics/opt-in`, `POST /v1/diagnostics/events`, `POST /v1/diagnostics/bundles`, `GET /v1/diagnostics`, `GET /v1/diagnostics/export`, and `DELETE /v1/diagnostics`.
-13. Router, Hermes, scheduler, and durable worker execution are in-process lifecycle components; no state-changing `/v1/internal/*` worker-pump route is part of the production API. Worker health is read-only and background workers are started by the service entry point.
+13. Router, Hermes, scheduler, and durable worker execution are in-process lifecycle components. The exact allowlisted `/v1/internal/worker/{claim,recover,complete,fail,run}` controls are available only to a verified active worker principal; worker health is read-only and background workers are also started by the service entry point.
 
 Network requests other than health, OpenAPI, and immutable update reads require a verified principal. Configure the deployment-only `RECORDER_INGRESS_SECRET`; the trusted ingress signs `X-Recorder-Principal-User` plus `X-Recorder-Principal-Device` with HMAC-SHA256 and sends the signature in `X-Recorder-Principal-Signature`. The principal identity must match all user/device fields in the query or JSON body. Direct in-process calls are not a network authorization boundary.
 

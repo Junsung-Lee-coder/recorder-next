@@ -58,6 +58,16 @@ class UnauthorizedError(RecorderError):
     status = 401
 
 
+class ForbiddenError(RecorderError):
+    code = "FORBIDDEN"
+    status = 403
+
+
+class GatewayRequestTooLargeError(RecorderError):
+    code = "GATEWAY_REQUEST_TOO_LARGE"
+    status = 413
+
+
 class ProviderError(RecorderError):
     code = "PROVIDER_ERROR"
     status = 502
@@ -66,6 +76,11 @@ class ProviderError(RecorderError):
 class NotReadyError(RecorderError):
     code = "NOT_READY"
     status = 409
+
+
+class SourceUnavailableError(RecorderError):
+    code = "SOURCE_UNAVAILABLE"
+    status = 410
 
 
 class CleanupIncompleteError(ConflictError):

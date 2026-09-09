@@ -15,6 +15,7 @@ from unittest.mock import patch
 from recorder_next.adapters import HermesAudioASRProvider
 from recorder_next.config import RecorderConfig
 from recorder_next.service import create_configured_service
+from tests.r25_test_helpers import canonical_wav
 
 
 class _ASRFixture:
@@ -138,7 +139,7 @@ class ConfiguredASRContractTests(unittest.TestCase):
                 device_id = "configured-asr-device"
                 service.store.register_device(user_id, device_id, "phone")
                 turn_id = "018f5a2e-7b6e-7abc-8d11-1234567890b1"
-                audio = b"RIFF-configured-public-asr"
+                audio = canonical_wav()
                 manifest = {
                     "schema_version": 1,
                     "user_id": user_id,

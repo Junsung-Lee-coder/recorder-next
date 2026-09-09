@@ -23,6 +23,13 @@ class HermesResult:
     submission_id: str | None = None
     turn_id: str | None = None
     marker: str | None = None
+    session_key: str | None = None
+    run_id: str | None = None
+    request_sha256: str | None = None
+    subject_kind: str | None = None
+    eavesdrop_session_id: str | None = None
+    segment_sequence: int | None = None
+    segment_sha256: str | None = None
 
 
 @dataclass(frozen=True)

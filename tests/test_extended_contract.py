@@ -11,9 +11,11 @@ from recorder_next.errors import ConflictError
 from recorder_next.models import AsrResult, HermesResult, RouterDecision
 from recorder_next.service import RecorderService
 from recorder_next.store import RecorderStore
+from tests.r25_test_helpers import canonical_wav
 
 
-def audio_manifest(turn_id, *, text=b"pcm-fixture"):
+def audio_manifest(turn_id, *, text=None):
+    text = canonical_wav() if text is None else text
     return {
         "schema_version": 1,
         "user_id": "user-audio",
@@ -26,7 +28,7 @@ def audio_manifest(turn_id, *, text=b"pcm-fixture"):
             {
                 "part_id": "audio-1",
                 "kind": "audio",
-                "mime": "audio/pcm",
+                "mime": "audio/wav",
                 "declared_bytes": len(text),
                 "declared_sha256": hashlib.sha256(text).hexdigest(),
                 "relationship": None,
@@ -41,9 +43,10 @@ def make_audio_store(tmp, turn_id="018f5a2e-7b6e-7abc-8d11-1234567890ad"):
     store = RecorderStore(Path(tmp) / "db.sqlite3", storage_root=Path(tmp) / "data")
     m = audio_manifest(turn_id)
     store.create_turn(m)
-    store.put_chunk(turn_id, "audio-1", 0, b"pcm-")
-    store.put_chunk(turn_id, "audio-1", 1, b"fixture")
-    data = b"pcm-fixture"
+    data = canonical_wav()
+    split = len(data) // 2
+    store.put_chunk(turn_id, "audio-1", 0, data[:split])
+    store.put_chunk(turn_id, "audio-1", 1, data[split:])
     store.finish_part(turn_id, "audio-1", total_chunks=2, total_bytes=len(data), whole_stream_sha256=hashlib.sha256(data).hexdigest())
     store.accept_turn(turn_id)
     return store, turn_id
@@ -65,6 +68,7 @@ class ASRArbitrationTests(unittest.TestCase):
     def test_fallback_generation_accepts_only_current_provider_and_deletes_audio_after_valid_transcript(self):
         with tempfile.TemporaryDirectory() as tmp:
             store, turn_id = make_audio_store(tmp)
+            source_path = Path(store.get_turn(turn_id)["parts"][0]["source_path"])
             first_generation = store.set_asr_stage(turn_id, expected_generation=0, stage="realtime")
             self.assertEqual(first_generation, 1)
             self.assertFalse(store.commit_asr_result(turn_id, expected_generation=0, stage="realtime", result=AsrResult.valid("stale")))
@@ -73,7 +77,8 @@ class ASRArbitrationTests(unittest.TestCase):
             self.assertEqual(turn["authoritative_asr_outcome"], "VALID_TRANSCRIPT")
             self.assertEqual(turn["transcript"], "hello")
             self.assertTrue(turn["source_deleted"])
-            self.assertFalse(any(Path(part["source_path"]).exists() for part in turn["parts"] if part["kind"] == "audio"))
+            self.assertFalse(source_path.exists())
+            self.assertIsNone(next(part["source_path"] for part in turn["parts"] if part["kind"] == "audio"))
 
     def test_valid_asr_keeps_source_flag_unset_when_physical_deletion_fails(self):
         from unittest.mock import patch
@@ -132,12 +137,33 @@ class GraceAndArchiveTests(unittest.TestCase):
             store.ack_event(manifest["turn_id"], route["event_id"], device_id="phone-1", event_version=1, payload_sha256=route["payload_sha256"])
             with store._read() as conn:
                 submission = conn.execute("SELECT hermes_submission_id FROM session_ingress WHERE turn_id=?", (manifest["turn_id"],)).fetchone()[0]
+            claimed = store.claim_session_ingress(project["stable_project_id"], "fixture-worker", lease_seconds=600)
+            assert claimed is not None
+            self.assertEqual(claimed["hermes_submission_id"], submission)
+            store.bind_hermes_run(
+                submission,
+                "late-run-1",
+                owner="fixture-worker",
+                lease_token=claimed["lease_token"],
+            )
+            binding = store.get_hermes_binding(submission)
+            late_result = HermesResult(
+                "late-1",
+                "실제 결과",
+                submission_id=submission,
+                turn_id=manifest["turn_id"],
+                marker=binding["marker"],
+                session_key=binding["gateway_session_key"],
+                run_id=binding["run_id"],
+                request_sha256=binding["canonical_request_sha256"],
+                subject_kind="turn",
+            )
             failed = store.commit_hermes_error(submission, grace_seconds=600)
             self.assertEqual(failed["state"], "LATE_RESULT_GRACE")
-            recovered = store.commit_hermes_result(submission, HermesResult("late-1", "실제 결과"))
+            recovered = store.commit_hermes_result(submission, late_result)
             self.assertEqual(recovered["final_event_version"], 2)
             self.assertIn("실제 결과", recovered["final_content"])
-            again = store.commit_hermes_result(submission, HermesResult("late-1", "실제 결과"))
+            again = store.commit_hermes_result(submission, late_result)
             self.assertEqual(again["final_event_version"], 2)
 
     def test_project_cas_and_archive_keep_data_but_hide_from_active_list(self):

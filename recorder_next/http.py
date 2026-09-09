@@ -14,13 +14,14 @@ class _RecorderHTTPServer(ThreadingHTTPServer):
 
     def __init__(self, server_address, service: RecorderService):
         self.service = service
+        self.max_request_bytes = service._wire_policy.gateway_max_request_bytes
         super().__init__(server_address, RecorderRequestHandler)
 
 
 class RecorderRequestHandler(BaseHTTPRequestHandler):
     server: _RecorderHTTPServer
     protocol_version = "HTTP/1.1"
-    max_request_bytes = 16 * 1024 * 1024
+    max_request_bytes = 10_000_000
 
     def log_message(self, format: str, *args: Any) -> None:
         # Access logs must not accidentally include request bodies or transcript data.
@@ -102,11 +103,11 @@ class RecorderRequestHandler(BaseHTTPRequestHandler):
         # but a non-zero value wider than the decimal bound is necessarily too
         # large and must still receive a bounded framing response.
         normalized = raw.lstrip("0") or "0"
-        maximum_digits = len(str(self.max_request_bytes))
+        maximum_digits = len(str(self.server.max_request_bytes))
         if len(normalized) > maximum_digits:
             return 0, (413, "REQUEST_TOO_LARGE", "request body exceeds server limit")
         length = int(normalized)
-        if length > self.max_request_bytes:
+        if length > self.server.max_request_bytes:
             return 0, (413, "REQUEST_TOO_LARGE", "request body exceeds server limit")
         return length, None
 

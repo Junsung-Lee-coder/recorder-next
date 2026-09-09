@@ -43,6 +43,31 @@ def accepted_store(tmp):
     return store, m["turn_id"]
 
 
+def bind_result(store, submission_id, assistant_message_id, content):
+    ingress = store.get_ingress(submission_id)
+    binding = store.get_hermes_binding(submission_id)
+    if binding["run_id"] is None:
+        claim = store.claim_session_ingress(ingress["target_session_id"], "fixture-hermes", lease_seconds=600)
+        assert claim is not None
+        binding = store.bind_hermes_run(
+            submission_id,
+            f"fixture-run-{assistant_message_id}",
+            owner="fixture-hermes",
+            lease_token=claim["lease_token"],
+        )
+    return HermesResult(
+        assistant_message_id,
+        content,
+        submission_id=submission_id,
+        turn_id=ingress["turn_id"],
+        marker=binding["marker"],
+        session_key=binding["gateway_session_key"],
+        run_id=binding["run_id"],
+        request_sha256=binding["canonical_request_sha256"],
+        subject_kind="turn",
+    )
+
+
 class UploadAndAcceptanceTests(unittest.TestCase):
     def test_disk_free_admission_is_checked_before_acceptance(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -114,12 +139,12 @@ class UploadAndAcceptanceTests(unittest.TestCase):
             ingress = store.get_ingress(store.get_turn(turn_id)["session_key"] and "" or "") if False else None
             with store._read() as conn:
                 submission_id = conn.execute("SELECT hermes_submission_id FROM session_ingress WHERE turn_id=?", (turn_id,)).fetchone()[0]
-            first = store.commit_hermes_result(submission_id, HermesResult("msg-1", "첫 답\r\n", True))
+            first = store.commit_hermes_result(submission_id, bind_result(store, submission_id, "msg-1", "첫 답\r\n"))
             self.assertEqual(first["final_event_version"], 1)
             self.assertEqual(first["state"], "FINAL_READY")
             final_pending = store.pending_outbox("phone-1", user_id="user-1")
             self.assertEqual([item["event_version"] for item in final_pending], [1])
-            second = store.commit_hermes_result(submission_id, HermesResult("msg-2", "두 번째 답", True))
+            second = store.commit_hermes_result(submission_id, bind_result(store, submission_id, "msg-2", "두 번째 답"))
             self.assertEqual(second["final_event_version"], 2)
             self.assertEqual(second["final_content"], "첫 답\n\n두 번째 답")
             self.assertEqual(len(second["tts_artifacts"]), 2)  # ROUTED_TTS + FINAL_TTS(v1), no v2 TTS

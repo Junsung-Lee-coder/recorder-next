@@ -18,12 +18,15 @@ from recorder_next.features import DurableProcessingWorker
 from recorder_next.models import HermesResult
 from recorder_next.service import RecorderService, create_configured_service
 from recorder_next.store import RecorderStore
+from tests.r25_test_helpers import canonical_wav
 
 
 TURN_ID = "018f5a2e-7b6e-7abc-8d11-1234567890ab"
 
 
 def complete_turn(store: RecorderStore, *, turn_id: str = TURN_ID, kind: str = "text", payload: bytes = b"hello") -> dict:
+    if kind == "audio":
+        payload = canonical_wav()
     manifest = {
         "schema_version": 1,
         "user_id": "feature-user",
@@ -33,7 +36,7 @@ def complete_turn(store: RecorderStore, *, turn_id: str = TURN_ID, kind: str = "
         "parts": [{
             "part_id": "part-1",
             "kind": kind,
-            "mime": "text/plain" if kind == "text" else "application/octet-stream",
+            "mime": "text/plain" if kind == "text" else "audio/wav" if kind == "audio" else "image/png",
             "declared_bytes": len(payload),
             "declared_sha256": hashlib.sha256(payload).hexdigest(),
         }],
@@ -635,10 +638,11 @@ class AttachmentEavesdropDiagnosticsFeatureTests(unittest.TestCase):
             raw = json.dumps({"events": [{"category": "voice", "stage": "upload", "status": "ok"}]}).encode()
             bundle = zlib.compress(raw)
             stored = store.ingest_diagnostic_bundle("feature-user", "feature-phone", "bundle-1", bundle, opt_in_event_id=opt_in["event_id"], expanded_size=len(raw))
-            self.assertEqual(stored["expanded_size"], len(raw))
+            projected = json.dumps({"events": [{"category": "voice", "stage": "upload", "status": "ok"}]}, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+            self.assertEqual(stored["expanded_size"], len(projected))
             secret_raw = json.dumps({"events": [{"category": "voice", "stage": "upload", "token": "super-secret", "transcript": "private words"}]}).encode()
             secret_bundle = store.ingest_diagnostic_bundle("feature-user", "feature-phone", "bundle-2", zlib.compress(secret_raw), opt_in_event_id=opt_in["event_id"], expanded_size=len(secret_raw))
-            secret_path = next(Path(tmp).rglob("bundle-2.z"))
+            secret_path = next(Path(tmp).rglob(f"{secret_bundle['bundle_id']}.z"))
             stored_secret = zlib.decompress(secret_path.read_bytes())
             self.assertNotIn(b"super-secret", stored_secret)
             self.assertNotIn(b"private words", stored_secret)
@@ -742,9 +746,8 @@ class AttachmentEavesdropDiagnosticsFeatureTests(unittest.TestCase):
             with sqlite3.connect(store.db_path) as conn:
                 conn.execute("CREATE TRIGGER abort_bundle BEFORE INSERT ON diagnostic_bundles BEGIN SELECT RAISE(ABORT, 'qa-abort'); END")
                 conn.execute("CREATE TRIGGER abort_update BEFORE INSERT ON update_manifests BEGIN SELECT RAISE(ABORT, 'qa-abort'); END")
-            bundle_path = root / "data" / "diagnostics" / hashlib.sha256(b"cleanup-user").hexdigest() / "bundle-cleanup.z"
             update_path = root / "data" / "updates" / "qa" / "1" / "cleanup.apk"
-            compressed = zlib.compress(b'{"category":"cleanup","status":"ok"}')
+            compressed = zlib.compress(b'{"events":[{"category":"other","stage":"other","status":"ok"}]}')
             with patch.object(Path, "unlink", side_effect=PermissionError("injected cleanup failure")):
                 with self.assertRaises(CleanupIncompleteError):
                     store.ingest_diagnostic_bundle("cleanup-user", "cleanup-phone", "bundle-cleanup", compressed, opt_in_event_id=opt_in["event_id"])
@@ -763,6 +766,7 @@ class AttachmentEavesdropDiagnosticsFeatureTests(unittest.TestCase):
                         artifact_bytes=b"synthetic-apk",
                         expected_generation=0,
                     )
+            bundle_path = next((root / "data" / "diagnostics").rglob("*.z"))
             self.assertTrue(bundle_path.exists())
             self.assertTrue(update_path.exists())
             with store._read() as conn:
@@ -782,10 +786,10 @@ class AttachmentEavesdropDiagnosticsFeatureTests(unittest.TestCase):
             store = RecorderStore(root / "db.sqlite3", storage_root=root / "data")
             store.register_device("delete-user", "delete-phone", "phone")
             opt_in = store.record_diagnostics_opt_in("delete-user", "delete-phone", event_id="delete-opt-in")
-            compressed = zlib.compress(b'{"category":"delete","status":"ok"}')
-            store.ingest_diagnostic_bundle("delete-user", "delete-phone", "bundle-delete", compressed, opt_in_event_id=opt_in["event_id"])
+            compressed = zlib.compress(b'{"events":[{"category":"other","stage":"other","status":"ok"}]}')
+            bundle = store.ingest_diagnostic_bundle("delete-user", "delete-phone", "bundle-delete", compressed, opt_in_event_id=opt_in["event_id"])
             with store._read() as conn:
-                path = Path(conn.execute("SELECT storage_path FROM diagnostic_bundles WHERE bundle_id='bundle-delete'").fetchone()[0])
+                path = Path(conn.execute("SELECT storage_path FROM diagnostic_bundles WHERE bundle_id=?", (bundle["bundle_id"],)).fetchone()[0])
             with patch.object(Path, "unlink", side_effect=PermissionError("injected cleanup failure")):
                 with self.assertRaises(CleanupIncompleteError):
                     store.delete_diagnostics("delete-user", "delete-phone")
@@ -803,10 +807,10 @@ class AttachmentEavesdropDiagnosticsFeatureTests(unittest.TestCase):
             store = RecorderStore(root / "db.sqlite3", storage_root=root / "data", diagnostics_retention_seconds=1)
             store.register_device("purge-user", "purge-phone", "phone")
             opt_in = store.record_diagnostics_opt_in("purge-user", "purge-phone", event_id="purge-opt-in", now="2026-09-04T00:00:00Z")
-            compressed = zlib.compress(b'{"category":"purge","status":"ok"}')
-            store.ingest_diagnostic_bundle("purge-user", "purge-phone", "bundle-purge", compressed, opt_in_event_id=opt_in["event_id"], now="2026-09-04T00:00:00Z")
+            compressed = zlib.compress(b'{"events":[{"category":"other","stage":"other","status":"ok"}]}')
+            bundle = store.ingest_diagnostic_bundle("purge-user", "purge-phone", "bundle-purge", compressed, opt_in_event_id=opt_in["event_id"], now="2026-09-04T00:00:00Z")
             with store._read() as conn:
-                path = Path(conn.execute("SELECT storage_path FROM diagnostic_bundles WHERE bundle_id='bundle-purge'").fetchone()[0])
+                path = Path(conn.execute("SELECT storage_path FROM diagnostic_bundles WHERE bundle_id=?", (bundle["bundle_id"],)).fetchone()[0])
             with patch.object(Path, "unlink", side_effect=PermissionError("injected cleanup failure")):
                 with self.assertRaises(CleanupIncompleteError):
                     store.purge_diagnostics(now="2026-09-04T00:00:02Z")

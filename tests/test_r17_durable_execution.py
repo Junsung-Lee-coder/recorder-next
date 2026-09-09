@@ -23,6 +23,7 @@ from recorder_next.models import AsrResult, HermesResult
 from recorder_next.openapi import OPENAPI
 from recorder_next.service import RecorderService
 from recorder_next.store import RecorderStore, utc_now
+from tests.r25_test_helpers import canonical_wav
 
 
 BASE_TIME = "2026-09-06T00:00:00+00:00"
@@ -58,6 +59,8 @@ def _manifest(
 
 
 def _accept(store: RecorderStore, turn_id: str, payload: bytes, *, kind: str = "text") -> dict:
+    if kind == "audio":
+        payload = canonical_wav()
     store.create_turn(_manifest(turn_id, payload, kind=kind))
     store.put_chunk(turn_id, "part-1", 0, payload)
     store.finish_part(

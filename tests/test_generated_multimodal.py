@@ -401,7 +401,7 @@ class GeneratedSingleInputHTTPTests(unittest.TestCase):
 
     def test_each_supported_non_audio_fixture_is_a_separate_public_single_input_turn(self):
         metadata = _fixture_metadata()
-        cases = ("image_png", "document_pdf", "text_utf8", "data_csv", "generic_binary")
+        cases = ("image_png", "text_utf8")
         for index, key in enumerate(cases, start=2):
             with self.subTest(fixture=key), tempfile.TemporaryDirectory() as tmp:
                 server, thread, store, project, gateway, user, device = _start_isolated_server(tmp, metadata)
@@ -415,7 +415,6 @@ class GeneratedSingleInputHTTPTests(unittest.TestCase):
                     self.assertEqual(part["declared_bytes"], len(payload))
                     self.assertEqual(part["whole_stream_sha256"], hashlib.sha256(payload).hexdigest())
                     self.assertEqual(part["status"], "COMPLETE")
-                    unsupported = key in {"document_pdf", "data_csv", "generic_binary"}
                     routed = _route_hermes_and_ack(
                         self,
                         server,
@@ -423,15 +422,12 @@ class GeneratedSingleInputHTTPTests(unittest.TestCase):
                         device=device,
                         project_id=project["stable_project_id"],
                         turn_id=turn_id,
-                        expect_error=unsupported,
+                        expect_error=False,
                     )
-                    if unsupported:
-                        self.assertEqual(routed["state"], "FINAL_READY")
-                    else:
-                        self.assertEqual(routed["state"], "DELIVERED")
-                        request = gateway.calls[0]["request"]["request"]
-                        self.assertEqual(request["manifest"]["parts"][0]["relationship"], metadata["files"][key].get("relationship"))
-                        self.assertEqual(request["manifest"]["parts"][0]["declared_sha256"], metadata["files"][key]["sha256"])
+                    self.assertEqual(routed["state"], "DELIVERED")
+                    request = gateway.calls[0]["request"]["request"]
+                    self.assertEqual(request["manifest"]["parts"][0]["relationship"], metadata["files"][key].get("relationship"))
+                    self.assertEqual(request["manifest"]["parts"][0]["declared_sha256"], metadata["files"][key]["sha256"])
                     archived = _assert_status(self, _request(server, "POST", f"/v1/turns/{turn_id}/archive?user_id={user}&device_id={device}", {"source": "generated-fixture-test"}), 200)
                     self.assertIsNotNone(archived["archived_at"])
                     self.assertEqual(store.read_part(turn_id, manifest["parts"][0]["part_id"]), payload)
