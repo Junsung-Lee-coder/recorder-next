@@ -270,17 +270,23 @@ class RecorderRequestHandler(BaseHTTPRequestHandler):
             self.close_connection = True
 
     def parse_request(self) -> bool:
+        self._expect_continue = False
         parsed = super().parse_request()
         self.close_connection = True
+        if not parsed:
+            return False
+        values = self.headers.get_all("Expect") or []
+        if len(values) != 1 or values[0].strip(" \t").lower() != "100-continue":
+            if values:
+                self._send_framing_error(400, "INVALID_FRAMING", "unsupported Expect header", head=self.command == "HEAD")
+                return False
+            return True
+        if self.protocol_version >= "HTTP/1.1" and self.request_version >= "HTTP/1.1":
+            self._expect_continue = True
         return parsed
 
     def handle_expect_100(self) -> bool:
-        values = self.headers.get_all("Expect") or []
-        if len(values) == 1 and values[0].strip().lower() == "100-continue":
-            self._expect_continue = True
-            return True
-        self._send_framing_error(400, "INVALID_FRAMING", "unsupported Expect header")
-        return False
+        return True
 
     def log_message(self, format: str, *args: Any) -> None:
         # Access logs must not accidentally include request bodies or transcript data.

@@ -6,6 +6,7 @@ import os
 import socket
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -602,6 +603,254 @@ class RecorderR1RepairTests(unittest.TestCase):
                 valid.close()
                 self.assertIn(b"HTTP/1.1 202", valid_response)
                 self.assertIn(b'"state":"ACCEPTED"', valid_response)
+            finally:
+                server.shutdown()
+                server.server_close()
+
+    def test_expect_header_validation_is_unconditional_and_pre_body(self):
+        class TrackingService(RecorderService):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.preflight_calls = 0
+                self.handle_calls = 0
+
+            def preflight_http(self, *args, **kwargs):
+                self.preflight_calls += 1
+                return super().preflight_http(*args, **kwargs)
+
+            def handle_http(self, *args, **kwargs):
+                self.handle_calls += 1
+                return super().handle_http(*args, **kwargs)
+
+        def make_request(
+            method="GET",
+            path="/healthz",
+            expect_fields=(),
+            *,
+            version="HTTP/1.1",
+            content_length=None,
+            extra_headers=(),
+            body=b"",
+        ):
+            parts = [f"{method} {path} {version}\r\n".encode(), b"Host: localhost\r\n", b"Connection: keep-alive\r\n"]
+            for name, value in expect_fields:
+                parts.extend((name.encode("ascii"), b": ", value, b"\r\n"))
+            for name, value in extra_headers:
+                parts.extend((name.encode("ascii"), b": ", value, b"\r\n"))
+            if content_length is not None:
+                parts.extend((f"Content-Length: {content_length}\r\n".encode(),))
+            parts.extend((b"\r\n", body))
+            return b"".join(parts)
+
+        def exchange(server_port, request):
+            sock = socket.create_connection(("127.0.0.1", server_port), timeout=2)
+            sock.settimeout(2)
+            started = time.monotonic()
+            try:
+                sock.sendall(request)
+                chunks = []
+                while True:
+                    part = sock.recv(4096)
+                    if not part:
+                        break
+                    chunks.append(part)
+                return b"".join(chunks), time.monotonic() - started
+            finally:
+                sock.close()
+
+        def assert_invalid(raw, *, head=False):
+            expected_body = b'{"error":{"code":"INVALID_FRAMING","message":"unsupported Expect header"}}'
+            response_headers, separator, response_body = raw.partition(b"\r\n\r\n")
+            self.assertTrue(separator)
+            self.assertTrue(response_headers.startswith(b"HTTP/1.1 400 "))
+            self.assertIn(b"Content-Type: application/json; charset=utf-8", response_headers)
+            self.assertIn(f"Content-Length: {len(expected_body)}".encode(), response_headers)
+            self.assertIn(b"Cache-Control: no-store", response_headers)
+            self.assertIn(b"Connection: close", response_headers)
+            self.assertNotIn(b"100 Continue", raw)
+            self.assertEqual(response_body, b"" if head else expected_body)
+
+        def drain(sock):
+            chunks = []
+            while True:
+                part = sock.recv(4096)
+                if not part:
+                    break
+                chunks.append(part)
+            return b"".join(chunks)
+
+        def read_until_headers(sock):
+            received = b""
+            while b"\r\n\r\n" not in received:
+                part = sock.recv(4096)
+                if not part:
+                    self.fail("server closed before sending interim response")
+                received += part
+            return received
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = RecorderStore(root / "db.sqlite3", storage_root=root / "data")
+            service = TrackingService(store, ingress_secret=INGRESS_SECRET)
+            store.register_device("repair-user", "repair-phone", "phone")
+            server = create_http_server(service, port=0)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                port = int(server.server_address[1])
+                invalid_cases = [
+                    ("unsupported", (("Expect", b"something"),), "GET", "/healthz", None, False),
+                    ("empty", (("Expect", b""),), "GET", "/healthz", None, False),
+                    ("outer whitespace only", (("Expect", b" \t "),), "GET", "/healthz", None, False),
+                    ("comma list", (("Expect", b"100-continue, 100-continue"),), "GET", "/healthz", None, False),
+                    ("parameterized", (("Expect", b"100-continue;foo=bar"),), "GET", "/healthz", None, False),
+                    ("quoted", (("Expect", b'"100-continue"'),), "GET", "/healthz", None, False),
+                    ("internal whitespace", (("Expect", b"100-\tcontinue"),), "GET", "/healthz", None, False),
+                    ("folded", (("Expect", b"100-\r\n\tcontinue"),), "GET", "/healthz", None, False),
+                    (
+                        "duplicate supported mixed-case fields",
+                        (("Expect", b"100-continue"), ("eXpEcT", b"100-continue")),
+                        "GET",
+                        "/healthz",
+                        None,
+                        False,
+                    ),
+                    (
+                        "supported then unsupported",
+                        (("Expect", b"100-continue"), ("EXPECT", b"something")),
+                        "GET",
+                        "/healthz",
+                        None,
+                        False,
+                    ),
+                    (
+                        "unsupported then supported",
+                        (("Expect", b"something"), ("EXPECT", b"100-continue")),
+                        "GET",
+                        "/healthz",
+                        None,
+                        False,
+                    ),
+                    ("HEAD", (("eXpEcT", b"something"),), "HEAD", "/healthz", None, True),
+                    ("body withheld POST", (("Expect", b"something"),), "POST", "/v1/turns", 128, False),
+                ]
+                for name, expect_fields, method, path, content_length, head in invalid_cases:
+                    with self.subTest(case=name):
+                        service.preflight_calls = 0
+                        service.handle_calls = 0
+                        raw, elapsed = exchange(
+                            port,
+                            make_request(
+                                method,
+                                path,
+                                expect_fields,
+                                content_length=content_length,
+                            ),
+                        )
+                        self.assertLess(elapsed, 1.5)
+                        assert_invalid(raw, head=head)
+                        self.assertEqual(service.preflight_calls, 0)
+                        self.assertEqual(service.handle_calls, 0)
+
+                        service.preflight_calls = 0
+                        service.handle_calls = 0
+                        health, _ = exchange(port, make_request())
+                        self.assertTrue(health.startswith(b"HTTP/1.1 200 "))
+                        self.assertNotIn(b"100 Continue", health)
+                        self.assertEqual(service.preflight_calls, 1)
+                        self.assertEqual(service.handle_calls, 1)
+
+                service.preflight_calls = 0
+                service.handle_calls = 0
+                mixed_case = make_request(
+                    expect_fields=(("eXpEcT", b"\t100-CoNtInUe\t"),),
+                )
+                raw, _ = exchange(port, mixed_case)
+                self.assertTrue(raw.startswith(b"HTTP/1.1 200 "))
+                self.assertNotIn(b"100 Continue", raw)
+                self.assertEqual(service.preflight_calls, 1)
+                self.assertEqual(service.handle_calls, 1)
+
+                service.preflight_calls = 0
+                service.handle_calls = 0
+                head_raw, _ = exchange(port, make_request("HEAD", expect_fields=(("Expect", b"100-continue"),)))
+                self.assertTrue(head_raw.startswith(b"HTTP/1.1 200 "))
+                self.assertIn(b"Content-Length: ", head_raw.split(b"\r\n\r\n", 1)[0])
+                self.assertEqual(head_raw.split(b"\r\n\r\n", 1)[1], b"")
+                self.assertNotIn(b"100 Continue", head_raw)
+                self.assertEqual(service.preflight_calls, 1)
+                self.assertEqual(service.handle_calls, 1)
+
+                body = json.dumps(
+                    {
+                        **BASE_TURN,
+                        "turn_id": "018f5a2e-7b6e-7abc-8d11-1234567899f2",
+                        "parts": [],
+                        "text": "mixed-case expect body",
+                    }
+                ).encode()
+                signature = hmac.new(INGRESS_SECRET.encode(), b"repair-user\x00repair-phone", hashlib.sha256).hexdigest()
+                headers = (
+                    ("Content-Type", b"application/json"),
+                    ("X-Recorder-Principal-User", b"repair-user"),
+                    ("X-Recorder-Principal-Device", b"repair-phone"),
+                    ("X-Recorder-Principal-Signature", signature.encode()),
+                )
+                service.preflight_calls = 0
+                service.handle_calls = 0
+                valid = socket.create_connection(("127.0.0.1", port), timeout=2)
+                valid.settimeout(2)
+                try:
+                    valid.sendall(
+                        make_request(
+                            "POST",
+                            "/v1/turns",
+                            (("ExPeCt", b" \t100-CoNtInUe\t "),),
+                            content_length=len(body),
+                            extra_headers=headers,
+                        )
+                    )
+                    interim = read_until_headers(valid)
+                    self.assertEqual(interim.count(b"HTTP/1.1 100 Continue"), 1)
+                    self.assertEqual(service.preflight_calls, 1)
+                    self.assertEqual(service.handle_calls, 0)
+                    valid.sendall(body)
+                    response = interim + drain(valid)
+                finally:
+                    valid.close()
+                self.assertEqual(response.count(b"HTTP/1.1 100 Continue"), 1)
+                self.assertIn(b"HTTP/1.1 202 ", response)
+                self.assertIn(b'"state":"ACCEPTED"', response)
+                self.assertEqual(service.preflight_calls, 1)
+                self.assertEqual(service.handle_calls, 1)
+
+                http10_body = json.dumps(
+                    {
+                        **BASE_TURN,
+                        "turn_id": "018f5a2e-7b6e-7abc-8d11-1234567899f3",
+                        "parts": [],
+                        "text": "http ten expect body",
+                    }
+                ).encode()
+                service.preflight_calls = 0
+                service.handle_calls = 0
+                http10, _ = exchange(
+                    port,
+                    make_request(
+                        "POST",
+                        "/v1/turns",
+                        (("Expect", b"100-continue"),),
+                        version="HTTP/1.0",
+                        content_length=len(http10_body),
+                        extra_headers=headers,
+                        body=http10_body,
+                    ),
+                )
+                self.assertNotIn(b"100 Continue", http10)
+                self.assertIn(b"HTTP/1.1 202 ", http10)
+                self.assertIn(b'"state":"ACCEPTED"', http10)
+                self.assertEqual(service.preflight_calls, 1)
+                self.assertEqual(service.handle_calls, 1)
             finally:
                 server.shutdown()
                 server.server_close()
