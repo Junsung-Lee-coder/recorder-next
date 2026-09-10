@@ -54,3 +54,37 @@ def normalize_hermes_text(text: str) -> str:
 
 def hermes_content_hash(text: str) -> str:
     return sha256_bytes(normalize_hermes_text(text).encode("utf-8"))
+
+
+def normalize_aliases(value: Any) -> list[str]:
+    """Validate and canonicalize the closed project-alias array.
+
+    Aliases are user-visible identifiers rather than arbitrary JSON values.
+    Keep this pure helper shared by HTTP and direct store callers so a caller
+    cannot bypass the request DTO and commit an invalid alias before response
+    projection.
+    """
+
+    if not isinstance(value, list):
+        raise ValueError("aliases must be a native array")
+    if len(value) > 32:
+        raise ValueError("aliases must contain at most 32 items")
+    normalized: list[str] = []
+    for alias in value:
+        if not isinstance(alias, str):
+            raise ValueError("each alias must be a string")
+        try:
+            item = unicodedata.normalize("NFC", alias).strip()
+            encoded = item.encode("utf-8", "strict")
+        except (UnicodeError, UnicodeEncodeError) as exc:
+            raise ValueError("alias must be valid UTF-8 text") from exc
+        if not 1 <= len(item) <= 128:
+            raise ValueError("each alias must contain 1 to 128 characters")
+        if len(encoded) > 512:
+            raise ValueError("each alias must be at most 512 UTF-8 bytes")
+        if any(unicodedata.category(char) in {"Cc", "Cf"} for char in item):
+            raise ValueError("aliases must not contain control characters")
+        if item in normalized:
+            raise ValueError("aliases must be unique after normalization")
+        normalized.append(item)
+    return normalized

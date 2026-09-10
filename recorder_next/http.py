@@ -9,6 +9,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
 from .errors import RecorderError
+from .features import MAX_FILE_SLAB, ManagedFileBody
 from .service import RecorderService
 
 
@@ -311,18 +312,20 @@ class RecorderRequestHandler(BaseHTTPRequestHandler):
         self._dispatch("PATCH")
 
     def _dispatch(self, method: str) -> None:
-        length, framing_error = self._validated_content_length()
-        if framing_error is not None:
-            self._send_framing_error(*framing_error, head=method == "HEAD")
-            return
+        admitted = False
         try:
-            self.server.service.preflight_http(
+            length, framing_error = self._validated_content_length()
+            if framing_error is not None:
+                self._send_framing_error(*framing_error, head=method == "HEAD")
+                return
+            self.server.service.admit_http(
                 method,
                 self.path,
                 self.headers,
                 body_length=length,
                 peer_addr=self.client_address,
             )
+            admitted = True
         except RecorderError as exc:
             self._send_payload(exc.status, {}, {"error": {"code": exc.code, "message": exc.message}}, head=method == "HEAD")
             return
@@ -333,50 +336,61 @@ class RecorderRequestHandler(BaseHTTPRequestHandler):
             self._send_payload(500, {}, {"error": {"code": "INTERNAL_ERROR", "message": "request could not be completed"}}, head=method == "HEAD")
             return
 
-        if self._expect_continue and length:
-            try:
+        try:
+            if self._expect_continue and length:
                 self._writer.begin()
                 self.send_response_only(100)
                 self.end_headers()
-            except (OSError, _DeadlineExceeded):
+            self._reader.begin_body()
+            try:
+                body = self.rfile.read(length) if length else b""
+            except (_DeadlineExceeded, socket.timeout):
+                self._send_framing_error(408, "REQUEST_TIMEOUT", "request body read timed out", head=method == "HEAD")
                 return
-        self._reader.begin_body()
-        try:
-            body = self.rfile.read(length) if length else b""
-        except (_DeadlineExceeded, socket.timeout):
-            self._send_framing_error(408, "REQUEST_TIMEOUT", "request body read timed out", head=method == "HEAD")
-            return
-        if len(body) != length:
-            self._send_framing_error(400, "INVALID_FRAMING", "request body is shorter than Content-Length", head=method == "HEAD")
-            return
-        try:
-            status, headers, payload = self.server.service.handle_http(
-                method,
-                self.path,
-                self.headers,
-                body,
-                peer_addr=self.client_address,
-            )
-        except RecorderError as exc:
-            status, headers, payload = exc.status, {}, {"error": {"code": exc.code, "message": exc.message}}
-        except (KeyError, TypeError, ValueError):
-            status, headers, payload = 400, {}, {"error": {"code": "INVALID_REQUEST", "message": "request is invalid"}}
-        except Exception:
-            status, headers, payload = 500, {}, {"error": {"code": "INTERNAL_ERROR", "message": "request could not be completed"}}
-        self._send_payload(status, headers, payload, head=method == "HEAD")
+            if len(body) != length:
+                self._send_framing_error(400, "INVALID_FRAMING", "request body is shorter than Content-Length", head=method == "HEAD")
+                return
+            try:
+                status, headers, payload = self.server.service.handle_http(
+                    method,
+                    self.path,
+                    self.headers,
+                    body,
+                    peer_addr=self.client_address,
+                    _admitted=True,
+                )
+            except RecorderError as exc:
+                status, headers, payload = exc.status, {}, {"error": {"code": exc.code, "message": exc.message}}
+            except (KeyError, TypeError, ValueError):
+                status, headers, payload = 400, {}, {"error": {"code": "INVALID_REQUEST", "message": "request is invalid"}}
+            except Exception:
+                status, headers, payload = 500, {}, {"error": {"code": "INTERNAL_ERROR", "message": "request could not be completed"}}
+            self._send_payload(status, headers, payload, head=method == "HEAD")
+        except (OSError, _DeadlineExceeded):
+            self.close_connection = True
+        finally:
+            if admitted:
+                self.server.service.release_http()
 
     def _send_payload(self, status: int, headers: dict[str, str], payload: Any, *, head: bool = False) -> None:
-        if isinstance(payload, bytes):
+        managed_body = payload if isinstance(payload, ManagedFileBody) else None
+        if managed_body is not None:
+            encoded = b""
+            body_length = managed_body.content_length
+            default_content_type = "application/octet-stream"
+        elif isinstance(payload, bytes):
             encoded = payload
+            body_length = len(encoded)
             default_content_type = "application/octet-stream"
         else:
             encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            body_length = len(encoded)
             default_content_type = "application/json; charset=utf-8"
         try:
             self._writer.begin()
             self.send_response(status)
             self.send_header("Content-Type", self._header_value(headers, "Content-Type") or default_content_type)
-            self.send_header("Content-Length", self._header_value(headers, "Content-Length") or str(len(encoded)))
+            self.send_header("Content-Length", self._header_value(headers, "Content-Length") or str(body_length))
             if self._header_value(headers, "Cache-Control") is None:
                 self.send_header("Cache-Control", "no-store")
             self.send_header("Connection", "close")
@@ -386,9 +400,16 @@ class RecorderRequestHandler(BaseHTTPRequestHandler):
                 self.send_header(key, value)
             self.end_headers()
             if not head:
-                self.wfile.write(encoded)
+                if managed_body is not None:
+                    for chunk in managed_body.iter_chunks(MAX_FILE_SLAB):
+                        self.wfile.write(chunk)
+                else:
+                    self.wfile.write(encoded)
         except (OSError, _DeadlineExceeded):
             self.close_connection = True
+        finally:
+            if managed_body is not None:
+                managed_body.close()
 
     @staticmethod
     def _header_value(headers: dict[str, str], name: str) -> str | None:

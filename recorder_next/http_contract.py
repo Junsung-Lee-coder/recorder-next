@@ -563,10 +563,20 @@ def validate_response(operation: Operation, status: int, headers: Mapping[str, s
     expected_media = response.media_type.lower() if response.media_type else None
     if expected_media and content_type and content_type != expected_media:
         raise ValueError(f"{operation.operation_id} returned an unexpected Content-Type")
-    if expected_media and expected_media != "application/json" and not isinstance(payload, bytes):
+    managed_body_type = None
+    if expected_media and expected_media != "application/json":
+        from .features import ManagedFileBody
+
+        managed_body_type = ManagedFileBody
+    is_binary_body = isinstance(payload, bytes) or (managed_body_type is not None and isinstance(payload, managed_body_type))
+    if expected_media and expected_media != "application/json" and not is_binary_body:
         raise ValueError(f"{operation.operation_id} declared a binary response")
-    if expected_media == "application/json" and isinstance(payload, bytes):
+    if expected_media == "application/json" and is_binary_body:
         raise ValueError(f"{operation.operation_id} declared a JSON response")
+    if managed_body_type is not None and isinstance(payload, managed_body_type):
+        declared_length = next((value for name, value in headers.items() if str(name).lower() == "content-length"), None)
+        if declared_length is None or str(declared_length) != str(payload.content_length):
+            raise ValueError(f"{operation.operation_id} binary body length is inconsistent")
     if response.schema_name:
         schema = _schema_registry().get(response.schema_name)
         if schema is None:
@@ -587,8 +597,21 @@ def _scalar(kind: str, *, nullable: bool = False, format: str | None = None) -> 
     return schema
 
 
-def _array(item: dict[str, Any]) -> dict[str, Any]:
-    return {"type": "array", "items": item}
+def _array(
+    item: dict[str, Any],
+    *,
+    min_items: int | None = None,
+    max_items: int | None = None,
+    unique_items: bool = False,
+) -> dict[str, Any]:
+    schema: dict[str, Any] = {"type": "array", "items": item}
+    if min_items is not None:
+        schema["minItems"] = min_items
+    if max_items is not None:
+        schema["maxItems"] = max_items
+    if unique_items:
+        schema["uniqueItems"] = True
+    return schema
 
 
 def _object(properties: Mapping[str, Any], *, required: tuple[str, ...] = ()) -> dict[str, Any]:
@@ -703,9 +726,29 @@ _TURN = _object({
 })
 _PROJECT = _object({
     "stable_project_id": _scalar("string"), "user_id": _scalar("string"), "project_number": _scalar("string"), "name": _scalar("string"),
-    "aliases": _array(_scalar("string")), "description": _scalar("string"), "default_session_key": _scalar("string"), "status": _scalar("string"),
+    "aliases": _array(_scalar("string"), min_items=0, max_items=32, unique_items=True), "description": _scalar("string"), "default_session_key": _scalar("string"), "status": _scalar("string"),
     "record_version": _scalar("integer"), "created_at": _scalar("string"), "updated_at": _scalar("string"), "archived_at": _scalar("string", nullable=True),
 })
+_HISTORY_ATTACHMENT = _object({
+    "part_id": _scalar("string"), "kind": _scalar("string"), "mime": _scalar("string"),
+    "byte_length": _scalar("integer", nullable=True), "sha256": _scalar("string", nullable=True), "status": _scalar("string"),
+}, required=("part_id", "kind", "mime", "byte_length", "sha256", "status"))
+_HISTORY_USER_MESSAGE = _object({
+    "role": {"type": "string", "enum": ["user"]}, "content": _scalar("string"),
+    "input_type": {"type": "string", "enum": ["audio", "text", "attachment", "mixed", "unknown"]},
+    "attachments": _array(_HISTORY_ATTACHMENT),
+}, required=("role", "content", "input_type", "attachments"))
+_HISTORY_ASSISTANT_MESSAGE = _object({
+    "role": {"type": "string", "enum": ["assistant"]}, "content": _scalar("string", nullable=True),
+    "outcome": _scalar("string", nullable=True), "state": _scalar("string"), "event_version": _scalar("integer"),
+}, required=("role", "content", "outcome", "state", "event_version"))
+_HISTORY_ITEM = _object({
+    "turn_id": _scalar("string"), "project_id": _scalar("string", nullable=True), "accepted_seq": _scalar("integer"),
+    "turn_source": _scalar("string"), "archived": _scalar("boolean"), "state": _scalar("string"),
+    "user": _HISTORY_USER_MESSAGE,
+    "assistant": {**_HISTORY_ASSISTANT_MESSAGE, "nullable": True},
+    "messages": _array({"oneOf": [_HISTORY_USER_MESSAGE, _HISTORY_ASSISTANT_MESSAGE]}),
+}, required=("turn_id", "project_id", "accepted_seq", "turn_source", "archived", "state", "user", "assistant", "messages"))
 _EAVESDROP_SEGMENT_ITEM = _object({
     "session_id": _scalar("string"), "sequence": _scalar("integer"), "client_segment_id": _scalar("string"),
     "audio_sha256": _scalar("string"), "byte_length": _scalar("integer"), "transcript": _scalar("string", nullable=True), "created_at": _scalar("string"),
@@ -828,7 +871,7 @@ _RESPONSE_SCHEMAS: dict[str, dict[str, Any]] = {
     "ProjectResponse": _PROJECT, "ProjectListResponse": _object({"items": _array(_PROJECT)}),
     "ScheduleResponse": _object({"schedule_id": _scalar("string"), "state": _scalar("string"), "parent_turn_id": _scalar("string"), "project_id": _scalar("string"), "session_key": _scalar("string"), "origin_device_id": _scalar("string"), "delivery_target_device_id": _scalar("string"), "fire_at_utc": _scalar("string"), "timezone_offset": _scalar("string"), "reminder_text": _scalar("string"), "confirmation_text": _scalar("string"), "trigger_instance_id": _scalar("string", nullable=True), "confirmation_event_id": _scalar("string", nullable=True), "occurrences": _array(_SCHEDULE_OCCURRENCE), "created_at": _scalar("string", nullable=True), "updated_at": _scalar("string", nullable=True)}),
     "UpdateManifestResponse": _object({"schema_version": _scalar("integer"), "platform": _scalar("string"), "channel": _scalar("string"), "version": _scalar("string"), "version_code": _scalar("integer", nullable=True), "version_name": _scalar("string", nullable=True), "sha256": _scalar("string"), "artifact_sha256": _scalar("string", nullable=True), "signer_digest": _scalar("string"), "changelog": _scalar("string"), "min_server_version": _scalar("string"), "min_supported_version": _scalar("integer", nullable=True), "authorization_policy": _scalar("string"), "content_type": _scalar("string"), "download_path": _scalar("string"), "manifest_sha256": _scalar("string"), "current": _scalar("boolean"), "channel_generation": _scalar("integer", nullable=True), "generation": _scalar("integer", nullable=True), "artifact_name": _scalar("string", nullable=True), "size": _scalar("integer", nullable=True), "etag": _scalar("string", nullable=True), "published_at": _scalar("string", nullable=True), "current_generation": _scalar("integer", nullable=True)}),
-    "BinaryBody": {"type": "string", "format": "binary"}, "HistoryResponse": _object({"items": _array(_object({"type": _scalar("string"), "turn_id": _scalar("string"), "project_id": _scalar("string", nullable=True), "message_id": _scalar("string"), "role": _scalar("string"), "content": _scalar("string", nullable=True), "content_hash": _scalar("string", nullable=True), "created_at": _scalar("string"), "accepted_seq": _scalar("integer", nullable=True), "archived": _scalar("boolean") })), "next_cursor": _scalar("string", nullable=True), "accepted_seq": _scalar("integer", nullable=True), "truncated": _scalar("boolean", nullable=True)}),
+    "BinaryBody": {"type": "string", "format": "binary"}, "HistoryResponse": _object({"items": _array(_HISTORY_ITEM), "next_cursor": _scalar("string", nullable=True), "has_more": _scalar("boolean"), "filters_version": _scalar("integer")}, required=("items", "next_cursor", "has_more", "filters_version")),
     "EavesdropSessionResponse": _EAVESDROP, "EavesdropSegmentResponse": _object({"session_id": _scalar("string", nullable=True), "sequence": _scalar("integer"), "client_segment_id": _scalar("string", nullable=True), "sha256": _scalar("string"), "audio_sha256": _scalar("string", nullable=True), "byte_length": _scalar("integer"), "duplicate": _scalar("boolean"), "state": _scalar("string", nullable=True), "stored": _scalar("boolean", nullable=True), "transcript": _scalar("string", nullable=True), "reply_text": _scalar("string", nullable=True)}),
     "EavesdropRepliesResponse": _object({"items": _array(_EAVESDROP_REPLY_ITEM)}), "RoutingDecisionResponse": _EAVESDROP_DECISION_ITEM, "RoutingDecisionsResponse": _object({"items": _array(_EAVESDROP_DECISION_ITEM)}),
     "DiagnosticsConsentResponse": _object({"event_id": _scalar("string"), "user_id": _scalar("string"), "device_id": _scalar("string"), "enabled": _scalar("boolean"), "expires_at": _scalar("string", nullable=True), "created_at": _scalar("string")}), "DiagnosticEventResponse": _DIAGNOSTIC_EVENT_ITEM, "DiagnosticBundleResponse": _DIAGNOSTIC_BUNDLE_ITEM, "DiagnosticListResponse": _object({"items": _array(_DIAGNOSTIC), "has_more": _scalar("boolean")}), "DiagnosticExportResponse": _object({"schema_version": _scalar("integer"), "items": _array(_DIAGNOSTIC), "tombstones": _array(_TOMBSTONE), "next_cursor": _scalar("string", nullable=True), "truncated": _scalar("boolean")}), "DeletionReceipt": _object({"events": _scalar("integer"), "bundles": _scalar("integer"), "tombstones": _scalar("integer")}),
@@ -877,7 +920,10 @@ def _validate_schema_value(schema: Mapping[str, Any], value: Any, *, path: str, 
         raise ValueError(f"{path} must not be null")
     if schema.get("format") == "binary":
         if not isinstance(value, bytes):
-            raise ValueError(f"{path} must be binary bytes")
+            from .features import ManagedFileBody
+
+            if not isinstance(value, ManagedFileBody):
+                raise ValueError(f"{path} must be binary bytes")
         return
     alternatives = schema.get("oneOf")
     if isinstance(alternatives, list):
@@ -996,7 +1042,21 @@ def project_response(operation: Operation, status: int, payload: Any) -> Any:
     """Return a fresh response DTO containing only catalog-declared fields."""
 
     response = operation.response(status)
-    if response.no_body or response.schema_name is None:
+    if response.no_body:
+        try:
+            from .features import ManagedFileBody
+
+            if isinstance(payload, ManagedFileBody):
+                payload.close()
+        except ImportError:
+            pass
+        return b""
+    if response.media_type and response.media_type.lower() != "application/json":
+        from .features import ManagedFileBody
+
+        if isinstance(payload, (bytes, ManagedFileBody)):
+            return payload
+    if response.schema_name is None:
         return b"" if response.no_body else copy.deepcopy(payload)
     schema = _schema_registry().get(response.schema_name)
     if schema is None:

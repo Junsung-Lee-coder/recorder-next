@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import inspect
 import json
 import os
 import re
@@ -50,6 +51,54 @@ def _close_http_error(exc: urllib.error.HTTPError) -> None:
     finally:
         if body is not None:
             body.close()
+
+
+def _read_bounded_response(response: Any, limit: int, *, deadline_at: float | None = None) -> bytes:
+    """Read a bounded response while enforcing one monotonic deadline."""
+
+    headers = getattr(response, "headers", None)
+    declared_values = headers.get_all("Content-Length") if headers is not None and hasattr(headers, "get_all") else None
+    if declared_values is not None and len(declared_values) != 1:
+        raise ValueError("provider response Content-Length is duplicated")
+    declared = headers.get("Content-Length") if headers is not None else None
+    declared_size: int | None = None
+    if declared is not None:
+        try:
+            declared_size = int(declared)
+        except (TypeError, ValueError):
+            raise ValueError("provider response Content-Length is invalid") from None
+        if declared_size < 0:
+            raise ValueError("provider response Content-Length is invalid")
+        if declared_size > limit:
+            raise ValueError("provider response exceeds the configured limit")
+    encoding = headers.get("Content-Encoding") if headers is not None else None
+    if encoding is not None and encoding.strip().lower() not in {"", "identity"}:
+        raise ValueError("provider response Content-Encoding is unsupported")
+    chunks: list[bytes] = []
+    total = 0
+    while total <= limit:
+        if deadline_at is not None and time.monotonic() >= deadline_at:
+            raise TimeoutError("provider response deadline expired")
+        requested = min(65_536, limit + 1 - total)
+        try:
+            chunk = response.read(requested)
+        except socket.timeout as exc:
+            raise TimeoutError("provider response deadline expired") from exc
+        if deadline_at is not None and time.monotonic() >= deadline_at:
+            raise TimeoutError("provider response deadline expired")
+        if not isinstance(chunk, (bytes, bytearray)):
+            raise ValueError("provider response body is invalid")
+        if len(chunk) > requested:
+            raise ValueError("provider response reader exceeded its bound")
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > limit:
+            raise ValueError("provider response exceeds the configured limit")
+        chunks.append(bytes(chunk))
+    if declared is not None and total != declared_size:
+        raise ValueError("provider response length does not match Content-Length")
+    return b"".join(chunks)
 
 
 class CredentialError(ValueError):
@@ -335,6 +384,7 @@ class HttpHermesGateway:
         poll_interval_seconds: float = 1.0,
         run_timeout_seconds: float = 120.0,
         max_request_bytes: int = 10_000_000,
+        max_response_bytes: int = 1_048_576,
     ):
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
@@ -347,10 +397,16 @@ class HttpHermesGateway:
             raise ValueError("Hermes run poll interval must be between 0 and 60 seconds")
         if not isinstance(run_timeout_seconds, (int, float)) or isinstance(run_timeout_seconds, bool) or not 0 < float(run_timeout_seconds) <= 3600:
             raise ValueError("Hermes run timeout must be between 0 and 3600 seconds")
+        if not isinstance(max_response_bytes, int) or isinstance(max_response_bytes, bool) or not 1 <= max_response_bytes <= 1_048_576:
+            raise ValueError("Hermes response limit is invalid")
         self.max_submit_attempts = max_submit_attempts
         self.poll_interval_seconds = float(poll_interval_seconds)
         self.run_timeout_seconds = float(run_timeout_seconds)
-        self._wire_policy = WirePolicy(gateway_max_request_bytes=max_request_bytes)
+        self.max_response_bytes = max_response_bytes
+        self._wire_policy = WirePolicy(
+            gateway_max_request_bytes=max_request_bytes,
+            gateway_max_response_bytes=max_response_bytes,
+        )
 
     def _session_headers(self, session_key: str) -> dict[str, str]:
         headers = {"X-Hermes-Session-Key": session_key}
@@ -358,7 +414,16 @@ class HttpHermesGateway:
             headers["Authorization"] = f"Bearer {self._api_key}"
         return headers
 
-    def _request(self, method: str, path: str, payload: Mapping[str, Any] | None = None, *, extra_headers: Mapping[str, str] | None = None) -> Any:
+    def _request(
+        self,
+        method: str,
+        path: str,
+        payload: Mapping[str, Any] | None = None,
+        *,
+        extra_headers: Mapping[str, str] | None = None,
+        timeout_seconds: float | None = None,
+        deadline_at: float | None = None,
+    ) -> Any:
         body = None if payload is None else self._wire_policy.ensure_size(serialize_json(payload))
         request_headers = {"Accept": "application/json", **dict(extra_headers or {})}
         if body is not None:
@@ -369,9 +434,42 @@ class HttpHermesGateway:
             method=method,
             headers=request_headers,
         )
-        with _urlopen_no_redirect(request, timeout=self.timeout) as response:
-            raw = response.read()
+        timeout = self.timeout if timeout_seconds is None else min(self.timeout, float(timeout_seconds))
+        if timeout <= 0:
+            raise TimeoutError("Hermes request deadline expired")
+        if deadline_at is None:
+            deadline_at = time.monotonic() + timeout
+        remaining = min(timeout, deadline_at - time.monotonic())
+        if remaining <= 0:
+            raise TimeoutError("Hermes request deadline expired")
+        with _urlopen_no_redirect(request, timeout=remaining) as response:
+            raw = _read_bounded_response(response, self.max_response_bytes, deadline_at=deadline_at)
         return json.loads(raw.decode("utf-8")) if raw else {}
+
+    def _request_with_timeout(
+        self,
+        method: str,
+        path: str,
+        payload: Mapping[str, Any] | None = None,
+        *,
+        extra_headers: Mapping[str, str] | None = None,
+        timeout_seconds: float | None = None,
+        deadline_at: float | None = None,
+    ) -> Any:
+        """Call the request seam while retaining compatibility test doubles."""
+
+        kwargs: dict[str, Any] = {"extra_headers": extra_headers}
+        try:
+            parameters = tuple(inspect.signature(self._request).parameters.values())
+        except (TypeError, ValueError):
+            parameters = ()
+        accepts_kwargs = any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in parameters)
+        if timeout_seconds is not None:
+            if accepts_kwargs or any(parameter.name == "timeout_seconds" for parameter in parameters):
+                kwargs["timeout_seconds"] = timeout_seconds
+        if deadline_at is not None and (accepts_kwargs or any(parameter.name == "deadline_at" for parameter in parameters)):
+            kwargs["deadline_at"] = deadline_at
+        return self._request(method, path, payload, **kwargs)
 
     @staticmethod
     def _attachment_references(
@@ -593,6 +691,7 @@ class HttpHermesGateway:
         submission_id: str,
         marker: str,
         first_error: urllib.error.HTTPError | None = None,
+        deadline_at: float | None = None,
     ) -> HermesResult | None:
         """Use the older session-chat route only as a compatibility fallback.
 
@@ -608,12 +707,24 @@ class HttpHermesGateway:
         legacy_body["hermes_submission_id"] = submission_id
         status_code: int | None = None
         result: Any = None
+        remaining = self.timeout if deadline_at is None else deadline_at - time.monotonic()
+        if remaining <= 0:
+            if first_error is not None:
+                _close_http_error(first_error)
+            return None
         if first_error is not None:
             status_code = first_error.code
             _close_http_error(first_error)
         else:
             try:
-                result = self._request("POST", chat_path, legacy_body, extra_headers=headers)
+                result = self._request_with_timeout(
+                    "POST",
+                    chat_path,
+                    legacy_body,
+                    extra_headers=headers,
+                    timeout_seconds=remaining,
+                    deadline_at=deadline_at,
+                )
             except urllib.error.HTTPError as exc:
                 status_code = exc.code
                 _close_http_error(exc)
@@ -621,11 +732,13 @@ class HttpHermesGateway:
                 return None
         if status_code == 404:
             try:
-                self._request(
+                self._request_with_timeout(
                     "POST",
                     "/api/sessions",
                     {"id": session_key, "source": "api_server"},
                     extra_headers=self._session_headers(session_key),
+                    timeout_seconds=deadline_at - time.monotonic() if deadline_at is not None else None,
+                    deadline_at=deadline_at,
                 )
             except urllib.error.HTTPError as exc:
                 status_code = exc.code
@@ -635,7 +748,17 @@ class HttpHermesGateway:
             except (urllib.error.URLError, TimeoutError):
                 return None
             try:
-                result = self._request("POST", chat_path, legacy_body, extra_headers=headers)
+                remaining = self.timeout if deadline_at is None else deadline_at - time.monotonic()
+                if remaining <= 0:
+                    return None
+                result = self._request_with_timeout(
+                    "POST",
+                    chat_path,
+                    legacy_body,
+                    extra_headers=headers,
+                    timeout_seconds=remaining,
+                    deadline_at=deadline_at,
+                )
             except urllib.error.HTTPError as exc:
                 _close_http_error(exc)
                 return None
@@ -700,7 +823,17 @@ class HttpHermesGateway:
                 accepted = {"run_id": accepted_run_id}
                 break
             try:
-                response = self._request("POST", "/v1/runs", body, extra_headers=headers)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return None
+                response = self._request_with_timeout(
+                    "POST",
+                    "/v1/runs",
+                    body,
+                    extra_headers=headers,
+                    timeout_seconds=remaining,
+                    deadline_at=deadline,
+                )
             except urllib.error.HTTPError as exc:
                 if context is None and attempt == 0:
                     return self._submit_legacy_session_chat(
@@ -710,6 +843,7 @@ class HttpHermesGateway:
                         submission_id=submission_id,
                         marker=marker,
                         first_error=exc,
+                        deadline_at=deadline,
                     )
                 _close_http_error(exc)
                 return None
@@ -741,7 +875,16 @@ class HttpHermesGateway:
             return immediate
         while time.monotonic() <= deadline:
             try:
-                status = self._request("GET", f"/v1/runs/{quote(run_id, safe='')}", extra_headers=self._session_headers(session_key))
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return None
+                status = self._request_with_timeout(
+                    "GET",
+                    f"/v1/runs/{quote(run_id, safe='')}",
+                    extra_headers=self._session_headers(session_key),
+                    timeout_seconds=remaining,
+                    deadline_at=deadline,
+                )
             except (urllib.error.URLError, TimeoutError):
                 if time.monotonic() >= deadline:
                     return None
@@ -767,8 +910,15 @@ class HttpHermesGateway:
 
     def history_messages(self, *, session_key: str, marker: str) -> list[HermesResult]:
         encoded_session = quote(session_key, safe="")
+        deadline = time.monotonic() + self.timeout
         try:
-            result = self._request("GET", f"/api/sessions/{encoded_session}/messages", extra_headers=self._session_headers(session_key))
+            result = self._request_with_timeout(
+                "GET",
+                f"/api/sessions/{encoded_session}/messages",
+                extra_headers=self._session_headers(session_key),
+                timeout_seconds=self.timeout,
+                deadline_at=deadline,
+            )
         except urllib.error.HTTPError as exc:
             _close_http_error(exc)
             return []
@@ -1150,6 +1300,7 @@ class _HTTPProvider:
         *,
         max_response_bytes: int = 16 * 1024 * 1024,
         timeout_seconds: float | None = None,
+        deadline_at: float | None = None,
     ) -> tuple[str, bytes]:
         if not isinstance(max_response_bytes, int) or max_response_bytes < 1:
             raise ValueError("provider response limit is invalid")
@@ -1159,12 +1310,18 @@ class _HTTPProvider:
         timeout = self.timeout if timeout_seconds is None else min(self.timeout, float(timeout_seconds))
         if timeout <= 0:
             raise ProviderFailure("timeout", retryable=True)
+        if deadline_at is None:
+            deadline_at = time.monotonic() + timeout
+        remaining = min(timeout, deadline_at - time.monotonic())
+        if remaining <= 0:
+            raise ProviderFailure("timeout", retryable=True)
         request = urllib.request.Request(self.endpoint, data=body, method="POST", headers=headers)
         try:
-            with _urlopen_no_redirect(request, timeout=timeout) as response:
-                raw = response.read(max_response_bytes + 1)
-                if len(raw) > max_response_bytes:
-                    raise ProviderFailure("response_too_large", retryable=False)
+            with _urlopen_no_redirect(request, timeout=remaining) as response:
+                try:
+                    raw = _read_bounded_response(response, max_response_bytes, deadline_at=deadline_at)
+                except ValueError as exc:
+                    raise ProviderFailure("response_too_large", retryable=False) from exc
                 return response.headers.get("Content-Type", ""), raw
         except urllib.error.HTTPError as exc:
             status_code = exc.code
@@ -1182,6 +1339,7 @@ class _HTTPProvider:
         content_type: str,
         max_response_bytes: int = 16 * 1024 * 1024,
         timeout_seconds: float | None = None,
+        deadline_at: float | None = None,
     ) -> tuple[str, bytes]:
         if not isinstance(body, bytes) or not body:
             raise ProviderFailure("unsupported_media", retryable=False)
@@ -1194,12 +1352,18 @@ class _HTTPProvider:
         timeout = self.timeout if timeout_seconds is None else min(self.timeout, float(timeout_seconds))
         if timeout <= 0:
             raise ProviderFailure("timeout", retryable=True)
+        if deadline_at is None:
+            deadline_at = time.monotonic() + timeout
+        remaining = min(timeout, deadline_at - time.monotonic())
+        if remaining <= 0:
+            raise ProviderFailure("timeout", retryable=True)
         request = urllib.request.Request(self.endpoint, data=body, method="POST", headers=headers)
         try:
-            with _urlopen_no_redirect(request, timeout=timeout) as response:
-                raw = response.read(max_response_bytes + 1)
-                if len(raw) > max_response_bytes:
-                    raise ProviderFailure("response_too_large", retryable=False)
+            with _urlopen_no_redirect(request, timeout=remaining) as response:
+                try:
+                    raw = _read_bounded_response(response, max_response_bytes, deadline_at=deadline_at)
+                except ValueError as exc:
+                    raise ProviderFailure("response_too_large", retryable=False) from exc
                 return response.headers.get("Content-Type", ""), raw
         except urllib.error.HTTPError as exc:
             status_code = exc.code
@@ -1210,7 +1374,13 @@ class _HTTPProvider:
         except urllib.error.URLError:
             raise ProviderFailure("transport", retryable=True) from None
 
-    def _probe(self, path: str | None) -> dict[str, Any]:
+    def _probe(
+        self,
+        path: str | None,
+        *,
+        timeout_seconds: float | None = None,
+        deadline_at: float | None = None,
+    ) -> dict[str, Any]:
         if path is None:
             return {"configured": False}
         parsed = urllib.parse.urlsplit(self.endpoint)
@@ -1218,19 +1388,31 @@ class _HTTPProvider:
         headers = {"Accept": "application/json"}
         headers.update(self._auth_headers())
         request = urllib.request.Request(url, method="GET", headers=headers)
+        timeout = self.timeout if timeout_seconds is None else min(self.timeout, float(timeout_seconds))
+        if deadline_at is None:
+            deadline_at = time.monotonic() + timeout
+        remaining = min(timeout, deadline_at - time.monotonic())
+        if remaining <= 0:
+            raise ProviderFailure("timeout", retryable=True)
         try:
-            with _urlopen_no_redirect(request, timeout=self.timeout) as response:
-                raw = response.read(64 * 1024 + 1)
+            with _urlopen_no_redirect(request, timeout=remaining) as response:
+                raw = _read_bounded_response(response, 64 * 1024, deadline_at=deadline_at)
                 status_code = int(getattr(response, "status", 200))
         except urllib.error.HTTPError as exc:
             status_code = exc.code
             exc.close()
-            raise _provider_failure_for_http(status_code) from None
+            raw = b""
+        except ValueError:
+            raise ProviderFailure("malformed_probe", retryable=False) from None
         except (socket.timeout, TimeoutError):
             raise ProviderFailure("timeout", retryable=True) from None
         except urllib.error.URLError:
             raise ProviderFailure("transport", retryable=True) from None
-        if status_code < 200 or status_code >= 300 or len(raw) > 64 * 1024:
+        if status_code < 200 or status_code >= 300:
+            if 400 <= status_code < 500:
+                raise ProviderFailure("client", retryable=False, status_code=status_code)
+            if status_code >= 500:
+                raise ProviderFailure("server", retryable=True, status_code=status_code)
             raise ProviderFailure("malformed_probe", retryable=False, status_code=status_code)
         try:
             payload = json.loads(raw.decode("utf-8"))
@@ -1258,14 +1440,14 @@ class _HTTPProvider:
                 result[key] = nested
         return result
 
-    def health_check(self) -> dict[str, Any]:
-        result = self._probe(self.health_path)
+    def health_check(self, *, timeout_seconds: float | None = None, deadline_at: float | None = None) -> dict[str, Any]:
+        result = self._probe(self.health_path, timeout_seconds=timeout_seconds, deadline_at=deadline_at)
         if result.get("ok") is False or result.get("ready") is False:
             raise ProviderFailure("provider_unavailable", retryable=True)
         return result
 
-    def capability_check(self) -> dict[str, Any]:
-        return self._probe(self.capability_path)
+    def capability_check(self, *, timeout_seconds: float | None = None, deadline_at: float | None = None) -> dict[str, Any]:
+        return self._probe(self.capability_path, timeout_seconds=timeout_seconds, deadline_at=deadline_at)
 
 
 _ASR_FAILURE_STATES = {
@@ -1465,7 +1647,7 @@ class HttpASRProvider(_HTTPProvider):
             raise ValueError("ASR media types must be audio MIME types")
         super().__init__(endpoint, timeout=timeout, credential_file=credential_file, health_path=health_path, capability_path=capability_path)
 
-    def transcribe(self, audio: ASRInput | bytes, *, turn_id: str, generation: int, timeout_seconds: float | None = None) -> AsrResult:
+    def transcribe(self, audio: ASRInput | bytes, *, turn_id: str, generation: int, timeout_seconds: float | None = None, deadline_at: float | None = None) -> AsrResult:
         value = _coerce_asr_input(audio)
         if value.canonical_mime not in {item.lower() for item in self.media_types} or (self.max_bytes is not None and value.byte_count > self.max_bytes):
             raise ProviderFailure("unsupported_media", retryable=False)
@@ -1479,6 +1661,7 @@ class HttpASRProvider(_HTTPProvider):
             },
             max_response_bytes=16 * 1024 * 1024,
             timeout_seconds=timeout_seconds,
+            deadline_at=deadline_at,
         )
         del content_type
         try:
@@ -1542,6 +1725,7 @@ class WhisperASRProvider(HttpASRProvider):
         turn_id: str,
         generation: int,
         timeout_seconds: float | None = None,
+        deadline_at: float | None = None,
     ) -> AsrResult:
         value = _coerce_asr_input(audio)
         if value.canonical_mime not in {item.lower() for item in self.media_types} or (self.max_bytes is not None and value.byte_count > self.max_bytes):
@@ -1550,7 +1734,12 @@ class WhisperASRProvider(HttpASRProvider):
         if self.language:
             fields["language"] = _language_code(self.language)
         content_type, body = _multipart_form(fields, filename="audio.wav", content_type="audio/wav", file_bytes=value.data)
-        _response_type, raw = self._request_bytes(body, content_type=content_type, timeout_seconds=timeout_seconds)
+        _response_type, raw = self._request_bytes(
+            body,
+            content_type=content_type,
+            timeout_seconds=timeout_seconds,
+            deadline_at=deadline_at,
+        )
         try:
             payload = json.loads(raw.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError):
@@ -1638,6 +1827,7 @@ class HermesAudioASRProvider(_HTTPProvider):
         turn_id: str,
         generation: int,
         timeout_seconds: float | None = None,
+        deadline_at: float | None = None,
     ) -> AsrResult:
         value = _coerce_asr_input(audio)
         if self.max_bytes is not None and value.byte_count > self.max_bytes:
@@ -1646,6 +1836,8 @@ class HermesAudioASRProvider(_HTTPProvider):
         request_kwargs: dict[str, Any] = {"max_response_bytes": 16 * 1024 * 1024}
         if timeout_seconds is not None:
             request_kwargs["timeout_seconds"] = timeout_seconds
+        if deadline_at is not None:
+            request_kwargs["deadline_at"] = deadline_at
         _content_type, raw = self._request({"data_url": data_url, "mime_type": "audio/wav"}, **request_kwargs)
         try:
             payload = json.loads(raw.decode("utf-8"))
@@ -1742,7 +1934,7 @@ class HttpTTSProvider(_HTTPProvider):
             raise ValueError("TTS option is reserved by the provider contract")
         super().__init__(endpoint, timeout=timeout, credential_file=credential_file, health_path=health_path, capability_path=capability_path)
 
-    def synthesize(self, text: str, *, artifact_id: str, timeout_seconds: float | None = None) -> TTSResult:
+    def synthesize(self, text: str, *, artifact_id: str, timeout_seconds: float | None = None, deadline_at: float | None = None) -> TTSResult:
         if not isinstance(text, str) or not text:
             raise ProviderFailure("malformed_request", retryable=False)
         request_payload: dict[str, Any] = {
@@ -1761,6 +1953,7 @@ class HttpTTSProvider(_HTTPProvider):
             request_payload,
             max_response_bytes=min(16 * 1024 * 1024, max(64 * 1024, (self.max_bytes or 0) * 2 + 4096)),
             timeout_seconds=timeout_seconds,
+            deadline_at=deadline_at,
         )
         returned_http_type = _audio_content_type(content_type)
         if returned_http_type is not None:
@@ -1885,6 +2078,7 @@ class HermesAudioTTSProvider(_HTTPProvider):
         *,
         max_response_bytes: int = 16 * 1024 * 1024,
         timeout_seconds: float | None = None,
+        deadline_at: float | None = None,
     ) -> tuple[str, bytes]:
         """Classify an API-only Hermes listener as unavailable for TTS.
 
@@ -1896,19 +2090,25 @@ class HermesAudioTTSProvider(_HTTPProvider):
         the capability mismatch explicit to provider-chain fallback logic.
         """
         try:
-            return super()._request(payload, max_response_bytes=max_response_bytes, timeout_seconds=timeout_seconds)
+            return super()._request(
+                payload,
+                max_response_bytes=max_response_bytes,
+                timeout_seconds=timeout_seconds,
+                deadline_at=deadline_at,
+            )
         except ProviderFailure as exc:
             if exc.status_code == 404:
                 raise ProviderFailure("provider_unavailable", retryable=False, status_code=404) from None
             raise
 
-    def synthesize(self, text: str, *, artifact_id: str, timeout_seconds: float | None = None) -> TTSResult:
+    def synthesize(self, text: str, *, artifact_id: str, timeout_seconds: float | None = None, deadline_at: float | None = None) -> TTSResult:
         if not isinstance(text, str) or not text.strip():
             raise ProviderFailure("malformed_request", retryable=False)
         content_type, raw = self._request(
             {"text": text},
             max_response_bytes=min(16 * 1024 * 1024, max(64 * 1024, (self.max_bytes or 0) * 2 + 4096)),
             timeout_seconds=timeout_seconds,
+            deadline_at=deadline_at,
         )
         returned_http_type = _audio_content_type(content_type)
         if returned_http_type is not None:
@@ -2126,12 +2326,12 @@ class ProviderChain:
                     provider: Any = target.provider
                     if operation == "asr":
                         if isinstance(provider, _HTTPProvider):
-                            result = getattr(provider, "transcribe")(value, turn_id=identifier, generation=request_generation, timeout_seconds=request_timeout)
+                            result = getattr(provider, "transcribe")(value, turn_id=identifier, generation=request_generation, timeout_seconds=request_timeout, deadline_at=deadline)
                         else:
                             result = provider.transcribe(value.data if isinstance(value, ASRInput) else value, turn_id=identifier, generation=request_generation)
                     else:
                         if isinstance(provider, _HTTPProvider):
-                            result = getattr(provider, "synthesize")(value, artifact_id=identifier, timeout_seconds=request_timeout)
+                            result = getattr(provider, "synthesize")(value, artifact_id=identifier, timeout_seconds=request_timeout, deadline_at=deadline)
                         else:
                             result = provider.synthesize(value, artifact_id=identifier)
                     if time.monotonic() >= deadline:
@@ -2166,6 +2366,9 @@ class ProviderChain:
                     # failure, or when the provider explicitly reports that it
                     # is unavailable/capacity constrained.  Permanent server
                     # and auth failures must not silently switch providers.
+                    if time.monotonic() >= deadline:
+                        statuses.append(self._safe_status(target, status="deadline", retry_count=attempt, error=exc))
+                        raise ChainFailure("deadline", statuses, retryable=False)
                     client_terminal = (
                         isinstance(exc.status_code, int)
                         and 400 <= exc.status_code < 500

@@ -13,7 +13,9 @@ import zlib
 from pathlib import Path
 from unittest.mock import patch
 
+from recorder_next.adapters import HermesResult
 from recorder_next.errors import ConflictError, LeaseConflict, SourceUnavailableError, ValidationError
+from recorder_next.service import RecorderService
 from recorder_next.features import FeatureGroups
 from recorder_next.models import AsrResult
 from recorder_next.store import RecorderStore
@@ -61,6 +63,308 @@ def _logical_database_snapshot(db_path: Path) -> dict:
 
 
 class R25IntegratedRegressionTests(unittest.TestCase):
+    def test_project_create_omitted_aliases_uses_empty_canonical_array(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = RecorderStore(root / "db.sqlite3", storage_root=root / "data")
+            store.register_device("project-user", "project-phone", "phone")
+            status, _headers, payload = RecorderService(store).handle_http(
+                "POST",
+                "/v1/projects",
+                {"Content-Type": "application/json"},
+                json.dumps(
+                    {
+                        "user_id": "project-user",
+                        "device_id": "project-phone",
+                        "project_number": "P-1",
+                        "name": "Project one",
+                    }
+                ).encode(),
+            )
+            self.assertEqual(status, 201)
+            self.assertEqual(payload["aliases"], [])
+
+    def test_audio_duration_is_derived_and_frame_boundary_is_enforced(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = RecorderStore(root / "db.sqlite3", storage_root=root / "data", max_audio_minutes=1)
+
+            def create_audio_turn(turn_id: str, frames: int) -> bytes:
+                manifest = {
+                    "schema_version": 1,
+                    "user_id": "audio-user",
+                    "turn_id": turn_id,
+                    "origin_device_id": "phone",
+                    "client_created_at": "2026-09-09T00:00:00Z",
+                    "parts": [{"part_id": "audio", "kind": "audio", "mime": "audio/wav", "streaming": True}],
+                }
+                store.create_turn(manifest)
+                wav_buffer = io.BytesIO()
+                with wave.open(wav_buffer, "wb") as handle:
+                    handle.setnchannels(1)
+                    handle.setsampwidth(2)
+                    handle.setframerate(16000)
+                    handle.writeframes(b"\x00\x00" * frames)
+                audio = wav_buffer.getvalue()
+                starts = range(0, len(audio), store.max_chunk_bytes)
+                for sequence, start in enumerate(starts):
+                    store.put_chunk(turn_id, "audio", sequence, audio[start : start + store.max_chunk_bytes])
+                return audio, (len(audio) + store.max_chunk_bytes - 1) // store.max_chunk_bytes
+
+            audio, total_chunks = create_audio_turn("018f5a2e-7b6e-7abc-8d11-1234567890b1", 160)
+            result = store.finish_part(
+                "018f5a2e-7b6e-7abc-8d11-1234567890b1",
+                "audio",
+                total_chunks=total_chunks,
+                total_bytes=len(audio),
+                whole_stream_sha256=hashlib.sha256(audio).hexdigest(),
+                duration_ms=11,
+            )
+            self.assertEqual(result["duration_ms"], 10)
+
+            oversized, total_chunks = create_audio_turn("018f5a2e-7b6e-7abc-8d11-1234567890b2", 960001)
+            with self.assertRaises(Exception) as raised:
+                store.finish_part(
+                    "018f5a2e-7b6e-7abc-8d11-1234567890b2",
+                    "audio",
+                    total_chunks=total_chunks,
+                    total_bytes=len(oversized),
+                    whole_stream_sha256=hashlib.sha256(oversized).hexdigest(),
+                )
+            self.assertEqual(getattr(raised.exception, "code", None), "QUOTA_EXCEEDED")
+
+    def test_diagnostic_purge_removes_expired_content_rows_after_cleanup(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = RecorderStore(
+                root / "db.sqlite3",
+                storage_root=root / "data",
+                diagnostics_retention_seconds=1,
+                diagnostics_tombstone_retention_seconds=10,
+            )
+            store.register_device("diag-user", "diag-phone", "phone")
+            opt_in = store.record_diagnostics_opt_in("diag-user", "diag-phone", event_id="diag-opt", now="2026-09-01T00:00:00Z")
+            event = store.ingest_diagnostic_event(
+                "diag-user",
+                "diag-phone",
+                event_id="diag-event",
+                idempotency_key="diag-event",
+                payload={"category": "voice", "stage": "upload"},
+                now="2026-09-01T00:00:00Z",
+            )
+            bundle = store.ingest_diagnostic_bundle(
+                "diag-user",
+                "diag-phone",
+                "diag-bundle",
+                zlib.compress(b'{"category":"voice","stage":"upload"}'),
+                opt_in_event_id=opt_in["event_id"],
+                now="2026-09-01T00:00:00Z",
+            )
+            first = store.purge_diagnostics(now="2026-09-01T00:00:02Z")
+            self.assertEqual((first["events"], first["bundles"]), (1, 1))
+            with store._read() as conn:
+                self.assertIsNotNone(conn.execute("SELECT 1 FROM diagnostic_events WHERE event_id=?", (event["event_id"],)).fetchone())
+                self.assertIsNotNone(conn.execute("SELECT 1 FROM diagnostic_bundles WHERE bundle_id=?", (bundle["bundle_id"],)).fetchone())
+            second = store.purge_diagnostics(now="2026-09-01T00:00:20Z")
+            self.assertGreaterEqual(second.get("tombstones", 0), 2)
+            with store._read() as conn:
+                self.assertIsNone(conn.execute("SELECT 1 FROM diagnostic_events WHERE event_id=?", (event["event_id"],)).fetchone())
+                self.assertIsNone(conn.execute("SELECT 1 FROM diagnostic_bundles WHERE bundle_id=?", (bundle["bundle_id"],)).fetchone())
+
+    def test_diagnostic_tombstones_scrub_owner_and_event_classification(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = RecorderStore(
+                root / "db.sqlite3",
+                storage_root=root / "data",
+                diagnostics_retention_seconds=1,
+                diagnostics_tombstone_retention_seconds=10,
+            )
+            store.register_device("opaque-user", "opaque-phone", "phone")
+            store.record_diagnostics_opt_in("opaque-user", "opaque-phone", event_id="opaque-opt", now="2026-09-01T00:00:00Z")
+            event_result = store.ingest_diagnostic_event(
+                "opaque-user",
+                "opaque-phone",
+                event_id="opaque-event",
+                idempotency_key="opaque-event",
+                payload={"category": "voice", "stage": "upload"},
+                now="2026-09-01T00:00:00Z",
+            )
+            store.purge_diagnostics(now="2026-09-01T00:00:02Z", _recover_cleanup=False)
+            with store._read() as conn:
+                event = conn.execute("SELECT category, stage, metadata_json FROM diagnostic_events WHERE event_id=?", (event_result["event_id"],)).fetchone()
+                tombstone = conn.execute("SELECT user_id, device_id, entity_id FROM diagnostic_tombstones WHERE entity_type='event' AND entity_id=?", (event_result["event_id"],)).fetchone()
+            self.assertEqual((event["category"], event["stage"], event["metadata_json"]), ("other", "other", "{}"))
+            self.assertIsNotNone(tombstone)
+            self.assertNotIn("opaque-user", tombstone["user_id"])
+            self.assertNotIn("opaque-phone", tombstone["device_id"])
+            self.assertEqual(tombstone["entity_id"], event_result["event_id"])
+
+    def test_cleanup_receipt_claim_is_single_owner_and_reclaims_after_lease(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = RecorderStore(root / "db.sqlite3", storage_root=root / "data")
+            target = root / "data" / "cleanup.bin"
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(b"cleanup")
+            receipt_id = store._prepare_cleanup_receipt(
+                operation="integrated_claim_test",
+                path=target,
+                expected_sha256=hashlib.sha256(b"cleanup").hexdigest(),
+                expected_size=7,
+                now="2026-09-01T00:00:00Z",
+            )
+            first = store._features._claim_cleanup_receipt(receipt_id, now="2026-09-01T00:00:00Z")
+            second = store._features._claim_cleanup_receipt(receipt_id, now="2026-09-01T00:00:01Z")
+            reclaimed = store._features._claim_cleanup_receipt(receipt_id, now="2026-09-01T00:05:01Z")
+            self.assertIsNotNone(first)
+            self.assertIsNone(second)
+            self.assertIsNotNone(reclaimed)
+            self.assertNotEqual(first, reclaimed)
+
+    def test_http_rejects_new_work_after_shutdown_requested(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            service = RecorderService(RecorderStore(root / "db.sqlite3", storage_root=root / "data"))
+            service.request_shutdown()
+            status, _headers, payload = service.handle_http("GET", "/v1/health", {}, b"")
+            self.assertEqual(status, 503)
+            self.assertEqual(payload["error"]["code"], "SERVICE_STOPPING")
+
+    def test_audio_finish_replay_without_duration_uses_trusted_derived_value(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = RecorderStore(root / "db.sqlite3", storage_root=root / "data")
+            turn_id = "018f5a2e-7b6e-7abc-8d11-1234567890ac"
+            manifest = {
+                "schema_version": 1,
+                "user_id": "u",
+                "turn_id": turn_id,
+                "origin_device_id": "phone",
+                "client_created_at": "2026-09-09T00:00:00Z",
+                "parts": [{"part_id": "audio", "kind": "audio", "mime": "audio/wav", "streaming": True}],
+            }
+            store.create_turn(manifest)
+            wav_buffer = io.BytesIO()
+            with wave.open(wav_buffer, "wb") as handle:
+                handle.setnchannels(1)
+                handle.setsampwidth(2)
+                handle.setframerate(16000)
+                handle.writeframes(b"\x00\x00" * 160)
+            audio = wav_buffer.getvalue()
+            digest = hashlib.sha256(audio).hexdigest()
+            store.put_chunk(turn_id, "audio", 0, audio)
+            first = store.finish_part(
+                turn_id,
+                "audio",
+                total_chunks=1,
+                total_bytes=len(audio),
+                whole_stream_sha256=digest,
+            )
+            replay = store.finish_part(
+                turn_id,
+                "audio",
+                total_chunks=1,
+                total_bytes=len(audio),
+                whole_stream_sha256=digest,
+            )
+            self.assertEqual(first["duration_ms"], 10)
+            self.assertEqual(replay["duration_ms"], first["duration_ms"])
+
+    def test_audio_finish_legacy_missing_duration_is_repaired_or_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = RecorderStore(root / "db.sqlite3", storage_root=root / "data")
+            turn_id = "018f5a2e-7b6e-7abc-8d11-1234567890ad"
+            manifest = {
+                "schema_version": 1,
+                "user_id": "u",
+                "turn_id": turn_id,
+                "origin_device_id": "phone",
+                "client_created_at": "2026-09-09T00:00:00Z",
+                "parts": [{"part_id": "audio", "kind": "audio", "mime": "audio/wav", "streaming": True}],
+            }
+            store.create_turn(manifest)
+            wav_buffer = io.BytesIO()
+            with wave.open(wav_buffer, "wb") as handle:
+                handle.setnchannels(1)
+                handle.setsampwidth(2)
+                handle.setframerate(16000)
+                handle.writeframes(b"\x00\x00" * 160)
+            audio = wav_buffer.getvalue()
+            digest = hashlib.sha256(audio).hexdigest()
+            store.put_chunk(turn_id, "audio", 0, audio)
+            first = store.finish_part(
+                turn_id,
+                "audio",
+                total_chunks=1,
+                total_bytes=len(audio),
+                whole_stream_sha256=digest,
+            )
+            with store._tx() as conn:
+                conn.execute("UPDATE turn_parts SET duration_ms=NULL WHERE turn_id=? AND part_id=?", (turn_id, "audio"))
+            repaired = store.finish_part(
+                turn_id,
+                "audio",
+                total_chunks=1,
+                total_bytes=len(audio),
+                whole_stream_sha256=digest,
+            )
+            self.assertEqual(repaired["duration_ms"], first["duration_ms"])
+
+            with store._tx() as conn:
+                conn.execute(
+                    "UPDATE turn_parts SET duration_ms=NULL, source_deleted_at=? WHERE turn_id=? AND part_id=?",
+                    ("2026-09-10T00:00:00+00:00", turn_id, "audio"),
+                )
+            with self.assertRaises(SourceUnavailableError):
+                store.finish_part(
+                    turn_id,
+                    "audio",
+                    total_chunks=1,
+                    total_bytes=len(audio),
+                    whole_stream_sha256=digest,
+                )
+
+    def test_audio_finish_publishes_with_cleanup_receipt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = RecorderStore(root / "db.sqlite3", storage_root=root / "data")
+            turn_id = "018f5a2e-7b6e-7abc-8d11-1234567890ae"
+            manifest = {
+                "schema_version": 1,
+                "user_id": "u",
+                "turn_id": turn_id,
+                "origin_device_id": "phone",
+                "client_created_at": "2026-09-09T00:00:00Z",
+                "parts": [{"part_id": "text", "kind": "text", "mime": "text/plain"}],
+            }
+            store.create_turn(manifest)
+            payload = b"streamed finish"
+            digest = hashlib.sha256(payload).hexdigest()
+            store.put_chunk(turn_id, "text", 0, payload)
+            real_link = store._features._link_staged
+
+            def link_then_fail(*args, **kwargs):
+                real_link(*args, **kwargs)
+                raise RuntimeError("simulated post-publication failure")
+
+            with patch.object(store._features, "_link_staged", side_effect=link_then_fail):
+                with self.assertRaises(RuntimeError):
+                    store.finish_part(
+                        turn_id,
+                        "text",
+                        total_chunks=1,
+                        total_bytes=len(payload),
+                        whole_stream_sha256=digest,
+                    )
+            part_dir = next((root / "data" / "turns").glob("*/" + "*/parts/*"))
+            self.assertFalse((part_dir / "part.bin").exists())
+            with store._read() as conn:
+                statuses = [row["status"] for row in conn.execute("SELECT status FROM storage_cleanup_receipts").fetchall()]
+            self.assertTrue(statuses)
+            self.assertTrue(all(status == "COMPLETE" for status in statuses))
+
     def test_schema4_fixture_is_the_pinned_public_preimage(self):
         content = SCHEMA4_FIXTURE.read_bytes()
         self.assertEqual(len(content), 19999)
@@ -596,6 +900,80 @@ class R25IntegratedRegressionTests(unittest.TestCase):
             with restarted._read() as conn:
                 self.assertEqual(conn.execute("SELECT COUNT(*) FROM diagnostic_bundles").fetchone()[0], 2)
                 self.assertEqual(conn.execute("SELECT COUNT(*) FROM diagnostic_bundles WHERE migration_state='READY'").fetchone()[0], 2)
+
+    def test_history_requery_uses_canonical_request_hash_not_ingress_envelope_hash(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = RecorderStore(root / "db.sqlite3", storage_root=root / "data")
+            service = RecorderService(store)
+            turn_id = "018f5a2e-7b6e-7abc-8d11-1234567890a1"
+            service.store.get_turn = lambda _turn_id: {
+                "turn_id": turn_id,
+                "final_event_version": 1,
+                "final_content": None,
+                "final_outcome": None,
+            }
+
+            first = HermesResult(
+                "assistant-1", "first", True, "hermes-history", submission_id="submission-1",
+                turn_id=turn_id, marker="marker-1", session_key="session-1", run_id="run-1",
+                request_sha256="request-hash", subject_kind="turn",
+            )
+            second = HermesResult(
+                "assistant-2", "second", True, "hermes-run", submission_id="submission-1",
+                turn_id=turn_id, marker="marker-1", session_key="session-1", run_id="run-1",
+                request_sha256="request-hash", subject_kind="turn",
+            )
+
+            class HistoryGateway:
+                def history_messages(self, *, session_key, marker):
+                    self.seen = (session_key, marker)
+                    return [first]
+
+            service.hermes = HistoryGateway()
+            ingress = {
+                "turn_id": turn_id,
+                "hermes_submission_id": "submission-1",
+                "marker": "marker-1",
+                "gateway_session_key": "session-1",
+                "run_id": "run-1",
+                "payload_sha256": "envelope-hash",
+            }
+            self.assertEqual(service._requery_combined_content(ingress, second), "first\nsecond")
+
+    def test_update_manifest_rejects_same_size_source_mutation_during_copy(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "candidate.apk"
+            source.write_bytes(b"original")
+            store = RecorderStore(root / "db.sqlite3", storage_root=root / "data")
+            features = store._features
+            publish_stream = features._publish_stream
+
+            def mutate_source_then_publish(*args, **kwargs):
+                source.write_bytes(b"mutated!")
+                return publish_stream(*args, **kwargs)
+
+            features._publish_stream = mutate_source_then_publish
+            try:
+                with self.assertRaises(ConflictError):
+                    store.publish_update_manifest(
+                        channel="mutation",
+                        generation=1,
+                        platform="phone",
+                        version="1.0.0",
+                        version_code=1,
+                        artifact_name="candidate.apk",
+                        artifact_path=source,
+                        signer_digest="a" * 64,
+                        changelog="change",
+                        min_server_version="1.0.0",
+                        authorization_policy="test-only",
+                    )
+            finally:
+                features._publish_stream = publish_stream
+            with store._read() as conn:
+                self.assertIsNone(conn.execute("SELECT 1 FROM update_manifests WHERE channel=?", ("mutation",)).fetchone())
 
 
 if __name__ == "__main__":

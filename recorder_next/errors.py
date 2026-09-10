@@ -78,6 +78,11 @@ class NotReadyError(RecorderError):
     status = 409
 
 
+class ServiceStoppingError(RecorderError):
+    code = "SERVICE_STOPPING"
+    status = 503
+
+
 class SourceUnavailableError(RecorderError):
     code = "SOURCE_UNAVAILABLE"
     status = 410

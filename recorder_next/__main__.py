@@ -5,6 +5,7 @@ import os
 import signal
 import stat
 import threading
+import time
 from dataclasses import replace
 from types import FrameType
 from typing import Callable
@@ -15,6 +16,7 @@ from .service import create_configured_service, create_service
 
 
 SignalHandler = Callable[[int, FrameType | None], object] | int | None
+APPLICATION_MAX_SECONDS = 3900.0
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -59,6 +61,7 @@ class _ShutdownBridge:
         self.server = server
         self.server_join_timeout = server_join_timeout
         self.requested = threading.Event()
+        self.requested_at: float | None = None
         self._previous_handlers: dict[int, SignalHandler] = {}
         self._server_thread = threading.Thread(
             target=self._shutdown_server,
@@ -79,6 +82,7 @@ class _ShutdownBridge:
     def request(self) -> None:
         if self.requested.is_set():
             return
+        self.requested_at = time.monotonic()
         self.requested.set()
         self.service.request_shutdown()
 
@@ -153,8 +157,14 @@ def main(argv: list[str] | None = None) -> int:
         server.serve_forever()
     finally:
         shutdown.close()
+        deadline = (shutdown.requested_at or time.monotonic()) + APPLICATION_MAX_SECONDS
+        remaining = max(0.0, deadline - time.monotonic())
+        background_stopped = service.stop_background_workers(timeout=remaining)
+        remaining = max(0.0, deadline - time.monotonic())
+        drained = service.wait_for_drain(timeout=remaining)
         server.server_close()
-        service.stop_background_workers()
+        if not background_stopped or not drained:
+            raise RuntimeError("Recorder service did not stop within the configured drain deadline")
     return 0
 
 

@@ -11,13 +11,15 @@ Environment=RECORDER_INGRESS_SECRET_FILE=%d/recorder_ingress_secret
 ExecStart=/usr/bin/python3 -m recorder_next --config /etc/recorder-next/recorder-next.toml
 Restart=on-failure
 RestartSec=3
-TimeoutStopSec=15s
+TimeoutStopSec=3960s
 User=rumi
 Group=rumi
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
+StateDirectory=recorder-next
+StateDirectoryMode=0700
 ReadWritePaths=/var/lib/recorder-next
 
 [Install]

@@ -10,16 +10,17 @@ import shutil
 import sqlite3
 import stat
 import threading
+import time
 import uuid
 import zlib
 from pathlib import Path
-from typing import Any, Callable, Iterator, Mapping, Sequence
+from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
 from urllib.parse import quote
 
-from .canonical import canonical_json, hermes_content_hash, normalize_hermes_text, sha256_bytes, sha256_json
+from .canonical import canonical_json, hermes_content_hash, normalize_aliases, normalize_hermes_text, sha256_bytes, sha256_json
 from .hermes_wire import SubmissionContext
 from .ingress_contract import ManifestPolicy, validate_turn_manifest
-from .media import validate_wav
+from .media import inspect_wav_file
 from .errors import (
     ChunkConflict,
     CleanupIncompleteError,
@@ -43,6 +44,7 @@ SCHEDULE_ID = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
 MAX_CHUNK_BYTES = 1024 * 1024
 DEFAULT_MISSING_PAGE_SIZE = 1024
 MAX_MISSING_PAGE_SIZE = 1024
+_MISSING = object()
 
 TERMINAL_TURN_STATES = {"DELIVERED", "FAILED_PERMANENT", "EXPIRED"}
 FINAL_ERROR_MESSAGES = {
@@ -215,6 +217,7 @@ class RecorderStore:
             c7_complete = self._migrate_c7_diagnostics(conn, force=source_version < 5)
             marker = "5" if c7_complete else "4"
             conn.execute("BEGIN IMMEDIATE")
+            self._normalize_diagnostic_tombstones(conn)
             conn.execute("INSERT OR IGNORE INTO schema_meta(key, value) VALUES ('schema_version', ?)", (marker,))
             conn.execute("UPDATE schema_meta SET value=? WHERE key='schema_version'", (marker,))
             conn.execute("COMMIT")
@@ -393,6 +396,25 @@ class RecorderStore:
                     conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_diagnostic_events_ready ON diagnostic_events(user_id, device_id, retention_deadline, privacy_version, migration_state)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_diagnostic_bundles_ready ON diagnostic_bundles(user_id, device_id, retention_deadline, privacy_version, migration_state)")
+
+    def _normalize_diagnostic_tombstones(self, conn: sqlite3.Connection) -> None:
+        """Remove raw owner identifiers from tombstones without a schema change."""
+
+        from .features import FeatureGroups
+
+        def is_token(value: Any, prefix: str) -> bool:
+            return isinstance(value, str) and re.fullmatch(rf"{prefix}1:[0-9a-fA-F]{{64}}", value) is not None
+
+        for row in conn.execute("SELECT tombstone_id, user_id, device_id FROM diagnostic_tombstones").fetchall():
+            user_id = row["user_id"]
+            device_id = row["device_id"]
+            normalized_user = user_id if is_token(user_id, "u") else FeatureGroups._tombstone_owner_token("user", str(user_id))
+            normalized_device = device_id if is_token(device_id, "d") else FeatureGroups._tombstone_owner_token("device", str(device_id))
+            if normalized_user != user_id or normalized_device != device_id:
+                conn.execute(
+                    "UPDATE diagnostic_tombstones SET user_id=?, device_id=? WHERE tombstone_id=?",
+                    (normalized_user, normalized_device, row["tombstone_id"]),
+                )
 
     @staticmethod
     def _create_c7_bundle_table(conn: sqlite3.Connection, table_name: str = "diagnostic_bundles_new") -> None:
@@ -1042,6 +1064,9 @@ class RecorderStore:
         return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
     def _safe_write(self, path: Path, payload: bytes) -> None:
+        self._safe_write_stream(path, (payload,))
+
+    def _safe_write_stream(self, path: Path, chunks: Iterable[bytes]) -> None:
         from .features import FeatureGroups
 
         root = FeatureGroups._lexical_absolute(self.storage_root)
@@ -1070,7 +1095,10 @@ class RecorderStore:
             )
             temporary_present = True
             with os.fdopen(temporary_descriptor, "wb", closefd=False) as handle:
-                handle.write(payload)
+                for chunk in chunks:
+                    if not isinstance(chunk, bytes):
+                        raise TypeError("managed file stream must yield bytes")
+                    handle.write(chunk)
                 handle.flush()
                 os.fsync(handle.fileno())
             os.close(temporary_descriptor)
@@ -1857,6 +1885,76 @@ class RecorderStore:
         user_id: str | None = None,
         device_id: str | None = None,
     ) -> dict[str, Any]:
+        """Verify and publish a part while retaining rollback authority."""
+
+        self._validate_total_chunks(total_chunks)
+        if not isinstance(total_bytes, int) or isinstance(total_bytes, bool) or total_bytes < 0:
+            raise ValidationError("total_bytes must be a non-negative integer")
+        if not isinstance(whole_stream_sha256, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", whole_stream_sha256):
+            raise ValidationError("whole_stream_sha256 must be a SHA-256 hex digest")
+        with self._write_lock:
+            with self._read() as conn:
+                turn = self._turn_row(conn, turn_id)
+                self._assert_turn_owner_tx(conn, turn, user_id, device_id)
+                part = conn.execute(
+                    "SELECT status FROM turn_parts WHERE turn_id=? AND part_id=?", (turn_id, part_id)
+                ).fetchone()
+                if part is None:
+                    raise NotFoundError("part not found")
+                if part["status"] == "COMPLETE":
+                    return self._finish_part(
+                        turn_id,
+                        part_id,
+                        total_chunks=total_chunks,
+                        total_bytes=total_bytes,
+                        whole_stream_sha256=whole_stream_sha256,
+                        duration_ms=duration_ms,
+                        user_id=user_id,
+                        device_id=device_id,
+                    )
+                target = self._part_dir(turn["user_id"], turn_id, part_id) / "part.bin"
+            receipt_id = self._prepare_cleanup_receipt(
+                operation="turn_part_rollback",
+                path=target,
+                expected_sha256=whole_stream_sha256,
+                expected_size=total_bytes,
+                user_id=turn["user_id"],
+                device_id=turn["origin_device_id"],
+                entity_type="turn_part",
+                entity_id=f"{turn_id}:{part_id}",
+                now=self._now(),
+            )
+            try:
+                return self._finish_part(
+                    turn_id,
+                    part_id,
+                    total_chunks=total_chunks,
+                    total_bytes=total_bytes,
+                    whole_stream_sha256=whole_stream_sha256,
+                    duration_ms=duration_ms,
+                    user_id=user_id,
+                    device_id=device_id,
+                    cleanup_receipt_id=receipt_id,
+                )
+            except Exception as exc:
+                cleanup = self.recover_cleanup_receipts(receipt_ids=[receipt_id], now=self._now())
+                if cleanup["pending"] or cleanup["blocked"]:
+                    raise CleanupIncompleteError("part publication rollback cleanup is incomplete") from exc
+                raise
+
+    def _finish_part(
+        self,
+        turn_id: str,
+        part_id: str,
+        *,
+        total_chunks: int,
+        total_bytes: int,
+        whole_stream_sha256: str,
+        duration_ms: int | None = None,
+        user_id: str | None = None,
+        device_id: str | None = None,
+        cleanup_receipt_id: str | None = None,
+    ) -> dict[str, Any]:
         total_chunks = self._validate_total_chunks(total_chunks)
         if not isinstance(total_bytes, int) or isinstance(total_bytes, bool) or total_bytes < 0:
             raise ValidationError("total_bytes must be a non-negative integer")
@@ -1864,72 +1962,274 @@ class RecorderStore:
             not isinstance(duration_ms, int) or isinstance(duration_ms, bool) or duration_ms < 0
         ):
             raise ValidationError("duration_ms must be a non-negative integer or null")
-        with self._tx() as conn:
-            turn = self._turn_row(conn, turn_id)
-            self._assert_turn_owner_tx(conn, turn, user_id, device_id)
-            part = conn.execute(
+        from .features import MANAGED_COPY_DEADLINE_SECONDS
+
+        def part_fingerprint(row: Mapping[str, Any]) -> tuple[Any, ...]:
+            return tuple(
+                row.get(field)
+                for field in (
+                    "status",
+                    "kind",
+                    "mime",
+                    "declared_bytes",
+                    "declared_sha256",
+                    "total_chunks",
+                    "total_bytes",
+                    "whole_stream_sha256",
+                    "duration_ms",
+                    "source_path",
+                    "source_deleted_at",
+                    "archived_at",
+                )
+            )
+
+        with self._read() as conn:
+            turn_row = self._turn_row(conn, turn_id)
+            self._assert_turn_owner_tx(conn, turn_row, user_id, device_id)
+            part_row = conn.execute(
                 "SELECT * FROM turn_parts WHERE turn_id=? AND part_id=?", (turn_id, part_id)
             ).fetchone()
-            if part is None:
+            if part_row is None:
                 raise NotFoundError("part not found")
-            total_chunks = self._validate_total_chunks(total_chunks, kind=part["kind"])
-            if part["kind"] == "audio" and duration_ms is not None:
-                if duration_ms > self.max_audio_minutes * 60 * 1000:
-                    raise QuotaExceeded("audio duration exceeds configured minute limit")
-            if part["status"] == "COMPLETE":
-                if (
-                    part["whole_stream_sha256"] == whole_stream_sha256
-                    and part["total_chunks"] == total_chunks
-                    and part["total_bytes"] == total_bytes
-                    and part["duration_ms"] == duration_ms
-                ):
-                    return _row(part) or {}
-                raise ChunkConflict("completed part was finished with a different manifest")
-            rows = conn.execute(
-                "SELECT * FROM turn_chunks WHERE turn_id=? AND part_id=? ORDER BY sequence", (turn_id, part_id)
-            ).fetchall()
-            have = {row["sequence"] for row in rows}
-            missing = [seq for seq in range(total_chunks) if seq not in have]
-            if missing:
-                raise MissingParts(f"missing chunk sequences: {missing}")
-            if len(rows) != total_chunks:
-                extra = sorted(have.difference(range(total_chunks)))
-                raise MissingParts(f"unexpected chunk sequences: {extra}")
-            if sum(row["byte_length"] for row in rows) != total_bytes:
+            turn = _row(turn_row) or {}
+            part = _row(part_row) or {}
+
+        total_chunks = self._validate_total_chunks(total_chunks, kind=part["kind"])
+        if part["kind"] == "audio" and duration_ms is not None:
+            if duration_ms > self.max_audio_minutes * 60 * 1000:
+                raise QuotaExceeded("audio duration exceeds configured minute limit")
+        part_limit = self.max_text_bytes if part["kind"] == "text" else self.max_audio_bytes if part["kind"] == "audio" else self.max_attachment_bytes
+        if total_bytes > part_limit:
+            raise QuotaExceeded("completed part exceeds its configured size limit")
+        if self.min_free_bytes and shutil.disk_usage(self.storage_root).free < self.min_free_bytes + total_bytes:
+            raise QuotaExceeded("configured minimum free disk space is not available")
+
+        manifest_duration = None
+        if part["kind"] == "audio":
+            manifest = _loads(turn["manifest_json"], {})
+            manifest_part = next(
+                (item for item in manifest.get("parts", []) if item.get("part_id") == part_id),
+                {},
+            )
+            manifest_duration = manifest_part.get("duration_ms")
+            if manifest_duration is not None and duration_ms is not None and manifest_duration != duration_ms:
+                raise ConflictError("manifest duration does not match finish assertion")
+
+        if part["status"] == "COMPLETE":
+            if part["kind"] == "audio" and part["duration_ms"] is None:
+                # A legacy COMPLETE row without a trusted duration must not
+                # become verified merely because the replay omits the field.
+                # Re-authenticate the retained source and repair the durable
+                # derived value, or fail explicitly when the source is gone.
+                if part["source_deleted_at"] is not None or not part["source_path"]:
+                    raise SourceUnavailableError("completed audio duration cannot be verified after source cleanup")
+                byte_length = part["total_bytes"]
+                digest = part["whole_stream_sha256"]
+                if not isinstance(byte_length, int) or not isinstance(digest, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", digest):
+                    raise ConflictError("completed audio source metadata is incomplete")
+                try:
+                    source = self._features._open_managed_body(
+                        self.storage_root,
+                        Path(part["source_path"]),
+                        expected_size=byte_length,
+                        expected_sha256=digest,
+                    )
+                    try:
+                        metadata = inspect_wav_file(
+                            source._descriptor,
+                            byte_length,
+                            part_id=part_id,
+                            mime=part["mime"],
+                        )
+                    finally:
+                        source.close()
+                except NotReadyError as exc:
+                    raise SourceUnavailableError("completed audio source is unavailable") from exc
+                derived_duration = metadata.duration_ms
+                if manifest_duration is not None and manifest_duration != derived_duration:
+                    raise ConflictError("manifest duration does not match WAV duration")
+                if duration_ms is not None and abs(duration_ms - derived_duration) > 1:
+                    raise ChunkConflict("completed part was finished with a different duration")
+                with self._tx() as conn:
+                    conn.execute(
+                        "UPDATE turn_parts SET duration_ms=? WHERE turn_id=? AND part_id=? AND status='COMPLETE' AND duration_ms IS NULL",
+                        (derived_duration, turn_id, part_id),
+                    )
+                    part = _row(conn.execute(
+                        "SELECT * FROM turn_parts WHERE turn_id=? AND part_id=?", (turn_id, part_id)
+                    ).fetchone()) or part
+            if (
+                part["whole_stream_sha256"] == whole_stream_sha256.lower()
+                and part["total_chunks"] == total_chunks
+                and part["total_bytes"] == total_bytes
+            ):
+                if duration_ms is None:
+                    return part
+                if part["duration_ms"] is not None and abs(part["duration_ms"] - duration_ms) <= 1:
+                    return part
+                raise ChunkConflict("completed part was finished with a different duration")
+            raise ChunkConflict("completed part was finished with a different manifest")
+
+        with self._read() as conn:
+            chunk_summary = conn.execute(
+                "SELECT COUNT(*) AS count, COALESCE(SUM(byte_length), 0) AS total_bytes, MIN(sequence) AS first_sequence, MAX(sequence) AS last_sequence FROM turn_chunks WHERE turn_id=? AND part_id=?",
+                (turn_id, part_id),
+            ).fetchone()
+            chunk_count = int(chunk_summary["count"])
+            if chunk_count != total_chunks:
+                raise MissingParts("stored chunk count does not match total_chunks")
+            if (
+                total_chunks > 0
+                and (chunk_summary["first_sequence"] != 0 or chunk_summary["last_sequence"] != total_chunks - 1)
+            ):
+                raise MissingParts("stored chunk sequences are not contiguous")
+            if int(chunk_summary["total_bytes"]) != total_bytes:
                 raise ConflictError("total_bytes does not match stored chunks")
-            digest = hashlib.sha256()
-            assembled = bytearray()
-            for row in rows:
-                content = Path(row["storage_path"]).read_bytes()
-                if sha256_bytes(content) != row["sha256"]:
+            chunk_rows: list[dict[str, Any]] = []
+            after_sequence = -1
+            while True:
+                rows = conn.execute(
+                    "SELECT sequence, byte_length, sha256, storage_path FROM turn_chunks WHERE turn_id=? AND part_id=? AND sequence>? ORDER BY sequence LIMIT 256",
+                    (turn_id, part_id, after_sequence),
+                ).fetchall()
+                if not rows:
+                    break
+                chunk_rows.extend(_row(row) or {} for row in rows)
+                after_sequence = int(rows[-1]["sequence"])
+
+        chunk_fingerprint = tuple(
+            (
+                int(row["sequence"]),
+                int(row["byte_length"]),
+                row["sha256"],
+                row["storage_path"],
+            )
+            for row in chunk_rows
+        )
+        digest = hashlib.sha256()
+        streamed_bytes = 0
+        copy_deadline = time.monotonic() + MANAGED_COPY_DEADLINE_SECONDS
+
+        def chunk_stream() -> Iterator[bytes]:
+            nonlocal streamed_bytes
+            for row in chunk_rows:
+                if time.monotonic() >= copy_deadline:
+                    raise TimeoutError("managed copy deadline exceeded")
+                chunk_digest = hashlib.sha256()
+                try:
+                    handle = self._features._open_managed_body(
+                        self.storage_root,
+                        Path(row["storage_path"]),
+                        expected_size=int(row["byte_length"]),
+                        expected_sha256=str(row["sha256"]),
+                    )
+                    try:
+                        for content in handle.iter_chunks(65_536):
+                            if time.monotonic() >= copy_deadline:
+                                raise TimeoutError("managed copy deadline exceeded")
+                            chunk_digest.update(content)
+                            digest.update(content)
+                            streamed_bytes += len(content)
+                            yield content
+                    finally:
+                        handle.close()
+                except (NotReadyError, OSError) as exc:
+                    raise ConflictError("stored chunk is unavailable") from exc
+                if chunk_digest.hexdigest() != row["sha256"]:
                     raise ConflictError("stored chunk failed its durable hash check")
-                digest.update(content)
-                assembled.extend(content)
+
+        assembled_path = self._part_dir(turn["user_id"], turn_id, part_id) / "part.bin"
+        staged = self._features._stage_stream(
+            self.storage_root,
+            assembled_path,
+            chunk_stream(),
+            deadline_at=copy_deadline,
+        )
+        try:
             actual = digest.hexdigest()
-            if actual != whole_stream_sha256:
+            if streamed_bytes != total_bytes:
+                raise ConflictError("assembled bytes do not match total_bytes")
+            if actual != whole_stream_sha256.lower():
                 raise ConflictError("whole_stream_sha256 does not match stored chunks")
             if part["declared_bytes"] is not None and part["declared_bytes"] != total_bytes:
                 raise ConflictError("declared_bytes does not match completed part")
-            if part["declared_sha256"] is not None and part["declared_sha256"] != actual:
+            if part["declared_sha256"] is not None and part["declared_sha256"].lower() != actual:
                 raise ConflictError("declared_sha256 does not match completed part")
             if part["kind"] == "audio":
-                validate_wav(
-                    bytes(assembled),
-                    part_id=part_id,
-                    mime=part["mime"],
-                    duration_ms=duration_ms,
-                )
-            assembled_path = self._part_dir(turn["user_id"], turn_id, part_id) / "part.bin"
-            self._safe_write(assembled_path, bytes(assembled))
-            conn.execute(
-                "UPDATE turn_parts SET total_chunks=?, total_bytes=?, whole_stream_sha256=?, duration_ms=?, status='COMPLETE', source_path=?, source_deleted_at=NULL WHERE turn_id=? AND part_id=?",
-                (total_chunks, total_bytes, actual, duration_ms, str(assembled_path), turn_id, part_id),
-            )
-            return _row(
-                conn.execute(
+                try:
+                    audio = inspect_wav_file(
+                        staged.descriptor,
+                        total_bytes,
+                        part_id=part_id,
+                        mime=part["mime"],
+                        asserted_duration_ms=duration_ms,
+                    )
+                except OSError as exc:
+                    raise ConflictError("assembled audio source is unavailable") from exc
+                if audio.frame_count > self.max_audio_minutes * 60 * audio.sample_rate:
+                    raise QuotaExceeded("audio duration exceeds configured minute limit")
+                if manifest_duration is not None and audio.duration_ms != manifest_duration:
+                    raise ConflictError("manifest duration does not match WAV duration")
+                # The WAV header is the authoritative duration.  The client
+                # value is an assertion only and must never become verified
+                # metadata merely because it was supplied by the caller.
+                duration_ms = audio.duration_ms
+
+            with self._tx() as conn:
+                current_turn = self._turn_row(conn, turn_id)
+                self._assert_turn_owner_tx(conn, current_turn, user_id, device_id)
+                if current_turn["manifest_json"] != turn["manifest_json"] or current_turn["archived_at"] != turn["archived_at"]:
+                    raise ConflictError("turn metadata changed during part assembly")
+                current_part_row = conn.execute(
                     "SELECT * FROM turn_parts WHERE turn_id=? AND part_id=?", (turn_id, part_id)
                 ).fetchone()
-            ) or {}
+                if current_part_row is None:
+                    raise NotFoundError("part not found")
+                current_part = _row(current_part_row) or {}
+                if current_part["status"] == "COMPLETE":
+                    if (
+                        current_part["whole_stream_sha256"] == whole_stream_sha256.lower()
+                        and current_part["total_chunks"] == total_chunks
+                        and current_part["total_bytes"] == total_bytes
+                    ):
+                        if duration_ms is None or current_part["duration_ms"] is not None and abs(current_part["duration_ms"] - duration_ms) <= 1:
+                            if cleanup_receipt_id is not None:
+                                self._complete_cleanup_receipt_tx(conn, cleanup_receipt_id, now=self._now())
+                            return current_part
+                    raise ChunkConflict("completed part was finished with a different manifest")
+                if part_fingerprint(current_part) != part_fingerprint(part):
+                    raise ConflictError("part metadata changed during assembly")
+                final_chunk_rows = conn.execute(
+                    "SELECT sequence, byte_length, sha256, storage_path FROM turn_chunks WHERE turn_id=? AND part_id=? ORDER BY sequence",
+                    (turn_id, part_id),
+                ).fetchall()
+                final_chunk_fingerprint = tuple(
+                    (
+                        int(row["sequence"]),
+                        int(row["byte_length"]),
+                        row["sha256"],
+                        row["storage_path"],
+                    )
+                    for row in final_chunk_rows
+                )
+                if final_chunk_fingerprint != chunk_fingerprint:
+                    raise ConflictError("stored chunks changed during part assembly")
+                self._features._link_staged(staged, deadline_at=copy_deadline)
+                updated = conn.execute(
+                    "UPDATE turn_parts SET total_chunks=?, total_bytes=?, whole_stream_sha256=?, duration_ms=?, status='COMPLETE', source_path=?, source_deleted_at=NULL WHERE turn_id=? AND part_id=? AND status != 'COMPLETE'",
+                    (total_chunks, total_bytes, actual, duration_ms, str(assembled_path), turn_id, part_id),
+                )
+                if updated.rowcount != 1:
+                    raise ConflictError("part changed during final publication")
+                if cleanup_receipt_id is not None:
+                    self._complete_cleanup_receipt_tx(conn, cleanup_receipt_id, now=self._now())
+                return _row(
+                    conn.execute(
+                        "SELECT * FROM turn_parts WHERE turn_id=? AND part_id=?", (turn_id, part_id)
+                    ).fetchone()
+                ) or {}
+        finally:
+            staged.close()
 
     def read_part(
         self,
@@ -2773,10 +3073,9 @@ class RecorderStore:
                 source_text=combined,
                 output_kind="FINAL_TTS",
             )
-        state = turn["state"] if turn["state"] == "DELIVERED" else "FINAL_READY"
         conn.execute(
             "UPDATE turns SET final_event_version=?, final_combined_hash=?, final_content=?, final_outcome='success', final_error_kind=NULL, state=?, grace_until=NULL, updated_at=? WHERE turn_id=?",
-            (version, combined_hash, combined, state, self._now(), turn["turn_id"]),
+            (version, combined_hash, combined, "FINAL_READY", self._now(), turn["turn_id"]),
         )
         conn.execute(
             "UPDATE session_ingress SET status='SUBMITTED', lease_owner=NULL, lease_token=NULL, lease_expires_at=NULL, updated_at=? WHERE hermes_submission_id=?",
@@ -2892,9 +3191,33 @@ class RecorderStore:
             outbox = conn.execute("SELECT * FROM outbox WHERE event_id=?", (event_id,)).fetchone()
             if outbox is None:
                 raise ConflictError("event is not a deliverable text outbox row")
+            if event["event_kind"] == "FINAL":
+                authoritative_version = int(turn["final_event_version"] or 0)
+                authoritative = conn.execute(
+                    "SELECT event_id, payload_sha256 FROM events WHERE turn_id=? AND event_kind='FINAL' AND event_version=?",
+                    (turn_id, authoritative_version),
+                ).fetchone()
+                if authoritative is None:
+                    raise ConflictError("turn points to a missing authoritative final event")
+                authoritative_outbox = conn.execute(
+                    "SELECT event_id, event_version, required_device_id, payload_sha256 FROM outbox WHERE event_id=? AND turn_id=? AND event_kind='FINAL'",
+                    (authoritative["event_id"], turn_id),
+                ).fetchone()
+                if (
+                    authoritative_outbox is None
+                    or authoritative_outbox["event_version"] != authoritative_version
+                    or authoritative_outbox["required_device_id"] != turn["origin_device_id"]
+                    or authoritative_outbox["payload_sha256"] != authoritative["payload_sha256"]
+                ):
+                    raise ConflictError("authoritative final outbox binding is corrupt")
+                authoritative_ack = authoritative["event_id"] == event_id and authoritative["payload_sha256"] == payload_sha256
+            else:
+                authoritative_ack = True
             if outbox["state"] != "ACKED":
                 conn.execute("UPDATE outbox SET state='ACKED', acknowledged_at=? WHERE event_id=?", (now, event_id))
             if event["event_kind"] == "FINAL":
+                if not authoritative_ack:
+                    return self._turn_payload(conn, turn_id)
                 if event["outcome"] == "success":
                     if turn["state"] != "DELIVERED":
                         conn.execute("UPDATE turns SET state='DELIVERED', updated_at=? WHERE turn_id=?", (now, turn_id))
@@ -3762,6 +4085,38 @@ class RecorderStore:
         if require_active and project["status"] != "active":
             raise ConflictError("scheduled occurrence project/session is not active for its user")
 
+    def _cancel_schedule_tx(self, conn: sqlite3.Connection, schedule_id: str, *, now: str) -> None:
+        """Cancel one schedule and all occurrences that have not fired."""
+
+        conn.execute(
+            "UPDATE schedule_occurrences SET state='FAILED', version=version+1, lease_owner=NULL, lease_expires_at=NULL, updated_at=? WHERE schedule_id=? AND state IN ('PENDING','CLAIMED')",
+            (now, schedule_id),
+        )
+        conn.execute(
+            "UPDATE schedules SET state='CANCELLED', version=version+1, lease_owner=NULL, lease_expires_at=NULL, updated_at=? WHERE schedule_id=? AND state IN ('SCHEDULED','CLAIMED')",
+            (now, schedule_id),
+        )
+
+    def _cancel_project_schedules_tx(self, conn: sqlite3.Connection, user_id: str, project_id: str, *, now: str) -> int:
+        rows = conn.execute(
+            "SELECT schedule_id FROM schedules WHERE user_id=? AND project_id=? AND state IN ('SCHEDULED','CLAIMED')",
+            (user_id, project_id),
+        ).fetchall()
+        for row in rows:
+            self._cancel_schedule_tx(conn, str(row["schedule_id"]), now=now)
+        return len(rows)
+
+    def _normalize_archived_schedules_tx(self, conn: sqlite3.Connection, *, now: str, limit: int = 500) -> int:
+        """Repair stale active schedule rows for archived projects before claim."""
+
+        rows = conn.execute(
+            "SELECT s.schedule_id FROM schedules s JOIN projects p ON p.stable_project_id=s.project_id AND p.user_id=s.user_id WHERE p.status='archived' AND s.state IN ('SCHEDULED','CLAIMED') ORDER BY s.schedule_id LIMIT ?",
+            (limit,),
+        ).fetchall()
+        for row in rows:
+            self._cancel_schedule_tx(conn, str(row["schedule_id"]), now=now)
+        return len(rows)
+
     def claim_due_occurrence(
         self,
         *,
@@ -3776,8 +4131,9 @@ class RecorderStore:
         now = self._schedule_timestamp(now or self._now(), "now")
         expires = (dt.datetime.fromisoformat(now) + dt.timedelta(seconds=lease_seconds)).isoformat(timespec="milliseconds")
         with self._tx() as conn:
+            self._normalize_archived_schedules_tx(conn, now=now)
             row = conn.execute(
-                "SELECT o.*, s.state AS schedule_state, s.version AS schedule_version FROM schedule_occurrences o JOIN schedules s ON s.schedule_id=o.schedule_id WHERE o.scheduled_for <= ? AND o.state IN ('PENDING','CLAIMED') AND (o.state='PENDING' OR o.lease_expires_at <= ?) AND s.state IN ('SCHEDULED','CLAIMED') ORDER BY o.scheduled_for, o.schedule_id, o.trigger_instance_id LIMIT 1",
+                "SELECT o.*, s.state AS schedule_state, s.version AS schedule_version FROM schedule_occurrences o JOIN schedules s ON s.schedule_id=o.schedule_id JOIN projects p ON p.stable_project_id=s.project_id AND p.user_id=s.user_id AND p.status='active' WHERE o.scheduled_for <= ? AND o.state IN ('PENDING','CLAIMED') AND (o.state='PENDING' OR o.lease_expires_at <= ?) AND s.state IN ('SCHEDULED','CLAIMED') ORDER BY o.scheduled_for, o.schedule_id, o.trigger_instance_id LIMIT 1",
                 (now, now),
             ).fetchone()
             if row is None:
@@ -4303,6 +4659,7 @@ class RecorderStore:
     def recover(self, *, now: str | None = None) -> dict[str, int]:
         now = now or self._now()
         with self._tx() as conn:
+            archived_schedules_cancelled = self._normalize_archived_schedules_tx(conn, now=now)
             source_pending = [row["turn_id"] for row in conn.execute("SELECT turn_id FROM turns WHERE source_deleted=0 AND authoritative_asr_outcome='VALID_TRANSCRIPT'").fetchall()]
             router_count = conn.execute(
                 "UPDATE router_queue SET state='QUEUED', lease_owner=NULL, lease_expires_at=NULL, updated_at=? WHERE state='IN_PROGRESS' AND lease_expires_at <= ?",
@@ -4335,6 +4692,7 @@ class RecorderStore:
                 "grace_expired": grace_expired,
                 "schedule_occurrences_requeued": schedule_occurrences_requeued,
                 "schedules_requeued": schedules_requeued,
+                "archived_schedules_cancelled": archived_schedules_cancelled,
                 "source_deletions_retried": 0,
             }
         for pending_turn_id in source_pending:
@@ -4433,7 +4791,11 @@ class RecorderStore:
 
     def _project_payload(self, row: sqlite3.Row) -> dict[str, Any]:
         result = _row(row) or {}
-        result["aliases"] = _loads(result.pop("aliases_json"), [])
+        aliases = _loads(result.pop("aliases_json"), [])
+        try:
+            result["aliases"] = normalize_aliases(aliases)
+        except ValueError as exc:
+            raise ConflictError("stored project aliases are invalid") from exc
         return result
 
     def create_project(
@@ -4442,14 +4804,22 @@ class RecorderStore:
         *,
         project_number: str,
         name: str,
-        aliases: list[str] | None = None,
+        aliases: list[str] | None | object = _MISSING,
         description: str = "",
         idempotency_key: str | None = None,
         stable_project_id: str | None = None,
         worker_claim: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
-        if not user_id or not project_number or not name:
+        if not isinstance(user_id, str) or not user_id or not isinstance(project_number, str) or not project_number or not isinstance(name, str) or not name:
             raise ValidationError("project_number and name are required")
+        if not isinstance(description, str):
+            raise ValidationError("description must be a string")
+        if idempotency_key is not None and not isinstance(idempotency_key, str):
+            raise ValidationError("idempotency_key must be a string or null")
+        try:
+            aliases = normalize_aliases([] if aliases is _MISSING else aliases)
+        except ValueError as exc:
+            raise ValidationError(str(exc)) from exc
         stable_project_id = stable_project_id or str(uuid.uuid5(uuid.NAMESPACE_URL, f"recorder-next:project:{user_id}:{idempotency_key or project_number}"))
         session_key = f"project:{stable_project_id}:default"
         now = self._now()
@@ -4469,7 +4839,7 @@ class RecorderStore:
                 return self._project_payload(by_number)
             conn.execute(
                 "INSERT INTO projects(stable_project_id, user_id, project_number, name, aliases_json, description, status, default_session_key, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?, ?)",
-                (stable_project_id, user_id, project_number, name, _json(aliases or []), description, session_key, now, now),
+                (stable_project_id, user_id, project_number, name, _json(aliases), description, session_key, now, now),
             )
             conn.execute(
                 "INSERT INTO sessions(session_key, project_id, gateway_session_key, created_at) VALUES (?, ?, ?, ?)",
@@ -4505,8 +4875,22 @@ class RecorderStore:
 
     def update_project(self, user_id: str, project_id: str, *, expected_version: int, patch: Mapping[str, Any]) -> dict[str, Any]:
         allowed = {"name", "aliases", "description"}
+        if not isinstance(patch, Mapping):
+            raise ValidationError("project update must be an object")
+        if not isinstance(expected_version, int) or isinstance(expected_version, bool) or expected_version < 1:
+            raise ValidationError("expected_version must be a positive integer")
         if set(patch) - allowed:
             raise ValidationError("project update may change only name, aliases, and description")
+        if "name" in patch and (not isinstance(patch["name"], str) or not patch["name"]):
+            raise ValidationError("name must be a non-empty string")
+        if "description" in patch and not isinstance(patch["description"], str):
+            raise ValidationError("description must be a string")
+        normalized_aliases: str | None = None
+        if "aliases" in patch:
+            try:
+                normalized_aliases = _json(normalize_aliases(patch["aliases"]))
+            except ValueError as exc:
+                raise ValidationError(str(exc)) from exc
         with self._tx() as conn:
             row = conn.execute("SELECT * FROM projects WHERE stable_project_id=? AND user_id=?", (project_id, user_id)).fetchone()
             if row is None:
@@ -4515,7 +4899,8 @@ class RecorderStore:
             if "name" in patch:
                 fields["name"] = patch["name"]
             if "aliases" in patch:
-                fields["aliases_json"] = _json(patch["aliases"])
+                assert normalized_aliases is not None
+                fields["aliases_json"] = normalized_aliases
             if "description" in patch:
                 fields["description"] = patch["description"]
             now = self._now()
@@ -4536,6 +4921,7 @@ class RecorderStore:
             ).rowcount
             if not updated:
                 raise ConflictError("project archive compare-and-set failed")
+            self._cancel_project_schedules_tx(conn, user_id, project_id, now=now)
             return self._project_payload(conn.execute("SELECT * FROM projects WHERE stable_project_id=?", (project_id,)).fetchone())
 
     def archive_turn(

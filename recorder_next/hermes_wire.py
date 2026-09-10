@@ -53,12 +53,15 @@ def serialize_json(value: Any) -> bytes:
 @dataclass(frozen=True)
 class WirePolicy:
     gateway_max_request_bytes: int = 10_000_000
+    gateway_max_response_bytes: int = 1_048_576
     text_reserve_bytes: int = 1_048_576
     session_reserve_bytes: int = 1_024
 
     def __post_init__(self) -> None:
         if not isinstance(self.gateway_max_request_bytes, int) or isinstance(self.gateway_max_request_bytes, bool) or not 1 <= self.gateway_max_request_bytes <= 10_000_000:
             raise ValueError("gateway_max_request_bytes must be between 1 and 10000000")
+        if not isinstance(self.gateway_max_response_bytes, int) or isinstance(self.gateway_max_response_bytes, bool) or not 1 <= self.gateway_max_response_bytes <= 1_048_576:
+            raise ValueError("gateway_max_response_bytes must be between 1 and 1048576")
         if self.text_reserve_bytes < 0 or self.session_reserve_bytes < 0:
             raise ValueError("wire reserves cannot be negative")
 

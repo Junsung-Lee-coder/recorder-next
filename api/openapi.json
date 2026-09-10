@@ -1844,49 +1844,257 @@
       "HistoryResponse": {
         "additionalProperties": false,
         "properties": {
-          "accepted_seq": {
-            "nullable": true,
+          "filters_version": {
             "type": "integer"
+          },
+          "has_more": {
+            "type": "boolean"
           },
           "items": {
             "items": {
               "additionalProperties": false,
               "properties": {
                 "accepted_seq": {
-                  "nullable": true,
                   "type": "integer"
                 },
                 "archived": {
                   "type": "boolean"
                 },
-                "content": {
+                "assistant": {
+                  "additionalProperties": false,
                   "nullable": true,
-                  "type": "string"
+                  "properties": {
+                    "content": {
+                      "nullable": true,
+                      "type": "string"
+                    },
+                    "event_version": {
+                      "type": "integer"
+                    },
+                    "outcome": {
+                      "nullable": true,
+                      "type": "string"
+                    },
+                    "role": {
+                      "enum": [
+                        "assistant"
+                      ],
+                      "type": "string"
+                    },
+                    "state": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "role",
+                    "content",
+                    "outcome",
+                    "state",
+                    "event_version"
+                  ],
+                  "type": "object"
                 },
-                "content_hash": {
-                  "nullable": true,
-                  "type": "string"
-                },
-                "created_at": {
-                  "type": "string"
-                },
-                "message_id": {
-                  "type": "string"
+                "messages": {
+                  "items": {
+                    "oneOf": [
+                      {
+                        "additionalProperties": false,
+                        "properties": {
+                          "attachments": {
+                            "items": {
+                              "additionalProperties": false,
+                              "properties": {
+                                "byte_length": {
+                                  "nullable": true,
+                                  "type": "integer"
+                                },
+                                "kind": {
+                                  "type": "string"
+                                },
+                                "mime": {
+                                  "type": "string"
+                                },
+                                "part_id": {
+                                  "type": "string"
+                                },
+                                "sha256": {
+                                  "nullable": true,
+                                  "type": "string"
+                                },
+                                "status": {
+                                  "type": "string"
+                                }
+                              },
+                              "required": [
+                                "part_id",
+                                "kind",
+                                "mime",
+                                "byte_length",
+                                "sha256",
+                                "status"
+                              ],
+                              "type": "object"
+                            },
+                            "type": "array"
+                          },
+                          "content": {
+                            "type": "string"
+                          },
+                          "input_type": {
+                            "enum": [
+                              "audio",
+                              "text",
+                              "attachment",
+                              "mixed",
+                              "unknown"
+                            ],
+                            "type": "string"
+                          },
+                          "role": {
+                            "enum": [
+                              "user"
+                            ],
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "role",
+                          "content",
+                          "input_type",
+                          "attachments"
+                        ],
+                        "type": "object"
+                      },
+                      {
+                        "additionalProperties": false,
+                        "properties": {
+                          "content": {
+                            "nullable": true,
+                            "type": "string"
+                          },
+                          "event_version": {
+                            "type": "integer"
+                          },
+                          "outcome": {
+                            "nullable": true,
+                            "type": "string"
+                          },
+                          "role": {
+                            "enum": [
+                              "assistant"
+                            ],
+                            "type": "string"
+                          },
+                          "state": {
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "role",
+                          "content",
+                          "outcome",
+                          "state",
+                          "event_version"
+                        ],
+                        "type": "object"
+                      }
+                    ]
+                  },
+                  "type": "array"
                 },
                 "project_id": {
                   "nullable": true,
                   "type": "string"
                 },
-                "role": {
+                "state": {
                   "type": "string"
                 },
                 "turn_id": {
                   "type": "string"
                 },
-                "type": {
+                "turn_source": {
                   "type": "string"
+                },
+                "user": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "attachments": {
+                      "items": {
+                        "additionalProperties": false,
+                        "properties": {
+                          "byte_length": {
+                            "nullable": true,
+                            "type": "integer"
+                          },
+                          "kind": {
+                            "type": "string"
+                          },
+                          "mime": {
+                            "type": "string"
+                          },
+                          "part_id": {
+                            "type": "string"
+                          },
+                          "sha256": {
+                            "nullable": true,
+                            "type": "string"
+                          },
+                          "status": {
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "part_id",
+                          "kind",
+                          "mime",
+                          "byte_length",
+                          "sha256",
+                          "status"
+                        ],
+                        "type": "object"
+                      },
+                      "type": "array"
+                    },
+                    "content": {
+                      "type": "string"
+                    },
+                    "input_type": {
+                      "enum": [
+                        "audio",
+                        "text",
+                        "attachment",
+                        "mixed",
+                        "unknown"
+                      ],
+                      "type": "string"
+                    },
+                    "role": {
+                      "enum": [
+                        "user"
+                      ],
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "role",
+                    "content",
+                    "input_type",
+                    "attachments"
+                  ],
+                  "type": "object"
                 }
               },
+              "required": [
+                "turn_id",
+                "project_id",
+                "accepted_seq",
+                "turn_source",
+                "archived",
+                "state",
+                "user",
+                "assistant",
+                "messages"
+              ],
               "type": "object"
             },
             "type": "array"
@@ -1894,12 +2102,14 @@
           "next_cursor": {
             "nullable": true,
             "type": "string"
-          },
-          "truncated": {
-            "nullable": true,
-            "type": "boolean"
           }
         },
+        "required": [
+          "items",
+          "next_cursor",
+          "has_more",
+          "filters_version"
+        ],
         "type": "object"
       },
       "MissingSequencePage": {
@@ -6414,7 +6624,14 @@
         "additionalProperties": false,
         "properties": {
           "aliases": {
-            "type": "array"
+            "items": {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            },
+            "maxItems": 32,
+            "type": "array",
+            "uniqueItems": true
           },
           "description": {
             "type": "string"
@@ -6455,7 +6672,10 @@
                   "items": {
                     "type": "string"
                   },
-                  "type": "array"
+                  "maxItems": 32,
+                  "minItems": 0,
+                  "type": "array",
+                  "uniqueItems": true
                 },
                 "archived_at": {
                   "nullable": true,
@@ -6503,11 +6723,16 @@
         "additionalProperties": false,
         "properties": {
           "aliases": {
-            "nullable": true,
-            "type": "array"
+            "items": {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            },
+            "maxItems": 32,
+            "type": "array",
+            "uniqueItems": true
           },
           "description": {
-            "nullable": true,
             "type": "string"
           },
           "expected_version": {
@@ -6515,7 +6740,6 @@
             "type": "integer"
           },
           "name": {
-            "nullable": true,
             "type": "string"
           }
         },
@@ -6531,7 +6755,10 @@
             "items": {
               "type": "string"
             },
-            "type": "array"
+            "maxItems": 32,
+            "minItems": 0,
+            "type": "array",
+            "uniqueItems": true
           },
           "archived_at": {
             "nullable": true,

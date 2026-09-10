@@ -41,8 +41,8 @@ from .adapters import (
 from .api_models import WORKER_CLAIM, WORKER_COMPLETE, WORKER_FAIL, WORKER_RECOVER, WORKER_RUN
 from .canonical import hermes_content_hash, normalize_hermes_text
 from .config import RecorderConfig
-from .errors import ForbiddenError, GatewayRequestTooLargeError, LeaseConflict, NotFoundError, RecorderError, UnauthorizedError, UnsupportedMediaType, ValidationError
-from .features import DurableWorker
+from .errors import ForbiddenError, GatewayRequestTooLargeError, LeaseConflict, NotFoundError, RecorderError, ServiceStoppingError, UnauthorizedError, UnsupportedMediaType, ValidationError
+from .features import DurableWorker, ManagedFileBody
 from .hermes_wire import GatewayRequestTooLarge, SubmissionContext, WirePolicy, estimate_run_body_upper_bound, serialize_json
 from .http_contract import match_operation, project_response, validate_request, validate_request_headers, validate_response
 from .ingress_contract import strict_json_loads
@@ -99,9 +99,74 @@ class RecorderService:
         self._internal_worker_principals = frozenset((str(user), str(device)) for user, device in internal_worker_principals)
         self._wire_policy = WirePolicy(gateway_max_request_bytes=gateway_max_request_bytes)
         self._lock = threading.RLock()
+        self._drain_condition = threading.Condition(self._lock)
+        self._active_operations = 0
+        self._lifecycle_state = "RUNNING"
         self._background_stop: threading.Event | None = None
         self._background_threads: list[threading.Thread] = []
         self._shutdown_requested = threading.Event()
+
+    def _begin_operation(self) -> None:
+        with self._drain_condition:
+            if self._shutdown_requested.is_set():
+                raise ServiceStoppingError("Recorder service is draining and is not accepting new work")
+            self._active_operations += 1
+
+    def _end_operation(self) -> None:
+        with self._drain_condition:
+            self._active_operations = max(0, self._active_operations - 1)
+            self._drain_condition.notify_all()
+
+    def admit_http(
+        self,
+        method: str,
+        target: str,
+        headers: Mapping[str, str],
+        *,
+        body_length: int,
+        peer_addr: tuple[str, int],
+    ) -> None:
+        """Admit and preflight a request before sending 100 or reading body."""
+        self._begin_operation()
+        try:
+            self.preflight_http(
+                method,
+                target,
+                headers,
+                body_length=body_length,
+                peer_addr=peer_addr,
+            )
+        except BaseException:
+            self._end_operation()
+            raise
+
+    def release_http(self) -> None:
+        self._end_operation()
+
+    @property
+    def lifecycle_state(self) -> str:
+        with self._lock:
+            return self._lifecycle_state
+
+    def _mark_stopped_if_idle(self) -> None:
+        with self._drain_condition:
+            background_alive = any(thread.is_alive() for thread in self._background_threads)
+            if self._shutdown_requested.is_set() and self._active_operations == 0 and not background_alive:
+                self._lifecycle_state = "STOPPED"
+                self._drain_condition.notify_all()
+
+    def wait_for_drain(self, *, timeout: float = 30.0) -> bool:
+        if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not math.isfinite(float(timeout)) or timeout < 0:
+            raise ValueError("timeout must be a non-negative number")
+        deadline = time.monotonic() + float(timeout)
+        with self._drain_condition:
+            while self._active_operations:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._drain_condition.wait(remaining)
+        self._mark_stopped_if_idle()
+        return True
 
     @staticmethod
     def _poll_seconds(value: float, field: str) -> float:
@@ -154,32 +219,44 @@ class RecorderService:
             scheduler.start()
 
     def _background_worker_loop(self, stop: threading.Event, owner: str, poll_seconds: float, lease_seconds: int) -> None:
-        error_streak = 0
-        while not stop.is_set():
-            try:
-                result = self.run_background_worker_once(owner=owner, lease_seconds=lease_seconds)
-                error_streak = 0
-                delay = poll_seconds if result is None else 0.0
-            except Exception:
-                error_streak = min(error_streak + 1, 8)
-                delay = min(30.0, max(poll_seconds, poll_seconds * (2 ** error_streak)))
-            stop.wait(delay)
+        self._begin_operation()
+        try:
+            error_streak = 0
+            while not stop.is_set():
+                try:
+                    result = self.run_background_worker_once(owner=owner, lease_seconds=lease_seconds)
+                    error_streak = 0
+                    delay = poll_seconds if result is None else 0.0
+                except ServiceStoppingError:
+                    break
+                except Exception:
+                    error_streak = min(error_streak + 1, 8)
+                    delay = min(30.0, max(poll_seconds, poll_seconds * (2 ** error_streak)))
+                stop.wait(delay)
+        finally:
+            self._end_operation()
 
     def _background_scheduler_loop(self, stop: threading.Event, owner: str, poll_seconds: float, lease_seconds: int) -> None:
-        error_streak = 0
-        while not stop.is_set():
-            try:
-                self.recover_scheduler()
-                self.store.recover_worker_jobs()
-                self.run_scheduler(owner=owner, lease_seconds=lease_seconds)
-                error_streak = 0
-                delay = poll_seconds
-            except Exception:
-                error_streak = min(error_streak + 1, 8)
-                delay = min(30.0, max(poll_seconds, poll_seconds * (2 ** error_streak)))
-            stop.wait(delay)
+        self._begin_operation()
+        try:
+            error_streak = 0
+            while not stop.is_set():
+                try:
+                    self.recover_scheduler()
+                    self.store.recover_worker_jobs()
+                    self.run_scheduler(owner=owner, lease_seconds=lease_seconds)
+                    error_streak = 0
+                    delay = poll_seconds
+                except ServiceStoppingError:
+                    break
+                except Exception:
+                    error_streak = min(error_streak + 1, 8)
+                    delay = min(30.0, max(poll_seconds, poll_seconds * (2 ** error_streak)))
+                stop.wait(delay)
+        finally:
+            self._end_operation()
 
-    def stop_background_workers(self, *, timeout: float = 10.0) -> None:
+    def stop_background_workers(self, *, timeout: float = 10.0) -> bool:
         """Request both lifecycle threads to stop and wait for clean exit."""
 
         if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not math.isfinite(float(timeout)) or timeout < 0:
@@ -188,7 +265,8 @@ class RecorderService:
             stop = self._background_stop
             threads = list(self._background_threads)
         if stop is None:
-            return
+            self._mark_stopped_if_idle()
+            return True
         stop.set()
         deadline = time.monotonic() + float(timeout)
         for thread in threads:
@@ -198,11 +276,16 @@ class RecorderService:
             self._background_threads = [thread for thread in threads if thread.is_alive()]
             if not self._background_threads:
                 self._background_stop = None
+            stopped = not self._background_threads
+        self._mark_stopped_if_idle()
+        return stopped
 
     def request_shutdown(self) -> None:
         """Request the shared lifecycle stop without waiting in a signal handler."""
 
-        self._shutdown_requested.set()
+        with self._lock:
+            self._lifecycle_state = "DRAINING"
+            self._shutdown_requested.set()
         with self._lock:
             stop = self._background_stop
         if stop is not None:
@@ -703,15 +786,56 @@ class RecorderService:
         if estimate > self._wire_policy.gateway_max_request_bytes:
             raise GatewayRequestTooLarge("Hermes request exceeds the configured Gateway limit")
 
-    def _requery_combined_content(self, ingress: Mapping[str, Any], result: HermesResult) -> str | None:
+    def _requery_combined_content(
+        self,
+        ingress: Mapping[str, Any],
+        result: HermesResult,
+        *,
+        deadline_at: float | None = None,
+    ) -> str | None:
         turn = self.store.get_turn(ingress["turn_id"])
         if not turn.get("final_event_version") or turn.get("final_content"):
             return None
         history_method = getattr(self.hermes, "history_messages", None)
         if history_method is None:
             return None
+        request_sha256 = ingress.get("canonical_request_sha256")
+        if not isinstance(request_sha256, str) or not request_sha256:
+            try:
+                request_sha256 = self.store.submission_context(
+                    str(ingress["hermes_submission_id"])
+                ).canonical_request_sha256
+            except Exception:
+                # Compatibility fixtures may provide only an ingress mapping.
+                # The envelope hash is not the request fingerprint.
+                request_sha256 = result.request_sha256
+        if not isinstance(request_sha256, str) or not request_sha256:
+            return None
         try:
-            messages = history_method(session_key=ingress["gateway_session_key"], marker=ingress["marker"])
+            if deadline_at is None:
+                messages = history_method(
+                    session_key=ingress["gateway_session_key"],
+                    marker=ingress["marker"],
+                )
+            else:
+                remaining = deadline_at - time.monotonic()
+                if remaining <= 0:
+                    return None
+                try:
+                    messages = history_method(
+                        session_key=ingress["gateway_session_key"],
+                        marker=ingress["marker"],
+                        timeout_seconds=remaining,
+                    )
+                except TypeError as exc:
+                    # The production HTTP gateway accepts this keyword. Keep
+                    # older in-process fixtures usable when they do not.
+                    if "timeout_seconds" not in str(exc):
+                        raise
+                    messages = history_method(
+                        session_key=ingress["gateway_session_key"],
+                        marker=ingress["marker"],
+                    )
         except Exception:
             return None
         values: list[str] = []
@@ -729,7 +853,7 @@ class RecorderService:
                     "marker": ingress["marker"],
                     "session_key": ingress["gateway_session_key"],
                     "run_id": ingress.get("run_id") or ingress.get("hermes_run_id"),
-                    "request_sha256": ingress["payload_sha256"],
+                    "request_sha256": request_sha256,
                     "subject_kind": "turn",
                 },
             )
@@ -1270,6 +1394,7 @@ class RecorderService:
                 return receipt("hermes-history", submission_id, status="already_terminal", state=turn.get("state"))
             if self.hermes is None:
                 raise ProviderFailure("provider_unavailable", retryable=True)
+            context = self.store.submission_context(submission_id)
             result = self._valid_terminal_hermes_result(
                 self.hermes.history(session_key=ingress["gateway_session_key"], marker=ingress["marker"]),
                 expected={
@@ -1277,8 +1402,8 @@ class RecorderService:
                     "turn_id": ingress["turn_id"],
                     "marker": ingress["marker"],
                     "session_key": ingress["gateway_session_key"],
-                    "run_id": ingress.get("run_id") or ingress.get("hermes_run_id"),
-                    "request_sha256": ingress["payload_sha256"],
+                    "run_id": context.run_id or ingress.get("run_id") or ingress.get("hermes_run_id"),
+                    "request_sha256": context.canonical_request_sha256,
                     "subject_kind": "turn",
                 },
             )
@@ -1425,25 +1550,36 @@ class RecorderService:
         body: bytes,
         *,
         peer_addr: tuple[str, int] | None = None,
+        _admitted: bool = False,
     ) -> tuple[int, dict[str, str], Any]:
+        admitted = _admitted
         try:
+            if not admitted:
+                self._begin_operation()
+                admitted = True
             result = self._handle_http(method, target, headers, body, peer_addr=peer_addr)
             path = urlsplit(target).path.rstrip("/") or "/"
             response_status, response_headers, response_payload = result
             if method.upper() == "HEAD":
                 response_headers = dict(response_headers)
-                encoded = response_payload if isinstance(response_payload, bytes) else json.dumps(
-                    response_payload,
-                    ensure_ascii=False,
-                    sort_keys=True,
-                    separators=(",", ":"),
-                ).encode("utf-8")
+                if isinstance(response_payload, ManagedFileBody):
+                    response_payload.close()
+                    encoded = b""
+                    body_length = response_headers.get("Content-Length", "0")
+                else:
+                    encoded = response_payload if isinstance(response_payload, bytes) else json.dumps(
+                        response_payload,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                    body_length = str(len(encoded))
                 if not any(key.lower() == "content-type" for key in response_headers):
                     response_headers["Content-Type"] = (
-                        "application/octet-stream" if isinstance(response_payload, bytes) else "application/json; charset=utf-8"
+                        "application/octet-stream" if isinstance(response_payload, (bytes, ManagedFileBody)) else "application/json; charset=utf-8"
                     )
                 if not any(key.lower() == "content-length" for key in response_headers):
-                    response_headers["Content-Length"] = str(len(encoded))
+                    response_headers["Content-Length"] = body_length
                 response_payload = b""
                 result = response_status, response_headers, response_payload
             operation = match_operation(path, method)
@@ -1462,6 +1598,9 @@ class RecorderService:
             return 400, {"Content-Type": "application/json"}, {"error": {"code": "INVALID_REQUEST", "message": "request is invalid"}}
         except Exception:
             return 500, {"Content-Type": "application/json"}, {"error": {"code": "INTERNAL_ERROR", "message": "request failed"}}
+        finally:
+            if admitted and not _admitted:
+                self._end_operation()
 
     @staticmethod
     def _json_body(body: bytes, decoded: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -1695,6 +1834,8 @@ class RecorderService:
         peer_addr: tuple[str, int],
     ) -> None:
         """Authenticate and validate an HTTP request without reading its body."""
+        if self._shutdown_requested.is_set():
+            raise ServiceStoppingError("Recorder service is draining and is not accepting new work")
         if body_length > self._wire_policy.gateway_max_request_bytes:
             raise GatewayRequestTooLargeError("request exceeds the configured Gateway limit")
         self._prepare_http_request(
@@ -2100,7 +2241,15 @@ class RecorderService:
                 user_id, device_id = self._payload_owner(payload)
                 self.store.assert_active_device(user_id, device_id)
                 optional_string = lambda key: self._json_string(payload, key) if key in payload and payload[key] is not None else None
-                return 201, {}, self.store.create_project(user_id, project_number=self._json_string(payload, "project_number"), name=self._json_string(payload, "name"), aliases=payload.get("aliases"), description=payload.get("description", ""), idempotency_key=optional_string("idempotency_key"))
+                project_kwargs: dict[str, Any] = {
+                    "project_number": self._json_string(payload, "project_number"),
+                    "name": self._json_string(payload, "name"),
+                    "description": payload.get("description", ""),
+                    "idempotency_key": optional_string("idempotency_key"),
+                }
+                if "aliases" in payload:
+                    project_kwargs["aliases"] = payload["aliases"]
+                return 201, {}, self.store.create_project(user_id, **project_kwargs)
         if segments[:3] == ["v1", "projects", "search"] and method == "GET":
             user_id, _device_id = self._authenticated_owner(query, headers)
             return 200, {}, {"items": self.store.search_projects(user_id, query.get("q", ""), include_archived=query.get("include_archived") == "true")}

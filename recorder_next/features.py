@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import ctypes
 import datetime as dt
 import errno
 import hashlib
@@ -18,15 +19,16 @@ import os
 import re
 import stat
 import threading
+import time
 import uuid
 import zlib
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Mapping, Sequence
 from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 from .canonical import canonical_json, hermes_content_hash, normalize_hermes_text, sha256_bytes, sha256_json
 from .diagnostics_contract import MetadataValidationError, project_bundle, project_metadata
-from .errors import CleanupIncompleteError, ConflictError, LeaseConflict, NotFoundError, NotReadyError, RangeNotSatisfiable, RecorderError, SourceUnavailableError, UnauthorizedError, ValidationError
+from .errors import CleanupIncompleteError, ConflictError, LeaseConflict, NotFoundError, NotReadyError, QuotaExceeded, RangeNotSatisfiable, RecorderError, SourceUnavailableError, UnauthorizedError, ValidationError
 
 
 DIGEST_RE = re.compile(r"^[0-9a-fA-F]{64}$")
@@ -38,6 +40,126 @@ SAFE_ERROR_RE = re.compile(r"^[a-z][a-z0-9_.-]{0,63}$")
 WORKER_ACTIVE = {"PENDING", "CLAIMED", "RETRY_WAIT"}
 WORKER_TERMINAL = {"SUCCEEDED", "FAILED_PERMANENT"}
 EAVESDROP_STATES = {"CREATED", "ACTIVE", "PAUSED", "STOPPING", "STOPPED", "EXPIRED", "FAILED"}
+MAX_FILE_SLAB = 65_536
+MAX_UPDATE_ARTIFACT_BYTES = 250 * 1024 * 1024
+MAX_HISTORY_PAGE_BYTES = 16 * 1024 * 1024
+MAX_HISTORY_INSPECTED_ROWS = 2_048
+MAX_HISTORY_INSPECTED_PARTS = 2_048
+MANAGED_COPY_DEADLINE_SECONDS = 120.0
+CLEANUP_CLAIM_LEASE_SECONDS = 300
+CLEANUP_CLAIM_PREFIX = "cleanup-claim-v1:"
+
+
+class ManagedFileBody:
+    """An owned, hash-authenticated descriptor for a binary HTTP response."""
+
+    def __init__(
+        self,
+        descriptor: int,
+        *,
+        size: int,
+        sha256: str,
+        offset: int = 0,
+        length: int | None = None,
+        identity: tuple[int, int, int] | None = None,
+    ) -> None:
+        self._descriptor = descriptor
+        self._size = size
+        self._sha256 = sha256
+        self._offset = offset
+        self._end = offset + (size - offset if length is None else length)
+        self._identity = identity
+
+    @property
+    def content_length(self) -> int:
+        return self._end - self._offset
+
+    @property
+    def expected_size(self) -> int:
+        return self._size
+
+    @property
+    def expected_sha256(self) -> str:
+        return self._sha256
+
+    @property
+    def closed(self) -> bool:
+        return self._descriptor < 0
+
+    def iter_chunks(self, max_bytes: int = MAX_FILE_SLAB):
+        if not isinstance(max_bytes, int) or isinstance(max_bytes, bool) or not 1 <= max_bytes <= MAX_FILE_SLAB:
+            raise ValueError("managed body slab is invalid")
+        if self.closed:
+            raise ValueError("managed body is closed")
+        if self._identity is not None:
+            info = os.fstat(self._descriptor)
+            if (info.st_dev, info.st_ino, info.st_size) != self._identity:
+                raise ConflictError("managed artifact changed while being delivered")
+        position = self._offset
+        while position < self._end:
+            chunk = os.pread(self._descriptor, min(max_bytes, self._end - position), position)
+            if not chunk:
+                raise ConflictError("managed artifact ended before its immutable length")
+            position += len(chunk)
+            yield chunk
+        if position != self._end:
+            raise ConflictError("managed artifact length is inconsistent")
+
+    def close(self) -> None:
+        descriptor, self._descriptor = self._descriptor, -1
+        if descriptor >= 0:
+            os.close(descriptor)
+
+    def __enter__(self) -> "ManagedFileBody":
+        return self
+
+    def __exit__(self, _type: Any, _value: Any, _traceback: Any) -> None:
+        self.close()
+
+    def __deepcopy__(self, _memo: dict[int, Any]) -> "ManagedFileBody":
+        raise TypeError("managed file bodies cannot be copied")
+
+    def __getstate__(self) -> None:
+        raise TypeError("managed file bodies cannot be serialized")
+
+    def __eq__(self, other: Any) -> bool:
+        # Preserve the small direct-service compatibility surface used by
+        # existing callers while keeping the network path descriptor-backed.
+        if isinstance(other, (bytes, bytearray)):
+            try:
+                return b"".join(self.iter_chunks()) == bytes(other)
+            finally:
+                self.close()
+        return self is other
+
+    def __repr__(self) -> str:
+        return f"ManagedFileBody(content_length={self.content_length}, closed={self.closed})"
+
+
+class _ManagedStagedFile:
+    """Anonymous managed inode held between assembly and DB publication."""
+
+    def __init__(self, root: Path, path: Path, root_descriptor: int, directory_descriptor: int, descriptor: int) -> None:
+        self.root = root
+        self.path = path
+        self.root_descriptor = root_descriptor
+        self.directory_descriptor = directory_descriptor
+        self.descriptor = descriptor
+        self.linked = False
+        self.closed = False
+
+    def close(self) -> None:
+        if self.closed:
+            return
+        self.closed = True
+        os.close(self.descriptor)
+        if self.directory_descriptor != self.root_descriptor:
+            os.close(self.directory_descriptor)
+        os.close(self.root_descriptor)
+
+
+class _HistoryItemTooLarge(ValueError):
+    """A single history item cannot fit in the bounded serialized page."""
 
 
 class EavesdropRoutingAgent:
@@ -103,6 +225,14 @@ class FeatureGroups:
         parts = (namespace, user_id, device_id, alias)
         payload = b"".join(len(part.encode("utf-8")).to_bytes(8, "big") + part.encode("utf-8") for part in parts)
         return hashlib.sha256(payload).hexdigest()
+
+    @staticmethod
+    def _tombstone_owner_token(namespace: str, value: str) -> str:
+        if not isinstance(namespace, str) or not isinstance(value, str):
+            raise ValueError("diagnostic tombstone owner is invalid")
+        encoded = value.encode("utf-8")
+        payload = b"diagnostic-tombstone-owner-v1\0" + namespace.encode("ascii") + len(encoded).to_bytes(8, "big") + encoded
+        return f"{namespace[:1]}1:{hashlib.sha256(payload).hexdigest()}"
 
     @staticmethod
     def _digest(value: Any, field: str) -> str:
@@ -361,6 +491,318 @@ class FeatureGroups:
             if root_descriptor is not None:
                 os.close(root_descriptor)
 
+    @classmethod
+    def _open_managed_body(
+        cls,
+        root: Path,
+        path: Path,
+        *,
+        expected_size: int,
+        expected_sha256: str,
+        offset: int = 0,
+        length: int | None = None,
+    ) -> ManagedFileBody:
+        """Open, verify and transfer ownership of one managed artifact FD."""
+
+        if (
+            isinstance(expected_size, bool)
+            or not isinstance(expected_size, int)
+            or expected_size < 0
+            or not isinstance(offset, int)
+            or isinstance(offset, bool)
+            or offset < 0
+            or offset > expected_size
+            or (length is not None and (not isinstance(length, int) or isinstance(length, bool) or length < 0 or offset + length > expected_size))
+        ):
+            raise ValidationError("managed artifact body bounds are invalid")
+        if not DIGEST_RE.fullmatch(expected_sha256):
+            raise ValidationError("managed artifact hash is invalid")
+        cls._ensure_no_symlink_path(root, path, allow_missing_leaf=False)
+        root = cls._lexical_absolute(root)
+        path = cls._lexical_absolute(path, reject_parent=True)
+        try:
+            relative = path.relative_to(root)
+        except ValueError as exc:
+            raise UnauthorizedError("managed path escapes the storage root") from exc
+        if not relative.parts:
+            raise UnauthorizedError("managed path must name a file")
+        directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        file_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        root_descriptor: int | None = None
+        directory_descriptor: int | None = None
+        descriptor: int | None = None
+        try:
+            root_descriptor = os.open(root, directory_flags)
+            directory_descriptor = root_descriptor
+            for component in relative.parts[:-1]:
+                next_descriptor = os.open(component, directory_flags, dir_fd=directory_descriptor)
+                if directory_descriptor != root_descriptor:
+                    os.close(directory_descriptor)
+                directory_descriptor = next_descriptor
+            descriptor = os.open(relative.parts[-1], file_flags, dir_fd=directory_descriptor)
+            info = os.fstat(descriptor)
+            identity = (info.st_dev, info.st_ino, info.st_size)
+            if not stat.S_ISREG(info.st_mode) or info.st_size != expected_size:
+                raise ConflictError("managed artifact size does not match its immutable receipt")
+            digest = hashlib.sha256()
+            total = 0
+            while total < expected_size:
+                chunk = os.read(descriptor, min(MAX_FILE_SLAB, expected_size - total))
+                if not chunk:
+                    raise ConflictError("managed artifact ended before its immutable length")
+                total += len(chunk)
+                digest.update(chunk)
+            if os.read(descriptor, 1):
+                raise ConflictError("managed artifact grew beyond its immutable receipt")
+            after = os.fstat(descriptor)
+            if (after.st_dev, after.st_ino, after.st_size) != identity or digest.hexdigest() != expected_sha256.lower():
+                raise ConflictError("managed artifact changed while being opened")
+            os.lseek(descriptor, offset, os.SEEK_SET)
+            body = ManagedFileBody(
+                descriptor,
+                size=expected_size,
+                sha256=expected_sha256.lower(),
+                offset=offset,
+                length=length,
+                identity=identity,
+            )
+            descriptor = None
+            return body
+        except OSError as exc:
+            raise NotReadyError("managed artifact is unavailable") from exc
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+            if directory_descriptor is not None and directory_descriptor != root_descriptor:
+                os.close(directory_descriptor)
+            if root_descriptor is not None:
+                os.close(root_descriptor)
+
+    @classmethod
+    def _open_source_descriptor(cls, path: Path) -> tuple[int, tuple[int, int, int]]:
+        path = cls._lexical_absolute(path, reject_parent=True)
+        directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        file_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        root_descriptor: int | None = None
+        directory_descriptor: int | None = None
+        descriptor: int | None = None
+        try:
+            root_descriptor = os.open(Path(path.anchor or "/"), directory_flags)
+            directory_descriptor = root_descriptor
+            for component in path.parts[1:-1]:
+                next_descriptor = os.open(component, directory_flags, dir_fd=directory_descriptor)
+                if directory_descriptor != root_descriptor:
+                    os.close(directory_descriptor)
+                directory_descriptor = next_descriptor
+            descriptor = os.open(path.parts[-1], file_flags, dir_fd=directory_descriptor)
+            info = os.fstat(descriptor)
+            if not stat.S_ISREG(info.st_mode):
+                raise UnauthorizedError("update artifact source must be a regular file")
+            if not 1 <= info.st_size <= MAX_UPDATE_ARTIFACT_BYTES:
+                if info.st_size > MAX_UPDATE_ARTIFACT_BYTES:
+                    raise QuotaExceeded("update artifact exceeds the configured size limit")
+                raise ValidationError("update artifact must be non-empty")
+            return descriptor, (info.st_dev, info.st_ino, info.st_size)
+        except OSError as exc:
+            if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+                raise UnauthorizedError("update artifact source contains a symlink") from exc
+            raise NotReadyError("update artifact source is unavailable") from exc
+        finally:
+            if directory_descriptor is not None and directory_descriptor != root_descriptor:
+                os.close(directory_descriptor)
+            if root_descriptor is not None:
+                os.close(root_descriptor)
+
+    @staticmethod
+    def _check_copy_deadline(deadline_at: float | None) -> None:
+        if deadline_at is not None and time.monotonic() >= deadline_at:
+            raise TimeoutError("managed copy deadline exceeded")
+
+    @staticmethod
+    def _hash_source_descriptor(
+        descriptor: int,
+        identity: tuple[int, int, int],
+        *,
+        deadline_at: float | None = None,
+    ) -> tuple[int, str]:
+        FeatureGroups._check_copy_deadline(deadline_at)
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        digest = hashlib.sha256()
+        total = 0
+        while True:
+            FeatureGroups._check_copy_deadline(deadline_at)
+            chunk = os.read(descriptor, MAX_FILE_SLAB)
+            if not chunk:
+                break
+            total += len(chunk)
+            digest.update(chunk)
+            if total > MAX_UPDATE_ARTIFACT_BYTES:
+                raise QuotaExceeded("update artifact exceeds the configured size limit")
+        FeatureGroups._check_copy_deadline(deadline_at)
+        after = os.fstat(descriptor)
+        if (after.st_dev, after.st_ino, after.st_size) != identity or total != identity[2]:
+            raise ConflictError("update artifact source changed while being read")
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        return total, digest.hexdigest()
+
+    @staticmethod
+    def _source_chunks(
+        descriptor: int,
+        size: int,
+        *,
+        expected_sha256: str | None = None,
+        expected_identity: tuple[int, int, int] | None = None,
+        deadline_at: float | None = None,
+    ):
+        FeatureGroups._check_copy_deadline(deadline_at)
+        if not 1 <= size <= MAX_UPDATE_ARTIFACT_BYTES:
+            raise ValidationError("update artifact size is invalid")
+        if expected_identity is not None:
+            before = os.fstat(descriptor)
+            if (before.st_dev, before.st_ino, before.st_size) != expected_identity:
+                raise ConflictError("update artifact source changed before being copied")
+        digest = hashlib.sha256()
+        remaining = size
+        while remaining:
+            FeatureGroups._check_copy_deadline(deadline_at)
+            chunk = os.read(descriptor, min(MAX_FILE_SLAB, remaining))
+            if not chunk:
+                raise ConflictError("update artifact source shrank while being copied")
+            remaining -= len(chunk)
+            digest.update(chunk)
+            yield chunk
+        FeatureGroups._check_copy_deadline(deadline_at)
+        if os.read(descriptor, 1):
+            raise ConflictError("update artifact source grew while being copied")
+        after = os.fstat(descriptor)
+        if expected_identity is not None and (after.st_dev, after.st_ino, after.st_size) != expected_identity:
+            raise ConflictError("update artifact source changed while being copied")
+        if expected_sha256 is not None and digest.hexdigest() != expected_sha256.lower():
+            raise ConflictError("update artifact source hash changed while being copied")
+
+    @staticmethod
+    def _bytes_chunks(payload: bytes, *, deadline_at: float | None = None):
+        view = memoryview(payload)
+        for offset in range(0, len(view), MAX_FILE_SLAB):
+            FeatureGroups._check_copy_deadline(deadline_at)
+            yield view[offset : offset + MAX_FILE_SLAB]
+
+    @classmethod
+    def _publish_stream(
+        cls,
+        root: Path,
+        path: Path,
+        chunks: Any,
+        *,
+        deadline_at: float | None = None,
+    ) -> None:
+        """Publish bounded chunks through an anonymous no-clobber inode."""
+
+        staged = cls._stage_stream(root, path, chunks, deadline_at=deadline_at)
+        try:
+            cls._link_staged(staged, deadline_at=deadline_at)
+        finally:
+            staged.close()
+
+    @classmethod
+    def _stage_stream(
+        cls,
+        root: Path,
+        path: Path,
+        chunks: Any,
+        *,
+        deadline_at: float | None = None,
+    ) -> _ManagedStagedFile:
+        """Assemble an anonymous inode without publishing a visible leaf."""
+
+        cls._check_copy_deadline(deadline_at)
+        cls._ensure_no_symlink_path(root, path, allow_missing_leaf=True)
+        root = cls._lexical_absolute(root)
+        path = cls._lexical_absolute(path, reject_parent=True)
+        relative = path.relative_to(root)
+        if not relative.parts:
+            raise UnauthorizedError("managed storage root cannot be written")
+        cls._mkdir_managed_path(root, path.parent)
+        directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        root_descriptor: int | None = None
+        directory_descriptor: int | None = None
+        descriptor: int | None = None
+        try:
+            root_descriptor = os.open(root, directory_flags)
+            directory_descriptor = root_descriptor
+            for component in relative.parts[:-1]:
+                next_descriptor = os.open(component, directory_flags, dir_fd=directory_descriptor)
+                if directory_descriptor != root_descriptor:
+                    os.close(directory_descriptor)
+                directory_descriptor = next_descriptor
+            tmp_flag = getattr(os, "O_TMPFILE", 0)
+            if not tmp_flag:
+                raise NotReadyError("anonymous managed staging is unavailable")
+            descriptor = os.open(".", tmp_flag | os.O_RDWR | getattr(os, "O_CLOEXEC", 0), 0o600, dir_fd=directory_descriptor)
+            info = os.fstat(descriptor)
+            if not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o600:
+                raise NotReadyError("anonymous managed staging has unsafe custody")
+            for chunk in chunks:
+                cls._check_copy_deadline(deadline_at)
+                view = memoryview(chunk)
+                if len(view) > MAX_FILE_SLAB:
+                    raise ValueError("managed publication slab is too large")
+                while view:
+                    cls._check_copy_deadline(deadline_at)
+                    written = os.write(descriptor, view)
+                    if written <= 0:
+                        raise OSError(errno.EIO, "short managed publication write")
+                    view = view[written:]
+            cls._check_copy_deadline(deadline_at)
+            os.fsync(descriptor)
+            cls._check_copy_deadline(deadline_at)
+            assert directory_descriptor is not None
+            assert root_descriptor is not None
+            assert descriptor is not None
+            staged = _ManagedStagedFile(root, path, root_descriptor, directory_descriptor, descriptor)
+            root_descriptor = None
+            directory_descriptor = None
+            descriptor = None
+            return staged
+        except OSError as exc:
+            if isinstance(exc, (ConflictError, NotReadyError)):
+                raise
+            raise NotReadyError("managed artifact staging failed") from exc
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+            if directory_descriptor is not None and directory_descriptor != root_descriptor:
+                os.close(directory_descriptor)
+            if root_descriptor is not None:
+                os.close(root_descriptor)
+
+    @classmethod
+    def _link_staged(cls, staged: _ManagedStagedFile, *, deadline_at: float | None = None) -> None:
+        """Link a staged inode into its final managed name exactly once."""
+
+        if staged.closed:
+            raise ConflictError("managed staged file is closed")
+        if staged.linked:
+            raise ConflictError("managed staged file was already published")
+        cls._check_copy_deadline(deadline_at)
+        cls._ensure_no_symlink_path(staged.root, staged.path, allow_missing_leaf=True)
+        target_name = staged.path.name.encode()
+        libc = ctypes.CDLL(None, use_errno=True)
+        linkat = libc.linkat
+        linkat.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_int]
+        linkat.restype = ctypes.c_int
+        if linkat(-100, f"/proc/self/fd/{staged.descriptor}".encode(), staged.directory_descriptor, target_name, 0x400) != 0:
+            error = ctypes.get_errno()
+            if error == errno.EEXIST:
+                raise ConflictError("managed publication target appeared during publication")
+            raise NotReadyError("anonymous managed publication is unavailable") from OSError(error, os.strerror(error))
+        staged.linked = True
+        cls._check_copy_deadline(deadline_at)
+        try:
+            os.fsync(staged.directory_descriptor)
+        except OSError as exc:
+            raise NotReadyError("managed artifact directory publication failed") from exc
+
     @staticmethod
     def _read_source_bytes(path: Path) -> bytes:
         path = FeatureGroups._lexical_absolute(path, reject_parent=True)
@@ -492,6 +934,8 @@ class FeatureGroups:
             except (TypeError, UnauthorizedError, ValueError):
                 return None
 
+        receipt_entity_type = receipt["entity_type"] if "entity_type" in receipt.keys() else None
+        receipt_entity_id = receipt["entity_id"] if "entity_id" in receipt.keys() else None
         with self.store._read() as conn:
             for row in conn.execute("SELECT storage_path, sha256, byte_length FROM turn_chunks").fetchall():
                 if canonical_reference(row["storage_path"]) == target:
@@ -503,12 +947,18 @@ class FeatureGroups:
                 candidate = canonical_reference(row["artifact_relpath"], relative=True)
                 if candidate is not None and candidate == target:
                     references.append((str(candidate), str(row["artifact_sha256"]), "update_manifest", row["size"]))
-            for row in conn.execute("SELECT source_path, whole_stream_sha256, total_bytes FROM turn_parts WHERE source_path IS NOT NULL").fetchall():
+            for row in conn.execute("SELECT turn_id, part_id, status, source_path, whole_stream_sha256, total_bytes FROM turn_parts WHERE source_path IS NOT NULL").fetchall():
+                if (
+                    receipt_entity_type == "turn_part"
+                    and receipt_entity_id == f"{row['turn_id']}:{row['part_id']}"
+                    and row["status"] != "COMPLETE"
+                ):
+                    continue
                 if canonical_reference(row["source_path"]) == target:
                     references.append((str(row["source_path"]), str(row["whole_stream_sha256"]), "turn_part", row["total_bytes"]))
             tts_rows = conn.execute("SELECT artifact_id, storage_path, payload_sha256, byte_size FROM tts_artifacts WHERE storage_path IS NOT NULL").fetchall()
             for row in tts_rows:
-                if receipt.get("entity_type") == "tts_artifact" and receipt.get("entity_id") == row["artifact_id"]:
+                if receipt_entity_type == "tts_artifact" and receipt_entity_id == row["artifact_id"]:
                     continue
                 if canonical_reference(row["storage_path"]) == target:
                     references.append((str(row["storage_path"]), str(row["payload_sha256"]), "tts_artifact", row["byte_size"]))
@@ -526,12 +976,50 @@ class FeatureGroups:
         detail = str(exc).replace("\n", " ")[:160]
         return f"{type(exc).__name__}: {detail}" if detail else type(exc).__name__
 
-    def _mark_cleanup_receipt_attempt(self, receipt_id: str, *, status: str, error: str, now: str) -> None:
+    def _claim_cleanup_receipt(self, receipt_id: str, *, now: str) -> str | None:
+        """Atomically lease a receipt before inspecting or unlinking a path."""
+
+        claim_token = uuid.uuid4().hex
+        claim_marker = f"{CLEANUP_CLAIM_PREFIX}{claim_token}|"
+        claim_expires = self._plus_seconds(now, CLEANUP_CLAIM_LEASE_SECONDS)
+        marker = f"{claim_marker}{claim_expires}"
         with self.store._tx() as conn:
-            conn.execute(
-                "UPDATE storage_cleanup_receipts SET status=?, attempt_count=attempt_count+1, last_error=?, updated_at=?, completed_at=NULL WHERE receipt_id=? AND status IN ('PENDING', 'BLOCKED')",
-                (status, error, now, receipt_id),
+            row = conn.execute(
+                "SELECT status, last_error FROM storage_cleanup_receipts WHERE receipt_id=?",
+                (receipt_id,),
+            ).fetchone()
+            if row is None or row["status"] not in {"PENDING", "BLOCKED"}:
+                return None
+            current_error = row["last_error"] or ""
+            if row["status"] == "BLOCKED" and current_error.startswith(CLEANUP_CLAIM_PREFIX):
+                parts = current_error.split("|", 2)
+                if len(parts) == 2 and parts[1] > now:
+                    return None
+            updated = conn.execute(
+                "UPDATE storage_cleanup_receipts SET status='BLOCKED', last_error=?, updated_at=?, completed_at=NULL WHERE receipt_id=? AND status IN ('PENDING', 'BLOCKED')",
+                (marker, now, receipt_id),
             )
+            if updated.rowcount != 1:
+                return None
+        return claim_token
+
+    def _finish_cleanup_receipt_claim(self, receipt_id: str, claim_token: str, *, now: str) -> bool:
+        marker = f"{CLEANUP_CLAIM_PREFIX}{claim_token}|%"
+        with self.store._tx() as conn:
+            updated = conn.execute(
+                "UPDATE storage_cleanup_receipts SET status='COMPLETE', last_error=NULL, updated_at=?, completed_at=? WHERE receipt_id=? AND status='BLOCKED' AND last_error LIKE ?",
+                (now, now, receipt_id, marker),
+            )
+        return updated.rowcount == 1
+
+    def _release_cleanup_receipt_claim(self, receipt_id: str, claim_token: str, *, status: str, error: str, now: str) -> bool:
+        marker = f"{CLEANUP_CLAIM_PREFIX}{claim_token}|%"
+        with self.store._tx() as conn:
+            updated = conn.execute(
+                "UPDATE storage_cleanup_receipts SET status=?, attempt_count=attempt_count+1, last_error=?, updated_at=?, completed_at=NULL WHERE receipt_id=? AND status='BLOCKED' AND last_error LIKE ?",
+                (status, error, now, receipt_id, marker),
+            )
+        return updated.rowcount == 1
 
     def recover_cleanup_receipts(
         self,
@@ -553,28 +1041,31 @@ class FeatureGroups:
                 ).fetchall()
         attempted = completed = blocked = 0
         for row in rows:
+            claim_token = self._claim_cleanup_receipt(row["receipt_id"], now=timestamp)
+            if claim_token is None:
+                continue
             attempted += 1
             reference_state = self._cleanup_reference_state(row)
             if reference_state == "owned":
-                self.store._complete_cleanup_receipt(row["receipt_id"], now=timestamp)
-                completed += 1
+                if self._finish_cleanup_receipt_claim(row["receipt_id"], claim_token, now=timestamp):
+                    completed += 1
                 continue
             if reference_state == "conflict":
-                self._mark_cleanup_receipt_attempt(row["receipt_id"], status="BLOCKED", error="cleanup target is referenced by a different durable artifact", now=timestamp)
-                blocked += 1
+                if self._release_cleanup_receipt_claim(row["receipt_id"], claim_token, status="BLOCKED", error="cleanup target is referenced by a different durable artifact", now=timestamp):
+                    blocked += 1
                 continue
             path = Path(row["storage_path"])
             state, detail = self._managed_file_state(self.store.storage_root, path)
             if state == "missing":
-                self.store._complete_cleanup_receipt(row["receipt_id"], now=timestamp)
-                completed += 1
+                if self._finish_cleanup_receipt_claim(row["receipt_id"], claim_token, now=timestamp):
+                    completed += 1
                 continue
             if state == "blocked":
-                self._mark_cleanup_receipt_attempt(row["receipt_id"], status="BLOCKED", error=detail or "cleanup target is unsafe", now=timestamp)
-                blocked += 1
+                if self._release_cleanup_receipt_claim(row["receipt_id"], claim_token, status="BLOCKED", error=detail or "cleanup target is unsafe", now=timestamp):
+                    blocked += 1
                 continue
             if state == "error":
-                self._mark_cleanup_receipt_attempt(row["receipt_id"], status="PENDING", error=detail or "cleanup target cannot be inspected", now=timestamp)
+                self._release_cleanup_receipt_claim(row["receipt_id"], claim_token, status="PENDING", error=detail or "cleanup target cannot be inspected", now=timestamp)
                 continue
             try:
                 self._read_managed_bytes(
@@ -584,22 +1075,22 @@ class FeatureGroups:
                     expected_sha256=str(row["expected_sha256"]),
                 )
             except ConflictError as exc:
-                self._mark_cleanup_receipt_attempt(row["receipt_id"], status="BLOCKED", error=self._cleanup_error(exc), now=timestamp)
-                blocked += 1
+                if self._release_cleanup_receipt_claim(row["receipt_id"], claim_token, status="BLOCKED", error=self._cleanup_error(exc), now=timestamp):
+                    blocked += 1
                 continue
             except (OSError, RecorderError) as exc:
-                self._mark_cleanup_receipt_attempt(row["receipt_id"], status="PENDING", error=self._cleanup_error(exc), now=timestamp)
+                self._release_cleanup_receipt_claim(row["receipt_id"], claim_token, status="PENDING", error=self._cleanup_error(exc), now=timestamp)
                 continue
             try:
                 self._unlink_managed_file(self.store.storage_root, path)
             except FileNotFoundError:
-                self.store._complete_cleanup_receipt(row["receipt_id"], now=timestamp)
-                completed += 1
+                if self._finish_cleanup_receipt_claim(row["receipt_id"], claim_token, now=timestamp):
+                    completed += 1
             except (OSError, RecorderError) as exc:
-                self._mark_cleanup_receipt_attempt(row["receipt_id"], status="PENDING", error=self._cleanup_error(exc), now=timestamp)
+                self._release_cleanup_receipt_claim(row["receipt_id"], claim_token, status="PENDING", error=self._cleanup_error(exc), now=timestamp)
             else:
-                self.store._complete_cleanup_receipt(row["receipt_id"], now=timestamp)
-                completed += 1
+                if self._finish_cleanup_receipt_claim(row["receipt_id"], claim_token, now=timestamp):
+                    completed += 1
         with self.store._read() as conn:
             if receipt_ids is None:
                 pending_row = conn.execute("SELECT COUNT(*) AS count FROM storage_cleanup_receipts WHERE status='PENDING'").fetchone()
@@ -1303,20 +1794,41 @@ class FeatureGroups:
             raise ValidationError("provide exactly one artifact_path or artifact_bytes")
         if artifact_bytes is not None and not isinstance(artifact_bytes, bytes):
             raise ValidationError("artifact_bytes must be bytes")
+        copy_deadline = time.monotonic() + MANAGED_COPY_DEADLINE_SECONDS
+        source_descriptor: int | None = None
         if artifact_path is not None:
             source = Path(artifact_path)
+            source_descriptor, source_identity = self._open_source_descriptor(source)
             try:
-                info = os.lstat(source)
-            except OSError as exc:
-                raise NotReadyError("update artifact source is unavailable") from exc
-            if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
-                raise UnauthorizedError("update artifact source must be a regular non-symlink file")
-            content = self._read_source_bytes(source)
+                size, digest = self._hash_source_descriptor(source_descriptor, source_identity, deadline_at=copy_deadline)
+            finally:
+                os.close(source_descriptor)
+                source_descriptor = None
+
+            def source_chunks():
+                descriptor, identity = self._open_source_descriptor(source)
+                try:
+                    if identity != source_identity:
+                        raise ConflictError("update artifact source changed before being copied")
+                    yield from self._source_chunks(
+                        descriptor,
+                        size,
+                        expected_sha256=digest,
+                        expected_identity=identity,
+                        deadline_at=copy_deadline,
+                    )
+                finally:
+                    os.close(descriptor)
         else:
-            content = artifact_bytes or b""
-        if not content:
+            assert artifact_bytes is not None
+            size = len(artifact_bytes)
+            if size > MAX_UPDATE_ARTIFACT_BYTES:
+                raise QuotaExceeded("update artifact exceeds the configured size limit")
+            self._check_copy_deadline(copy_deadline)
+            digest = sha256_bytes(artifact_bytes)
+            source_chunks = lambda: self._bytes_chunks(artifact_bytes, deadline_at=copy_deadline)
+        if size < 1:
             raise ValidationError("update artifact must be non-empty")
-        digest = sha256_bytes(content)
         timestamp = self._time(now, self.store)
         requested_etag = etag or f'"{digest}"'
         if not isinstance(requested_etag, str) or not requested_etag or "\r" in requested_etag or "\n" in requested_etag or len(requested_etag) > 256:
@@ -1331,7 +1843,7 @@ class FeatureGroups:
             "artifact_name": artifact_name,
             "sha256": digest,
             "signer_digest": signer_digest,
-            "size": len(content),
+            "size": size,
             "changelog": changelog,
             "min_server_version": min_server_version,
             "authorization_policy": authorization_policy,
@@ -1344,18 +1856,31 @@ class FeatureGroups:
         target = self.store.storage_root / relpath
         self._mkdir_managed_path(self.store.storage_root, target.parent)
         self._ensure_no_symlink_path(self.store.storage_root, target)
-        target_existed = target.exists()
+        target_existed = False
+        try:
+            target_info = os.lstat(target)
+            target_existed = True
+        except FileNotFoundError:
+            target_info = None
+        except OSError as exc:
+            raise NotReadyError("update artifact target is unavailable") from exc
         if target_existed:
-            existing_bytes = self._read_managed_bytes(self.store.storage_root, target)
-            if sha256_bytes(existing_bytes) != digest:
-                raise ConflictError("update artifact path already contains different bytes")
+            if target_info is None or stat.S_ISLNK(target_info.st_mode) or not stat.S_ISREG(target_info.st_mode):
+                raise UnauthorizedError("update artifact target must be a regular non-symlink file")
+            existing_body = self._open_managed_body(
+                self.store.storage_root,
+                target,
+                expected_size=size,
+                expected_sha256=digest,
+            )
+            existing_body.close()
         receipt_id = None
         if not target_existed:
             receipt_id = self.store._prepare_cleanup_receipt(
                 operation="update_manifest_rollback",
                 path=target,
                 expected_sha256=digest,
-                expected_size=len(content),
+                expected_size=size,
                 entity_type="update_manifest",
                 entity_id=f"{channel}:{generation}",
                 now=timestamp,
@@ -1366,9 +1891,13 @@ class FeatureGroups:
                 if existing is not None:
                     if existing["manifest_sha256"] != manifest_sha or existing["artifact_sha256"] != digest:
                         raise ConflictError("update generation is immutable")
-                    existing_bytes = self._read_managed_bytes(self.store.storage_root, target)
-                    if sha256_bytes(existing_bytes) != existing["artifact_sha256"]:
-                        raise ConflictError("immutable update artifact does not match its manifest")
+                    existing_body = self._open_managed_body(
+                        self.store.storage_root,
+                        target,
+                        expected_size=int(existing["size"]),
+                        expected_sha256=existing["artifact_sha256"],
+                    )
+                    existing_body.close()
                     current = conn.execute("SELECT current_generation FROM update_channels WHERE channel=?", (channel,)).fetchone()
                     return self._update_payload(existing, current_generation=int(current["current_generation"]) if current else None)
                 current = conn.execute("SELECT * FROM update_channels WHERE channel=?", (channel,)).fetchone()
@@ -1382,10 +1911,15 @@ class FeatureGroups:
                 if prior_version is not None:
                     raise ConflictError("update version_code is already used in this channel")
                 if not target_existed:
-                    self.store._safe_write(target, content)
+                    self._publish_stream(
+                        self.store.storage_root,
+                        target,
+                        source_chunks(),
+                        deadline_at=copy_deadline,
+                    )
                 conn.execute(
                     "INSERT INTO update_manifests(channel, generation, platform, version, version_code, artifact_name, artifact_relpath, artifact_sha256, signer_digest, size, changelog, min_server_version, authorization_policy, etag, manifest_json, manifest_sha256, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (channel, generation, platform, version, version_code, artifact_name, relpath.as_posix(), digest, signer_digest, len(content), changelog, min_server_version, authorization_policy, requested_etag, json.dumps(manifest, ensure_ascii=False, sort_keys=True, separators=(",", ":")), manifest_sha, timestamp),
+                    (channel, generation, platform, version, version_code, artifact_name, relpath.as_posix(), digest, signer_digest, size, changelog, min_server_version, authorization_policy, requested_etag, json.dumps(manifest, ensure_ascii=False, sort_keys=True, separators=(",", ":")), manifest_sha, timestamp),
                 )
                 conn.execute(
                     "INSERT INTO update_channels(channel, current_generation, current_manifest_sha256, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT(channel) DO UPDATE SET current_generation=excluded.current_generation, current_manifest_sha256=excluded.current_manifest_sha256, updated_at=excluded.updated_at",
@@ -1400,6 +1934,9 @@ class FeatureGroups:
                 if cleanup["pending"] or cleanup["blocked"]:
                     raise CleanupIncompleteError("update artifact rollback cleanup is incomplete") from exc
             raise
+        finally:
+            if source_descriptor is not None:
+                os.close(source_descriptor)
 
     def get_update_manifest(self, channel: str, generation: int | None = None) -> dict[str, Any]:
         channel = self._channel(channel)
@@ -1463,6 +2000,8 @@ class FeatureGroups:
                 raise NotFoundError("update manifest not found")
             path = self.store.storage_root / row["artifact_relpath"]
         size = int(row["size"])
+        if not 1 <= size <= MAX_UPDATE_ARTIFACT_BYTES:
+            raise ConflictError("stored update artifact size is outside the supported limit")
         headers = {
             "Content-Type": "application/vnd.android.package-archive",
             "Content-Length": str(size),
@@ -1482,11 +2021,23 @@ class FeatureGroups:
                 headers["Content-Length"] = "0"
                 return {"status": 416, "headers": headers, "body": b"", "manifest": manifest}
         if selected_range is None:
-            content = self._read_managed_bytes(self.store.storage_root, path, expected_size=size, expected_sha256=row["artifact_sha256"])
-            return {"status": 200, "headers": headers, "body": content, "manifest": manifest}
+            body = self._open_managed_body(
+                self.store.storage_root,
+                path,
+                expected_size=size,
+                expected_sha256=row["artifact_sha256"],
+            )
+            return {"status": 200, "headers": headers, "body": body, "manifest": manifest}
         start, end = selected_range
-        body = self._read_managed_range(self.store.storage_root, path, expected_size=size, start=start, end=end)
-        headers["Content-Length"] = str(len(body))
+        body = self._open_managed_body(
+            self.store.storage_root,
+            path,
+            expected_size=size,
+            expected_sha256=row["artifact_sha256"],
+            offset=start,
+            length=end - start + 1,
+        )
+        headers["Content-Length"] = str(body.content_length)
         headers["Content-Range"] = f"bytes {start}-{end}/{size}"
         return {"status": 206, "headers": headers, "body": body, "manifest": manifest}
 
@@ -1520,13 +2071,49 @@ class FeatureGroups:
             raise ValidationError("cursor is invalid")
         return payload
 
-    def _history_item(self, conn: Any, row: Any) -> dict[str, Any]:
+    def _history_text(self, part: Any, *, max_bytes: int) -> str:
+        byte_length = part["total_bytes"] if part["total_bytes"] is not None else part["declared_bytes"]
+        digest = part["whole_stream_sha256"]
+        if not isinstance(byte_length, int) or isinstance(byte_length, bool) or byte_length < 0 or not isinstance(digest, str) or not DIGEST_RE.fullmatch(digest):
+            raise NotReadyError("history text source metadata is unavailable")
+        if byte_length > max_bytes:
+            raise _HistoryItemTooLarge("history text exceeds the page budget")
+        body = self._open_managed_body(
+            self.store.storage_root,
+            Path(part["source_path"]),
+            expected_size=byte_length,
+            expected_sha256=digest,
+        )
+        try:
+            raw = bytearray()
+            for chunk in body.iter_chunks(min(MAX_FILE_SLAB, max(1, max_bytes - len(raw) + 1))):
+                if len(raw) + len(chunk) > max_bytes:
+                    raise _HistoryItemTooLarge("history text exceeds the page budget")
+                raw.extend(chunk)
+            return bytes(raw).decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise NotReadyError("history text source is not valid UTF-8") from exc
+        finally:
+            body.close()
+
+    def _history_item(
+        self,
+        conn: Any,
+        row: Any,
+        *,
+        text_budget: int = MAX_HISTORY_PAGE_BYTES,
+        part_rows: Sequence[Any] | None = None,
+        read_text: bool = True,
+    ) -> dict[str, Any]:
         parts: list[dict[str, Any]] = []
         text_values: list[str] = []
-        for part in conn.execute(
-            "SELECT part_id, kind, mime, declared_bytes, total_bytes, whole_stream_sha256, status, source_path FROM turn_parts WHERE turn_id=? ORDER BY part_id",
-            (row["turn_id"],),
-        ).fetchall():
+        if part_rows is None:
+            part_rows = conn.execute(
+                "SELECT part_id, kind, mime, declared_bytes, total_bytes, whole_stream_sha256, status, source_path FROM turn_parts WHERE turn_id=? ORDER BY part_id",
+                (row["turn_id"],),
+            ).fetchall()
+        remaining_text_budget = max(0, text_budget)
+        for part in part_rows:
             item = {
                 "part_id": part["part_id"],
                 "kind": part["kind"],
@@ -1536,17 +2123,23 @@ class FeatureGroups:
                 "status": part["status"],
             }
             parts.append(item)
-            if part["kind"] == "text" and part["status"] == "COMPLETE" and part["source_path"]:
+            if read_text and part["kind"] == "text" and part["status"] == "COMPLETE" and part["source_path"]:
                 try:
-                    raw = self._read_managed_bytes(self.store.storage_root, Path(part["source_path"]), expected_size=item["byte_length"], expected_sha256=item["sha256"])
-                    text_values.append(raw.decode("utf-8"))
-                except (UnicodeDecodeError, ConflictError, NotReadyError, UnauthorizedError):
+                    text_value = self._history_text(part, max_bytes=remaining_text_budget)
+                    text_values.append(text_value)
+                    remaining_text_budget -= len(text_value.encode("utf-8"))
+                except (UnicodeDecodeError, ConflictError, NotReadyError, UnauthorizedError, _HistoryItemTooLarge) as exc:
+                    if isinstance(exc, _HistoryItemTooLarge):
+                        raise
                     pass
         if row["transcript"]:
             input_text = row["transcript"]
             input_type = "audio"
         elif text_values:
             input_text = "\n".join(text_values)
+            input_type = "text"
+        elif any(part["kind"] == "text" for part in parts):
+            input_text = ""
             input_type = "text"
         elif any(part["kind"] == "audio" for part in parts):
             input_text = ""
@@ -1557,6 +2150,8 @@ class FeatureGroups:
         else:
             input_text = ""
             input_type = "unknown"
+        if len(input_text.encode("utf-8")) > text_budget:
+            raise _HistoryItemTooLarge("history transcript exceeds the page budget")
         assistant = None
         if row["final_content"] is not None or row["final_outcome"] is not None:
             assistant = {
@@ -1566,6 +2161,8 @@ class FeatureGroups:
                 "state": row["state"],
                 "event_version": row["final_event_version"],
             }
+            if assistant["content"] is not None and len(assistant["content"].encode("utf-8")) > text_budget:
+                raise _HistoryItemTooLarge("history assistant content exceeds the page budget")
         user_message = {"role": "user", "content": input_text, "input_type": input_type, "attachments": parts}
         return {
             "turn_id": row["turn_id"],
@@ -1612,8 +2209,20 @@ class FeatureGroups:
         with self.store._read() as conn:
             scan_after = after
             items: list[dict[str, Any]] = []
+            has_more = False
             exhausted = False
-            while len(items) <= limit and not exhausted:
+            inspected_rows = 0
+            inspected_parts = 0
+            last_scanned_key: tuple[int, str] | None = after
+            last_returned_key: tuple[int, str] | None = None
+            stop_kind: str | None = None
+            while not exhausted and not has_more:
+                remaining_rows = MAX_HISTORY_INSPECTED_ROWS - inspected_rows
+                if remaining_rows <= 0:
+                    has_more = True
+                    stop_kind = "scan_rows"
+                    break
+                batch_size = max(1, min(201, limit + 1, remaining_rows))
                 clauses = ["user_id=?", "accepted_seq IS NOT NULL"]
                 args: list[Any] = [user_id]
                 if not include_archived:
@@ -1628,26 +2237,98 @@ class FeatureGroups:
                     clauses.append("(accepted_seq > ? OR (accepted_seq=? AND turn_id>?))")
                     args.extend([scan_after[0], scan_after[0], scan_after[1]])
                 sql = "SELECT * FROM turns WHERE " + " AND ".join(clauses) + " ORDER BY accepted_seq, turn_id LIMIT ?"
-                rows = conn.execute(sql, (*args, max(200, limit + 1))).fetchall()
+                rows = conn.execute(sql, (*args, batch_size)).fetchall()
                 if not rows:
                     exhausted = True
                     break
                 for row in rows:
-                    item = self._history_item(conn, row)
-                    if input_type is None or item["user"]["input_type"] == input_type:
-                        items.append(item)
-                        if len(items) > limit:
-                            break
-                scan_after = (int(rows[-1]["accepted_seq"]), rows[-1]["turn_id"])
-                if len(rows) < max(200, limit + 1) or len(items) > limit:
+                    if len(items) >= limit:
+                        has_more = True
+                        stop_kind = "page"
+                        break
+                    inspected_rows += 1
+                    last_scanned_key = (int(row["accepted_seq"]), row["turn_id"])
+                    remaining_parts = MAX_HISTORY_INSPECTED_PARTS - inspected_parts
+                    part_count = int(
+                        conn.execute(
+                            "SELECT COUNT(*) AS count FROM turn_parts WHERE turn_id=?",
+                            (row["turn_id"],),
+                        ).fetchone()["count"]
+                    )
+                    if part_count > remaining_parts:
+                        if not items:
+                            raise QuotaExceeded("history turn exceeds the inspected part limit")
+                        has_more = True
+                        stop_kind = "scan_parts"
+                        break
+                    part_rows = conn.execute(
+                        "SELECT part_id, kind, mime, declared_bytes, total_bytes, whole_stream_sha256, status, source_path FROM turn_parts WHERE turn_id=? ORDER BY part_id",
+                        (row["turn_id"],),
+                    ).fetchall()
+                    inspected_parts += len(part_rows)
+                    if row["transcript"]:
+                        candidate_input_type = "audio"
+                    elif any(part["kind"] == "text" for part in part_rows):
+                        candidate_input_type = "text"
+                    elif any(part["kind"] == "audio" for part in part_rows):
+                        candidate_input_type = "audio"
+                    elif part_rows:
+                        candidate_input_type = "attachment" if len(part_rows) == 1 else "mixed"
+                    else:
+                        candidate_input_type = "unknown"
+                    if input_type is not None and candidate_input_type != input_type:
+                        continue
+                    envelope = {"items": items, "next_cursor": None, "has_more": True, "filters_version": 1}
+                    remaining_page = MAX_HISTORY_PAGE_BYTES - len(canonical_json(envelope))
+                    try:
+                        item = self._history_item(
+                            conn,
+                            row,
+                            text_budget=max(0, remaining_page),
+                            part_rows=part_rows,
+                            read_text=True,
+                        )
+                    except _HistoryItemTooLarge as exc:
+                        if not items:
+                            raise QuotaExceeded("history item exceeds the serialized page limit") from exc
+                        has_more = True
+                        stop_kind = "oversize"
+                        break
+                    candidate = items + [item]
+                    probe = {"items": candidate, "next_cursor": None, "has_more": False, "filters_version": 1}
+                    if len(canonical_json(probe)) > MAX_HISTORY_PAGE_BYTES:
+                        if not items:
+                            raise QuotaExceeded("history item exceeds the serialized page limit")
+                        has_more = True
+                        stop_kind = "oversize"
+                        break
+                    items.append(item)
+                    last_returned_key = last_scanned_key
+                if stop_kind is not None:
+                    break
+                scan_after = last_scanned_key
+                if len(rows) < batch_size:
                     exhausted = True
-            has_more = len(items) > limit
-            items = items[:limit]
+            if not has_more and len(items) >= limit:
+                has_more = not exhausted
             next_cursor = None
-            if has_more and items:
+            cursor_key = last_returned_key
+            if cursor_key is None and has_more:
+                cursor_key = last_scanned_key
+            if has_more and cursor_key is not None:
+                next_cursor = self._cursor(filters, cursor_key[0], cursor_key[1])
+            response = {"items": items, "next_cursor": next_cursor, "has_more": has_more, "filters_version": 1}
+            while len(canonical_json(response)) > MAX_HISTORY_PAGE_BYTES and items:
+                items.pop()
+                if not items:
+                    raise QuotaExceeded("history page envelope exceeds the serialized page limit")
+                has_more = True
                 last = items[-1]
                 next_cursor = self._cursor(filters, int(last["accepted_seq"]), last["turn_id"])
-            return {"items": items, "next_cursor": next_cursor, "has_more": has_more, "filters_version": 1}
+                response = {"items": items, "next_cursor": next_cursor, "has_more": has_more, "filters_version": 1}
+            if len(canonical_json(response)) > MAX_HISTORY_PAGE_BYTES:
+                raise QuotaExceeded("history page envelope exceeds the serialized page limit")
+            return response
 
     # ---- Group 6: hash-bound attachment delivery --------------------------
 
@@ -2573,16 +3254,16 @@ class FeatureGroups:
             scope_sql = " AND user_id=? AND device_id=?"
             scope_args = (user_id, device_id)
         events = conn.execute("SELECT event_id, user_id, device_id, retention_deadline FROM diagnostic_events WHERE deleted_at IS NULL AND retention_deadline <= ? AND privacy_version=2 AND migration_state='READY'" + scope_sql, (as_of, *scope_args)).fetchall()
-        bundles = conn.execute("SELECT bundle_id, user_id, device_id, storage_path, payload_sha256, compressed_size, retention_deadline FROM diagnostic_bundles WHERE deleted_at IS NULL AND retention_deadline <= ? AND privacy_version=2 AND migration_state='READY'" + scope_sql, (as_of, *scope_args)).fetchall()
+        bundles = conn.execute("SELECT bundle_id, user_id, device_id, alias_digest, storage_path, payload_sha256, compressed_size, retention_deadline FROM diagnostic_bundles WHERE deleted_at IS NULL AND retention_deadline <= ? AND privacy_version=2 AND migration_state='READY'" + scope_sql, (as_of, *scope_args)).fetchall()
         tombstone_seconds = int(self.store.diagnostics_tombstone_retention_seconds)
         for row in events:
             expires_at = self._plus_seconds(row["retention_deadline"], tombstone_seconds)
-            conn.execute("UPDATE diagnostic_events SET metadata_json='{}', deleted_at=? WHERE event_id=?", (as_of, row["event_id"]))
-            conn.execute("INSERT OR IGNORE INTO diagnostic_tombstones(tombstone_id, user_id, device_id, entity_type, entity_id, deleted_at, expires_at) VALUES (?, ?, ?, 'event', ?, ?, ?)", (str(uuid.uuid4()), row["user_id"], row["device_id"], row["event_id"], as_of, expires_at))
+            conn.execute("UPDATE diagnostic_events SET category='other', stage='other', metadata_json='{}', deleted_at=? WHERE event_id=?", (as_of, row["event_id"]))
+            conn.execute("INSERT OR IGNORE INTO diagnostic_tombstones(tombstone_id, user_id, device_id, entity_type, entity_id, deleted_at, expires_at) VALUES (?, ?, ?, 'event', ?, ?, ?)", (str(uuid.uuid4()), self._tombstone_owner_token("user", row["user_id"]), self._tombstone_owner_token("device", row["device_id"]), row["event_id"], as_of, expires_at))
         for row in bundles:
             expires_at = self._plus_seconds(row["retention_deadline"], tombstone_seconds)
             conn.execute("UPDATE diagnostic_bundles SET compressed_size=0, expanded_size=0, storage_path='', deleted_at=? WHERE bundle_id=?", (as_of, row["bundle_id"]))
-            conn.execute("INSERT OR IGNORE INTO diagnostic_tombstones(tombstone_id, user_id, device_id, entity_type, entity_id, deleted_at, expires_at) VALUES (?, ?, ?, 'bundle', ?, ?, ?)", (str(uuid.uuid4()), row["user_id"], row["device_id"], row["bundle_id"], as_of, expires_at))
+            conn.execute("INSERT OR IGNORE INTO diagnostic_tombstones(tombstone_id, user_id, device_id, entity_type, entity_id, deleted_at, expires_at) VALUES (?, ?, ?, 'bundle', ?, ?, ?)", (str(uuid.uuid4()), self._tombstone_owner_token("user", row["user_id"]), self._tombstone_owner_token("device", row["device_id"]), row["bundle_id"], as_of, expires_at))
             self.store._prepare_cleanup_receipt_tx(conn, operation="diagnostic_purge", path=Path(row["storage_path"]), expected_sha256=row["payload_sha256"], expected_size=int(row["compressed_size"]), user_id=row["user_id"], device_id=row["device_id"], entity_type="diagnostic_bundle", entity_id=row["bundle_id"], now=as_of)
         return {"events": len(events), "bundles": len(bundles)}
 
@@ -2720,7 +3401,7 @@ class FeatureGroups:
             bundle_clauses = ["b.user_id=?", "b.device_id=?", "b.deleted_at IS NULL", "b.retention_deadline > ?", "b.privacy_version=2", "b.migration_state='READY'"]
             bundle_args: list[Any] = [user_id, device_id, as_of]
             tombstone_clauses = ["t.user_id=?", "t.device_id=?", "t.expires_at > ?"]
-            tombstone_args: list[Any] = [user_id, device_id, as_of]
+            tombstone_args: list[Any] = [self._tombstone_owner_token("user", user_id), self._tombstone_owner_token("device", device_id), as_of]
             union_sql = (
                 "SELECT 'event' AS entity_type, 0 AS sort_type, e.event_id AS entity_id, e.occurred_at AS sort_at, "
                 "e.category AS category, e.stage AS stage, e.metadata_json AS metadata_json, "
@@ -2811,10 +3492,10 @@ class FeatureGroups:
             tombstone_expiry = self._plus_seconds(timestamp, self.store.diagnostics_tombstone_retention_seconds)
             for row in events:
                 conn.execute("UPDATE diagnostic_events SET category='other', stage='other', metadata_json='{}', deleted_at=? WHERE event_id=?", (timestamp, row["event_id"]))
-                conn.execute("INSERT OR IGNORE INTO diagnostic_tombstones(tombstone_id, user_id, device_id, entity_type, entity_id, deleted_at, expires_at) VALUES (?, ?, ?, 'event', ?, ?, ?)", (str(uuid.uuid4()), user_id, device_id, row["event_id"], timestamp, tombstone_expiry))
+                conn.execute("INSERT OR IGNORE INTO diagnostic_tombstones(tombstone_id, user_id, device_id, entity_type, entity_id, deleted_at, expires_at) VALUES (?, ?, ?, 'event', ?, ?, ?)", (str(uuid.uuid4()), self._tombstone_owner_token("user", user_id), self._tombstone_owner_token("device", device_id), row["event_id"], timestamp, tombstone_expiry))
             for row in bundles:
                 conn.execute("UPDATE diagnostic_bundles SET compressed_size=0, expanded_size=0, storage_path='', deleted_at=? WHERE bundle_id=?", (timestamp, row["bundle_id"]))
-                conn.execute("INSERT OR IGNORE INTO diagnostic_tombstones(tombstone_id, user_id, device_id, entity_type, entity_id, deleted_at, expires_at) VALUES (?, ?, ?, 'bundle', ?, ?, ?)", (str(uuid.uuid4()), user_id, device_id, row["bundle_id"], timestamp, tombstone_expiry))
+                conn.execute("INSERT OR IGNORE INTO diagnostic_tombstones(tombstone_id, user_id, device_id, entity_type, entity_id, deleted_at, expires_at) VALUES (?, ?, ?, 'bundle', ?, ?, ?)", (str(uuid.uuid4()), self._tombstone_owner_token("user", user_id), self._tombstone_owner_token("device", device_id), row["bundle_id"], timestamp, tombstone_expiry))
                 self.store._prepare_cleanup_receipt_tx(
                     conn,
                     operation="diagnostic_delete",
@@ -2842,25 +3523,141 @@ class FeatureGroups:
         timestamp = self._time(now, self.store)
         with self.store._tx() as conn:
             expired = self._expire_diagnostics_tx(conn, user_id=None, device_id=None, as_of=timestamp)
-            expired_tombstones = conn.execute("SELECT tombstone_id FROM diagnostic_tombstones WHERE expires_at <= ?", (timestamp,)).fetchall()
-            if expired_tombstones:
-                conn.executemany(
-                    "DELETE FROM diagnostic_tombstones WHERE tombstone_id=?",
-                    [(row["tombstone_id"],) for row in expired_tombstones],
-                )
         if _recover_cleanup:
-            self.store.recover_cleanup_receipts(now=timestamp)
-        if not _recover_cleanup:
-            return {"events": expired["events"], "bundles": expired["bundles"], "tombstones": len(expired_tombstones)}
-        with self.store._read() as conn:
-            pending = conn.execute(
-                "SELECT COUNT(*) FROM storage_cleanup_receipts WHERE operation IN ('diagnostic_delete', 'diagnostic_purge') AND status IN ('PENDING', 'BLOCKED')",
-            ).fetchone()[0]
-        if pending:
-            raise CleanupIncompleteError("diagnostic purge cleanup is incomplete")
+            cleanup = self.store.recover_cleanup_receipts(now=timestamp)
+            if cleanup["pending"] or cleanup["blocked"]:
+                raise CleanupIncompleteError("diagnostic purge cleanup is incomplete")
+        tombstones_deleted = 0
+        owners: set[tuple[str, str]] = set()
+        def owner_matches(tombstone: Mapping[str, Any], entity: Mapping[str, Any]) -> bool:
+            expected_user = self._tombstone_owner_token("user", str(entity["user_id"]))
+            expected_device = self._tombstone_owner_token("device", str(entity["device_id"]))
+            # Accept raw values only for a legacy row created before the
+            # schema-free owner-token normalization ran at startup.
+            return tombstone["user_id"] in {expected_user, entity["user_id"]} and tombstone["device_id"] in {expected_device, entity["device_id"]}
+
+        with self.store._tx() as conn:
+            rows = conn.execute(
+                "SELECT * FROM diagnostic_tombstones ORDER BY deleted_at, tombstone_id LIMIT 500"
+            ).fetchall()
+            for tombstone in rows:
+                expires_at = tombstone["expires_at"]
+                if not expires_at:
+                    # Rows created before the durable horizon column was
+                    # introduced use their scrub time as a conservative
+                    # fallback.  Never make the retention window shorter.
+                    expires_at = self._plus_seconds(
+                        tombstone["deleted_at"],
+                        int(self.store.diagnostics_tombstone_retention_seconds),
+                    )
+                try:
+                    due = self._time(expires_at, self.store) <= timestamp
+                except ValidationError:
+                    due = False
+                if not due:
+                    continue
+                entity_type = tombstone["entity_type"]
+                entity_id = tombstone["entity_id"]
+                if entity_type == "event":
+                    entity = conn.execute(
+                        "SELECT event_id, deleted_at, user_id, device_id FROM diagnostic_events WHERE event_id=?",
+                        (entity_id,),
+                    ).fetchone()
+                    if entity is not None and not owner_matches(tombstone, entity):
+                        continue
+                    if entity is not None and entity["deleted_at"] is None:
+                        continue
+                    receipt_rows = conn.execute(
+                        "SELECT status FROM storage_cleanup_receipts WHERE entity_type='diagnostic_event' AND entity_id=?",
+                        (entity_id,),
+                    ).fetchall()
+                    if any(row["status"] in {"PENDING", "BLOCKED"} for row in receipt_rows):
+                        continue
+                    if entity is not None:
+                        conn.execute(
+                            "DELETE FROM diagnostic_events WHERE event_id=? AND user_id=? AND device_id=? AND deleted_at IS NOT NULL",
+                            (entity_id, entity["user_id"], entity["device_id"]),
+                        )
+                        owners.add((entity["user_id"], entity["device_id"]))
+                elif entity_type == "bundle":
+                    entity = conn.execute(
+                        "SELECT bundle_id, deleted_at, user_id, device_id FROM diagnostic_bundles WHERE bundle_id=?",
+                        (entity_id,),
+                    ).fetchone()
+                    if entity is not None and not owner_matches(tombstone, entity):
+                        continue
+                    if entity is not None and entity["deleted_at"] is None:
+                        continue
+                    receipt_rows = conn.execute(
+                        "SELECT receipt_id, status FROM storage_cleanup_receipts WHERE entity_type='diagnostic_bundle' AND entity_id=?",
+                        (entity_id,),
+                    ).fetchall()
+                    if any(row["status"] in {"PENDING", "BLOCKED"} for row in receipt_rows):
+                        continue
+                    if entity is not None:
+                        conn.execute(
+                            "DELETE FROM diagnostic_bundles WHERE bundle_id=? AND user_id=? AND device_id=? AND deleted_at IS NOT NULL",
+                            (entity_id, entity["user_id"], entity["device_id"]),
+                        )
+                        owners.add((entity["user_id"], entity["device_id"]))
+                    conn.execute(
+                        "DELETE FROM storage_cleanup_receipts WHERE entity_type='diagnostic_bundle' AND entity_id=? AND status='COMPLETE'",
+                        (entity_id,),
+                    )
+                else:
+                    continue
+                conn.execute(
+                    "DELETE FROM diagnostic_tombstones WHERE tombstone_id=?",
+                    (tombstone["tombstone_id"],),
+                )
+                tombstones_deleted += 1
+
+            # A current consent row is the minimum opt-in/opt-out authority;
+            # only retired rows are eligible for deletion.  Once a current
+            # row's aliases are outside the retention horizon, remove only
+            # that lookup alias and retain its random event handle.
+            horizon = int(self.store.diagnostics_tombstone_retention_seconds)
+            for user_id, device_id in owners:
+                current = conn.execute(
+                    "SELECT event_id, created_at FROM diagnostics_consents WHERE user_id=? AND device_id=? AND revoked_at IS NULL ORDER BY created_at DESC, event_id DESC LIMIT 1",
+                    (user_id, device_id),
+                ).fetchone()
+                if current is not None:
+                    clear_at = self._plus_seconds(current["created_at"], horizon)
+                    if clear_at <= timestamp:
+                        conn.execute(
+                            "UPDATE diagnostics_consents SET alias_digest=NULL WHERE event_id=? AND alias_digest IS NOT NULL",
+                            (current["event_id"],),
+                        )
+                consents = conn.execute(
+                    "SELECT * FROM diagnostics_consents WHERE user_id=? AND device_id=? ORDER BY created_at, event_id",
+                    (user_id, device_id),
+                ).fetchall()
+                for consent in consents:
+                    if current is not None and consent["event_id"] == current["event_id"]:
+                        continue
+                    terminal_values = [
+                        value
+                        for value in (consent["revoked_at"], consent["expires_at"])
+                        if value is not None
+                    ]
+                    if not terminal_values:
+                        continue
+                    terminal = min(terminal_values)
+                    if self._plus_seconds(terminal, horizon) > timestamp:
+                        continue
+                    dependency = conn.execute(
+                        "SELECT 1 FROM diagnostic_bundles WHERE opt_in_event_id=? LIMIT 1",
+                        (consent["event_id"],),
+                    ).fetchone()
+                    if dependency is None:
+                        conn.execute(
+                            "DELETE FROM diagnostics_consents WHERE event_id=? AND user_id=? AND device_id=?",
+                            (consent["event_id"], user_id, device_id),
+                        )
         result = {"events": expired["events"], "bundles": expired["bundles"]}
-        if expired_tombstones:
-            result["tombstones"] = len(expired_tombstones)
+        if tombstones_deleted:
+            result["tombstones"] = tombstones_deleted
         return result
 
 

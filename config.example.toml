@@ -12,9 +12,11 @@ port = 8643
 internal_worker_principals = []
 
 [storage]
-database = "./state/recorder-next.sqlite3"
-root = "./state/data"
+database = "/var/lib/recorder-next/recorder-next.sqlite3"
+root = "/var/lib/recorder-next/data"
 min_free_bytes = 104857600
+# This file is intended to be copied to /etc/recorder-next. Local development
+# may explicitly override these paths with relative CLI/config values.
 
 [limits]
 max_audio_minutes = 120

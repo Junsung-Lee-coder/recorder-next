@@ -56,6 +56,10 @@ class Field:
     max_length: int | None = None
     pattern: str | None = None
     item_model: "ObjectModel | None" = None
+    item_field: "Field | None" = None
+    min_items: int | None = None
+    max_items: int | None = None
+    unique_items: bool = False
     object_model: "ObjectModel | None" = None
     schema_hint: Mapping[str, Any] | None = None
     internal: bool = False
@@ -90,6 +94,21 @@ class Field:
                 raise ModelValidationError(f"{path} must be an array")
             for index, item in enumerate(value):
                 self.item_model.validate(item, path=f"{path}[{index}]")
+        if self.item_field is not None:
+            if not isinstance(value, list):
+                raise ModelValidationError(f"{path} must be an array")
+            if self.min_items is not None and len(value) < self.min_items:
+                raise ModelValidationError(f"{path} contains too few items")
+            if self.max_items is not None and len(value) > self.max_items:
+                raise ModelValidationError(f"{path} contains too many items")
+            for index, item in enumerate(value):
+                self.item_field.validate(item, path=f"{path}[{index}]")
+            if self.unique_items and any(
+                left == right
+                for index, left in enumerate(value)
+                for right in value[index + 1 :]
+            ):
+                raise ModelValidationError(f"{path} contains duplicate items")
 
     def openapi_schema(self, *, include_internal: bool = False) -> dict[str, Any]:
         if self.schema_hint is not None:
@@ -100,6 +119,11 @@ class Field:
             schema = {
                 "type": "array",
                 "items": {"$ref": f"#/components/schemas/{self.item_model.name}"},
+            }
+        elif self.item_field is not None:
+            schema = {
+                "type": "array",
+                "items": self.item_field.openapi_schema(include_internal=include_internal),
             }
         elif len(self.types) == 1:
             schema: dict[str, Any] = {"type": _type_name(self.types[0])}
@@ -119,6 +143,12 @@ class Field:
             schema["maxLength"] = self.max_length
         if self.pattern is not None:
             schema["pattern"] = self.pattern
+        if self.min_items is not None:
+            schema["minItems"] = self.min_items
+        if self.max_items is not None:
+            schema["maxItems"] = self.max_items
+        if self.unique_items:
+            schema["uniqueItems"] = True
         if self.nullable:
             schema["nullable"] = True
         return schema
@@ -191,8 +221,10 @@ def boolean(name: str, *, required: bool = False, nullable: bool = False, intern
     return Field(name, required=required, types=(bool,), nullable=nullable, internal=internal, **kwargs)
 
 
-def array(name: str, *, required: bool = False, item_model: ObjectModel | None = None, nullable: bool = False, **kwargs: Any) -> Field:
-    return Field(name, required=required, types=(list,), item_model=item_model, nullable=nullable, **kwargs)
+def array(name: str, *, required: bool = False, item_model: ObjectModel | None = None, item_field: Field | None = None, nullable: bool = False, **kwargs: Any) -> Field:
+    if item_model is not None and item_field is not None:
+        raise ValueError("array accepts either item_model or item_field")
+    return Field(name, required=required, types=(list,), item_model=item_model, item_field=item_field, nullable=nullable, **kwargs)
 
 
 def object_field(name: str, *, required: bool = False, object_model: ObjectModel | None = None, nullable: bool = False, **kwargs: Any) -> Field:
@@ -270,7 +302,7 @@ PROJECT_CREATE = ObjectModel(
         string("device_id", required=True),
         string("project_number", required=True),
         string("name", required=True),
-        array("aliases"),
+        array("aliases", item_field=string("alias", min_length=1, max_length=128), max_items=32, unique_items=True),
         string("description"),
         string("idempotency_key", nullable=True),
     ),
@@ -279,9 +311,9 @@ PROJECT_PATCH = ObjectModel(
     "ProjectPatch",
     (
         integer("expected_version", required=True, minimum=1),
-        string("name", nullable=True),
-        array("aliases", nullable=True),
-        string("description", nullable=True),
+        string("name"),
+        array("aliases", item_field=string("alias", min_length=1, max_length=128), max_items=32, unique_items=True),
+        string("description"),
     ),
 )
 EXPECTED_VERSION = ObjectModel("ExpectedVersion", (integer("expected_version", required=True, minimum=1),))
