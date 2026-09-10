@@ -126,14 +126,6 @@
           "type": "string"
         }
       },
-      "InternalTrustedHeader": {
-        "in": "header",
-        "name": "X-Recorder-Internal-Trusted",
-        "required": true,
-        "schema": {
-          "type": "string"
-        }
-      },
       "LegacyDeviceHeader": {
         "in": "header",
         "name": "X-Recorder-Device-ID",
@@ -9856,6 +9848,16 @@
             },
             "description": "Structured Recorder error"
           },
+          "408": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Structured Recorder error"
+          },
           "500": {
             "content": {
               "application/json": {
@@ -9878,6 +9880,10 @@
             "x-no-body": true
           },
           "400": {
+            "description": "Structured Recorder error",
+            "x-no-body": true
+          },
+          "408": {
             "description": "Structured Recorder error",
             "x-no-body": true
           },
@@ -9941,6 +9947,16 @@
             "description": "Structured Recorder error"
           },
           "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Structured Recorder error"
+          },
+          "408": {
             "content": {
               "application/json": {
                 "schema": {
@@ -10051,6 +10067,16 @@
             "description": "Structured Recorder error"
           },
           "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Structured Recorder error"
+          },
+          "408": {
             "content": {
               "application/json": {
                 "schema": {
@@ -10189,6 +10215,16 @@
             },
             "description": "Structured Recorder error"
           },
+          "408": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Structured Recorder error"
+          },
           "409": {
             "content": {
               "application/json": {
@@ -10296,6 +10332,16 @@
             "description": "Structured Recorder error"
           },
           "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Structured Recorder error"
+          },
+          "408": {
             "content": {
               "application/json": {
                 "schema": {
@@ -10428,6 +10474,16 @@
             },
             "description": "Structured Recorder error"
           },
+          "408": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Structured Recorder error"
+          },
           "409": {
             "content": {
               "application/json": {
@@ -10527,6 +10583,10 @@
             "description": "Structured Recorder error",
             "x-no-body": true
           },
+          "408": {
+            "description": "Structured Recorder error",
+            "x-no-body": true
+          },
           "409": {
             "description": "Structured Recorder error",
             "x-no-body": true
@@ -10604,6 +10664,16 @@
             "description": "Structured Recorder error"
           },
           "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Structured Recorder error"
+          },
+          "408": {
             "content": {
               "application/json": {
                 "schema": {
@@ -10723,6 +10793,16 @@
             },
             "description": "Structured Recorder error"
           },
+          "408": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Structured Recorder error"
+          },
           "409": {
             "content": {
               "application/json": {
@@ -10824,6 +10904,16 @@
             "description": "Structured Recorder error"
           },
           "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Structured Recorder error"
+          },
+          "408": {
             "content": {
               "application/json": {
                 "schema": {
@@ -10964,6 +11054,16 @@
             },
             "description": "Structured Recorder error"
           },
+          "408": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Structured Recorder error"
+          },
           "409": {
             "content": {
               "application/json": {
@@ -11069,6 +11169,10 @@
             "description": "Structured Recorder error",
             "x-no-body": true
           },
+          "408": {
+            "description": "Structured Recorder error",
+            "x-no-body": true
+          },
           "409": {
             "description": "Structured Recorder error",
             "x-no-body": true
@@ -11146,6 +11250,16 @@
             "description": "Structured Recorder error"
           },
           "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Structured Recorder error"
+          },
+          "408": {
             "content": {
               "application/json": {
                 "schema": {
@@ -11256,6 +11370,16 @@
             "description": "Structured Recorder error"
           },
           "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Structured Recorder error"
+          },
+          "408": {
             "content": {
               "application/json": {
                 "schema": {
@@ -11387,6 +11511,16 @@
             },
             "description": "Structured Recorder error"
           },
+          "408": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Structured Recorder error"
+          },
           "409": {
             "content": {
               "application/json": {
@@ -11480,6 +11614,10 @@
             "x-no-body": true
           },
           "404": {
+            "description": "Structured Recorder error",
+            "x-no-body": true
+          },
+          "408": {
             "description": "Structured Recorder error",
             "x-no-body": true
           },
@@ -11582,6 +11720,16 @@
             "description": "Structured Recorder error"
           },
           "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Structured Recorder error"
+          },
+          "408": {
             "content": {
               "application/json": {
                 "schema": {
@@ -11713,6 +11861,16 @@
             },
             "description": "Structured Recorder error"
           },
+          "408": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Structured Recorder error"
+          },
           "409": {
             "content": {
               "application/json": {
@@ -11806,6 +11964,10 @@
             "x-no-body": true
           },
           "404": {
+            "description": "Structured Recorder error",
+            "x-no-body": true
+          },
+          "408": {
             "description": "Structured Recorder error",
             "x-no-body": true
           },
@@ -11908,6 +12070,16 @@
             "description": "Structured Recorder error"
           },
           "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Structured Recorder error"
+          },
+          "408": {
             "content": {
               "application/json": {
                 "schema": {
@@ -12039,6 +12211,16 @@
             },
             "description": "Structured Recorder error"
           },
+          "408": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Structured Recorder error"
+          },
           "409": {
             "content": {
               "application/json": {
@@ -12132,6 +12314,10 @@
             "x-no-body": true
           },
           "404": {
+            "description": "Structured Recorder error",
+            "x-no-body": true
+          },
+          "408": {
             "description": "Structured Recorder error",
             "x-no-body": true
           },
@@ -12234,6 +12420,16 @@
             "description": "Structured Recorder error"
           },
           "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Structured Recorder error"
+          },
+          "408": {
             "content": {
               "application/json": {
                 "schema": {
@@ -12375,6 +12571,16 @@
             },
             "description": "Structured Recorder error"
           },
+          "408": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Structured Recorder error"
+          },
           "409": {
             "content": {
               "application/json": {
@@ -12496,6 +12702,16 @@
             "description": "Structured Recorder error"
           },
           "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Structured Recorder error"
+          },
+          "408": {
             "content": {
               "application/json": {
                 "schema": {
@@ -12637,6 +12853,16 @@
             },
             "description": "Structured Recorder error"
           },
+          "408": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Structured Recorder error"
+          },
           "409": {
             "content": {
               "application/json": {
@@ -12769,6 +12995,16 @@
             },
             "description": "Structured Recorder error"
           },
+          "408": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Structured Recorder error"
+          },
           "409": {
             "content": {
               "application/json": {
@@ -12842,6 +13078,16 @@
             },
             "description": "Structured Recorder error"
           },
+          "408": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Structured Recorder error"
+          },
           "500": {
             "content": {
               "application/json": {
@@ -12863,6 +13109,10 @@
             "x-no-body": true
           },
           "400": {
+            "description": "Structured Recorder error",
+            "x-no-body": true
+          },
+          "408": {
             "description": "Structured Recorder error",
             "x-no-body": true
           },
@@ -12950,6 +13200,16 @@
             "description": "Structured Recorder error"
           },
           "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Structured Recorder error"
+          },
+          "408": {
             "content": {
               "application/json": {
                 "schema": {
@@ -13067,6 +13327,10 @@
             "description": "Structured Recorder error",
             "x-no-body": true
           },
+          "408": {
+            "description": "Structured Recorder error",
+            "x-no-body": true
+          },
           "409": {
             "description": "Structured Recorder error",
             "x-no-body": true
@@ -13116,9 +13380,6 @@
           },
           {
             "$ref": "#/components/parameters/DeviceIdQuery"
-          },
-          {
-            "$ref": "#/components/parameters/InternalTrustedHeader"
           }
         ],
         "requestBody": {
@@ -13153,6 +13414,26 @@
             "description": "Structured Recorder error"
           },
           "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Structured Recorder error"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Structured Recorder error"
+          },
+          "408": {
             "content": {
               "application/json": {
                 "schema": {
@@ -13208,7 +13489,8 @@
             "RecorderPrincipal": []
           }
         ],
-        "x-handler-key": "post_v1_internal_schedule_create"
+        "x-handler-key": "post_v1_internal_schedule_create",
+        "x-recorder-internal-principal": true
       }
     },
     "/v1/internal/scheduler/fire": {
@@ -13298,6 +13580,16 @@
             },
             "description": "Structured Recorder error"
           },
+          "408": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Structured Recorder error"
+          },
           "409": {
             "content": {
               "application/json": {
@@ -13344,7 +13636,8 @@
             "RecorderPrincipal": []
           }
         ],
-        "x-handler-key": "post_v1_internal_scheduler_fire"
+        "x-handler-key": "post_v1_internal_scheduler_fire",
+        "x-recorder-internal-principal": true
       }
     },
     "/v1/internal/scheduler/recover": {
@@ -13434,6 +13727,16 @@
             },
             "description": "Structured Recorder error"
           },
+          "408": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Structured Recorder error"
+          },
           "409": {
             "content": {
               "application/json": {
@@ -13480,7 +13783,8 @@
             "RecorderPrincipal": []
           }
         ],
-        "x-handler-key": "post_v1_internal_scheduler_recover"
+        "x-handler-key": "post_v1_internal_scheduler_recover",
+        "x-recorder-internal-principal": true
       }
     },
     "/v1/internal/worker/claim": {
@@ -13570,6 +13874,16 @@
             },
             "description": "Structured Recorder error"
           },
+          "408": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Structured Recorder error"
+          },
           "409": {
             "content": {
               "application/json": {
@@ -13616,7 +13930,8 @@
             "RecorderPrincipal": []
           }
         ],
-        "x-handler-key": "post_v1_internal_worker_claim"
+        "x-handler-key": "post_v1_internal_worker_claim",
+        "x-recorder-internal-principal": true
       }
     },
     "/v1/internal/worker/complete": {
@@ -13706,6 +14021,16 @@
             },
             "description": "Structured Recorder error"
           },
+          "408": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Structured Recorder error"
+          },
           "409": {
             "content": {
               "application/json": {
@@ -13752,7 +14077,8 @@
             "RecorderPrincipal": []
           }
         ],
-        "x-handler-key": "post_v1_internal_worker_complete"
+        "x-handler-key": "post_v1_internal_worker_complete",
+        "x-recorder-internal-principal": true
       }
     },
     "/v1/internal/worker/fail": {
@@ -13842,6 +14168,16 @@
             },
             "description": "Structured Recorder error"
           },
+          "408": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Structured Recorder error"
+          },
           "409": {
             "content": {
               "application/json": {
@@ -13888,7 +14224,8 @@
             "RecorderPrincipal": []
           }
         ],
-        "x-handler-key": "post_v1_internal_worker_fail"
+        "x-handler-key": "post_v1_internal_worker_fail",
+        "x-recorder-internal-principal": true
       }
     },
     "/v1/internal/worker/health": {
@@ -13968,6 +14305,16 @@
             },
             "description": "Structured Recorder error"
           },
+          "408": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Structured Recorder error"
+          },
           "409": {
             "content": {
               "application/json": {
@@ -14014,7 +14361,8 @@
             "RecorderPrincipal": []
           }
         ],
-        "x-handler-key": "get_v1_internal_worker_health"
+        "x-handler-key": "get_v1_internal_worker_health",
+        "x-recorder-internal-principal": true
       },
       "head": {
         "operationId": "head_get_v1_internal_worker_health",
@@ -14062,6 +14410,10 @@
             "description": "Structured Recorder error",
             "x-no-body": true
           },
+          "408": {
+            "description": "Structured Recorder error",
+            "x-no-body": true
+          },
           "409": {
             "description": "Structured Recorder error",
             "x-no-body": true
@@ -14084,7 +14436,8 @@
             "RecorderPrincipal": []
           }
         ],
-        "x-handler-key": "head_get_v1_internal_worker_health"
+        "x-handler-key": "head_get_v1_internal_worker_health",
+        "x-recorder-internal-principal": true
       }
     },
     "/v1/internal/worker/recover": {
@@ -14174,6 +14527,16 @@
             },
             "description": "Structured Recorder error"
           },
+          "408": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Structured Recorder error"
+          },
           "409": {
             "content": {
               "application/json": {
@@ -14220,7 +14583,8 @@
             "RecorderPrincipal": []
           }
         ],
-        "x-handler-key": "post_v1_internal_worker_recover"
+        "x-handler-key": "post_v1_internal_worker_recover",
+        "x-recorder-internal-principal": true
       }
     },
     "/v1/internal/worker/run": {
@@ -14310,6 +14674,16 @@
             },
             "description": "Structured Recorder error"
           },
+          "408": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Structured Recorder error"
+          },
           "409": {
             "content": {
               "application/json": {
@@ -14356,7 +14730,8 @@
             "RecorderPrincipal": []
           }
         ],
-        "x-handler-key": "post_v1_internal_worker_run"
+        "x-handler-key": "post_v1_internal_worker_run",
+        "x-recorder-internal-principal": true
       }
     },
     "/v1/openapi.json": {
@@ -14374,6 +14749,16 @@
             "description": "This contract"
           },
           "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Structured Recorder error"
+          },
+          "408": {
             "content": {
               "application/json": {
                 "schema": {
@@ -14404,6 +14789,10 @@
             "x-no-body": true
           },
           "400": {
+            "description": "Structured Recorder error",
+            "x-no-body": true
+          },
+          "408": {
             "description": "Structured Recorder error",
             "x-no-body": true
           },
@@ -14476,6 +14865,16 @@
             "description": "Structured Recorder error"
           },
           "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Structured Recorder error"
+          },
+          "408": {
             "content": {
               "application/json": {
                 "schema": {
@@ -14578,6 +14977,10 @@
             "description": "Structured Recorder error",
             "x-no-body": true
           },
+          "408": {
+            "description": "Structured Recorder error",
+            "x-no-body": true
+          },
           "409": {
             "description": "Structured Recorder error",
             "x-no-body": true
@@ -14664,6 +15067,16 @@
             "description": "Structured Recorder error"
           },
           "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Structured Recorder error"
+          },
+          "408": {
             "content": {
               "application/json": {
                 "schema": {
@@ -14766,6 +15179,10 @@
             "description": "Structured Recorder error",
             "x-no-body": true
           },
+          "408": {
+            "description": "Structured Recorder error",
+            "x-no-body": true
+          },
           "409": {
             "description": "Structured Recorder error",
             "x-no-body": true
@@ -14841,6 +15258,16 @@
             "description": "Structured Recorder error"
           },
           "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Structured Recorder error"
+          },
+          "408": {
             "content": {
               "application/json": {
                 "schema": {
@@ -14972,6 +15399,16 @@
             },
             "description": "Structured Recorder error"
           },
+          "408": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Structured Recorder error"
+          },
           "409": {
             "content": {
               "application/json": {
@@ -15068,6 +15505,10 @@
             "description": "Structured Recorder error",
             "x-no-body": true
           },
+          "408": {
+            "description": "Structured Recorder error",
+            "x-no-body": true
+          },
           "409": {
             "description": "Structured Recorder error",
             "x-no-body": true
@@ -15154,6 +15595,16 @@
             "description": "Structured Recorder error"
           },
           "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Structured Recorder error"
+          },
+          "408": {
             "content": {
               "application/json": {
                 "schema": {
@@ -15256,6 +15707,10 @@
             "description": "Structured Recorder error",
             "x-no-body": true
           },
+          "408": {
+            "description": "Structured Recorder error",
+            "x-no-body": true
+          },
           "409": {
             "description": "Structured Recorder error",
             "x-no-body": true
@@ -15350,6 +15805,16 @@
             "description": "Structured Recorder error"
           },
           "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Structured Recorder error"
+          },
+          "408": {
             "content": {
               "application/json": {
                 "schema": {
@@ -15488,6 +15953,16 @@
             },
             "description": "Structured Recorder error"
           },
+          "408": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Structured Recorder error"
+          },
           "409": {
             "content": {
               "application/json": {
@@ -15607,6 +16082,16 @@
             },
             "description": "Structured Recorder error"
           },
+          "408": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Structured Recorder error"
+          },
           "409": {
             "content": {
               "application/json": {
@@ -15697,6 +16182,10 @@
             "x-no-body": true
           },
           "404": {
+            "description": "Structured Recorder error",
+            "x-no-body": true
+          },
+          "408": {
             "description": "Structured Recorder error",
             "x-no-body": true
           },
@@ -15795,6 +16284,16 @@
             },
             "description": "Structured Recorder error"
           },
+          "408": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Structured Recorder error"
+          },
           "409": {
             "content": {
               "application/json": {
@@ -15865,6 +16364,10 @@
             "x-no-body": true
           },
           "404": {
+            "description": "Structured Recorder error",
+            "x-no-body": true
+          },
+          "408": {
             "description": "Structured Recorder error",
             "x-no-body": true
           },
@@ -15955,6 +16458,16 @@
             },
             "description": "Structured Recorder error"
           },
+          "408": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Structured Recorder error"
+          },
           "409": {
             "content": {
               "application/json": {
@@ -16025,6 +16538,10 @@
             "x-no-body": true
           },
           "404": {
+            "description": "Structured Recorder error",
+            "x-no-body": true
+          },
+          "408": {
             "description": "Structured Recorder error",
             "x-no-body": true
           },
@@ -16116,6 +16633,16 @@
             "description": "Structured Recorder error"
           },
           "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Structured Recorder error"
+          },
+          "408": {
             "content": {
               "application/json": {
                 "schema": {
@@ -16254,6 +16781,16 @@
             },
             "description": "Structured Recorder error"
           },
+          "408": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Structured Recorder error"
+          },
           "409": {
             "content": {
               "application/json": {
@@ -16365,6 +16902,16 @@
             "description": "Structured Recorder error"
           },
           "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Structured Recorder error"
+          },
+          "408": {
             "content": {
               "application/json": {
                 "schema": {
@@ -16493,6 +17040,16 @@
             },
             "description": "Structured Recorder error"
           },
+          "408": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Structured Recorder error"
+          },
           "409": {
             "content": {
               "application/json": {
@@ -16583,6 +17140,10 @@
             "x-no-body": true
           },
           "404": {
+            "description": "Structured Recorder error",
+            "x-no-body": true
+          },
+          "408": {
             "description": "Structured Recorder error",
             "x-no-body": true
           },
@@ -16682,6 +17243,16 @@
             "description": "Structured Recorder error"
           },
           "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Structured Recorder error"
+          },
+          "408": {
             "content": {
               "application/json": {
                 "schema": {
@@ -16811,6 +17382,16 @@
             "description": "Structured Recorder error"
           },
           "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Structured Recorder error"
+          },
+          "408": {
             "content": {
               "application/json": {
                 "schema": {
@@ -16952,6 +17533,16 @@
             },
             "description": "Structured Recorder error"
           },
+          "408": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Structured Recorder error"
+          },
           "409": {
             "content": {
               "application/json": {
@@ -17075,6 +17666,16 @@
             "description": "Structured Recorder error"
           },
           "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Structured Recorder error"
+          },
+          "408": {
             "content": {
               "application/json": {
                 "schema": {
@@ -17222,6 +17823,16 @@
             },
             "description": "Structured Recorder error"
           },
+          "408": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Structured Recorder error"
+          },
           "409": {
             "content": {
               "application/json": {
@@ -17358,6 +17969,16 @@
             },
             "description": "Structured Recorder error"
           },
+          "408": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Structured Recorder error"
+          },
           "409": {
             "content": {
               "application/json": {
@@ -17481,6 +18102,16 @@
             "description": "Structured Recorder error"
           },
           "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Structured Recorder error"
+          },
+          "408": {
             "content": {
               "application/json": {
                 "schema": {
@@ -17624,6 +18255,16 @@
             },
             "description": "Structured Recorder error"
           },
+          "408": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Structured Recorder error"
+          },
           "409": {
             "content": {
               "application/json": {
@@ -17732,6 +18373,10 @@
             "description": "Structured Recorder error",
             "x-no-body": true
           },
+          "408": {
+            "description": "Structured Recorder error",
+            "x-no-body": true
+          },
           "409": {
             "description": "Structured Recorder error",
             "x-no-body": true
@@ -17815,6 +18460,16 @@
             },
             "description": "Structured Recorder error"
           },
+          "408": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Structured Recorder error"
+          },
           "500": {
             "content": {
               "application/json": {
@@ -17864,6 +18519,10 @@
             "x-no-body": true
           },
           "404": {
+            "description": "Structured Recorder error",
+            "x-no-body": true
+          },
+          "408": {
             "description": "Structured Recorder error",
             "x-no-body": true
           },
@@ -17934,6 +18593,16 @@
             },
             "description": "Structured Recorder error"
           },
+          "408": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Structured Recorder error"
+          },
           "500": {
             "content": {
               "application/json": {
@@ -17984,6 +18653,10 @@
             "x-no-body": true
           },
           "404": {
+            "description": "Structured Recorder error",
+            "x-no-body": true
+          },
+          "408": {
             "description": "Structured Recorder error",
             "x-no-body": true
           },
@@ -18140,6 +18813,16 @@
             "description": "Structured Recorder error"
           },
           "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Structured Recorder error"
+          },
+          "408": {
             "content": {
               "application/json": {
                 "schema": {
@@ -18334,6 +19017,10 @@
             "x-no-body": true
           },
           "404": {
+            "description": "Structured Recorder error",
+            "x-no-body": true
+          },
+          "408": {
             "description": "Structured Recorder error",
             "x-no-body": true
           },

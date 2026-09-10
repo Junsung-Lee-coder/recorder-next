@@ -15,6 +15,58 @@ from recorder_next.store import RecorderStore
 
 
 class R25HttpContractTests(unittest.TestCase):
+    def test_internal_controls_are_catalogued_as_principal_bound_operations(self):
+        expected = {
+            ("POST", "/v1/internal/schedule_create"),
+            ("POST", "/v1/internal/scheduler/fire"),
+            ("POST", "/v1/internal/scheduler/recover"),
+            ("POST", "/v1/internal/worker/claim"),
+            ("POST", "/v1/internal/worker/recover"),
+            ("POST", "/v1/internal/worker/complete"),
+            ("POST", "/v1/internal/worker/fail"),
+            ("POST", "/v1/internal/worker/run"),
+            ("GET", "/v1/internal/worker/health"),
+            ("HEAD", "/v1/internal/worker/health"),
+        }
+        actual = {(item.method, item.path_template) for item in route_catalog() if item.requires_internal}
+        self.assertEqual(actual, expected)
+        for item in route_catalog():
+            if item.requires_internal:
+                self.assertTrue(item.requires_principal)
+                self.assertNotIn("X-Recorder-Internal-Trusted", item.header_parameters)
+
+    def test_network_preflight_rejects_non_allowlisted_internal_principal_before_body(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = RecorderStore(root / "db.sqlite3", storage_root=root / "data")
+            store.register_device("worker-user", "worker-device", "other")
+            service = RecorderService(
+                store,
+                ingress_secret="test-secret",
+                internal_worker_principals=(("different-user", "different-device"),),
+            )
+            headers = self._principal_headers("worker-user", "worker-device", "test-secret")
+            with self.assertRaises(Exception) as raised:
+                service.preflight_http(
+                    "POST",
+                    "/v1/internal/scheduler/recover",
+                    {**headers, "Content-Type": "application/json"},
+                    body_length=2,
+                    peer_addr=("127.0.0.1", 1),
+                )
+            self.assertEqual(getattr(raised.exception, "status", None), 403)
+
+    def test_public_health_rejects_undeclared_query_without_reading_worker_state(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = RecorderStore(root / "db.sqlite3", storage_root=root / "data")
+            service = RecorderService(store)
+            before = store.db_snapshot()
+            status, _headers, payload = service.handle_http("GET", "/v1/health?probe=1", {}, b"")
+            self.assertEqual(status, 400)
+            self.assertEqual(payload["error"]["code"], "VALIDATION_ERROR")
+            self.assertEqual(store.db_snapshot(), before)
+
     def test_catalog_is_authoritative_and_checked_in_coverage_is_generated(self):
         source = Path(__file__).parents[1].joinpath("recorder_next/http_contract.py").read_text()
         self.assertNotIn("from .openapi import", source)
@@ -165,8 +217,7 @@ class R25HttpContractTests(unittest.TestCase):
             "X-Recorder-Principal-Signature": "proof",
             "Content-Type": "application/json",
         }
-        with self.assertRaises(ValidationError):
-            validate_request(
+        validated = validate_request(
                 operation,
                 path="/v1/internal/schedule_create",
                 query={},
@@ -185,8 +236,9 @@ class R25HttpContractTests(unittest.TestCase):
                         "confirmation_text": "confirmed",
                     }
                 ).encode(),
-                network=True,
-            )
+            network=True,
+        )
+        self.assertEqual(validated["schedule_id"], "schedule-1")
 
     def test_openapi_is_executable_and_static_projection_matches(self):
         validate_openapi_contract()

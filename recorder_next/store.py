@@ -1251,7 +1251,7 @@ class RecorderStore:
     def _turn_row(self, conn: sqlite3.Connection, turn_id: str) -> sqlite3.Row:
         row = conn.execute("SELECT * FROM turns WHERE turn_id = ?", (turn_id,)).fetchone()
         if row is None:
-            raise NotFoundError(f"turn {turn_id} not found")
+            raise NotFoundError("turn not found")
         return row
 
     def _turn_payload(self, conn: sqlite3.Connection, turn_id: str) -> dict[str, Any]:
@@ -1474,6 +1474,33 @@ class RecorderStore:
         if row is None or row["status"] != "active":
             raise UnauthorizedError("device is not registered or has been revoked")
 
+    @staticmethod
+    def _validate_principal(principal: tuple[str, str] | None) -> tuple[str, str] | None:
+        if principal is None:
+            return None
+        if (
+            not isinstance(principal, tuple)
+            or len(principal) != 2
+            or any(not isinstance(value, str) or not value or "\x00" in value for value in principal)
+        ):
+            raise UnauthorizedError("verified request principal is invalid")
+        return principal
+
+    def _schedule_parent_for_principal_tx(
+        self,
+        conn: sqlite3.Connection,
+        parent_turn_id: str,
+        principal: tuple[str, str] | None,
+    ) -> sqlite3.Row:
+        parent = self._turn_row(conn, parent_turn_id)
+        if principal is None:
+            return parent
+        principal_user, principal_device = self._validate_principal(principal) or ("", "")
+        self._assert_device(conn, principal_user, principal_device)
+        if parent["user_id"] != principal_user:
+            raise NotFoundError("turn not found")
+        return parent
+
     def assert_active_device(self, user_id: str, device_id: str) -> None:
         """Validate a public owner proof without exposing device state."""
 
@@ -1493,9 +1520,9 @@ class RecorderStore:
             return
         if not isinstance(user_id, str) or not user_id or not isinstance(device_id, str) or not device_id:
             raise UnauthorizedError("a registered user and device are required")
-        if turn["user_id"] != user_id or turn["origin_device_id"] != device_id:
-            raise UnauthorizedError("turn is not owned by the authenticated origin device")
         self._assert_device(conn, user_id, device_id)
+        if turn["user_id"] != user_id or turn["origin_device_id"] != device_id:
+            raise NotFoundError("turn not found")
 
     def _assert_resource_owner_tx(
         self,
@@ -3357,15 +3384,20 @@ class RecorderStore:
     ) -> dict[str, Any]:
         schedule_id = self._schedule_identifier(schedule_id, "schedule_id")
         with self._read() as conn:
+            if user_id is None and device_id is not None:
+                raise UnauthorizedError("a registered user and device are required")
+            if user_id is not None:
+                if not isinstance(user_id, str) or not user_id or not isinstance(device_id, str) or not device_id:
+                    raise UnauthorizedError("a registered user and device are required")
+                self._assert_device(conn, user_id, device_id)
             owner = conn.execute(
                 "SELECT s.user_id, s.origin_device_id FROM schedules s WHERE s.schedule_id=?",
                 (schedule_id,),
             ).fetchone()
             if owner is None:
                 raise NotFoundError("schedule not found")
-            self._assert_resource_owner_tx(conn, owner["user_id"], user_id, device_id)
-            if user_id is not None and owner["origin_device_id"] != device_id:
-                raise UnauthorizedError("schedule is not owned by the authenticated origin device")
+            if user_id is not None and (owner["user_id"] != user_id or owner["origin_device_id"] != device_id):
+                raise NotFoundError("schedule not found")
             return self._schedule_payload(conn, schedule_id)
 
     def _commit_schedule_confirmation_tx(
@@ -3431,10 +3463,25 @@ class RecorderStore:
             raise ConflictError("parent turn already has a FINAL")
         return event
 
-    def _record_schedule_failure(self, parent_turn_id: str) -> dict[str, Any] | None:
+    def _record_schedule_failure(
+        self,
+        parent_turn_id: str,
+        *,
+        principal: tuple[str, str] | None = None,
+    ) -> dict[str, Any] | None:
+        principal = self._validate_principal(principal)
         try:
             with self._tx() as conn:
                 turn = self._turn_row(conn, parent_turn_id)
+                if principal is not None:
+                    principal_user, principal_device = principal
+                    self._assert_device(conn, principal_user, principal_device)
+                    if turn["user_id"] != principal_user:
+                        raise NotFoundError("turn not found")
+                    # Failure FINALs are authorized against the same active
+                    # origin that owns the parent, not merely the backend
+                    # principal that requested scheduling.
+                    self._assert_device(conn, turn["user_id"], turn["origin_device_id"])
                 if turn["final_event_version"]:
                     return self._turn_payload(conn, parent_turn_id)
                 return self._commit_protocol_final_tx(
@@ -3445,22 +3492,42 @@ class RecorderStore:
                     grace_seconds=0,
                     source_ref=f"recorder_protocol:schedule:{parent_turn_id}",
                 )
+        except (UnauthorizedError, NotFoundError):
+            return None
         except Exception:
             return None
 
-    def create_schedule(self, command: Mapping[str, Any]) -> dict[str, Any]:
+    def create_schedule(
+        self,
+        command: Mapping[str, Any],
+        *,
+        principal: tuple[str, str] | None = None,
+    ) -> dict[str, Any]:
+        principal = self._validate_principal(principal)
         parent_value = command.get("parent_turn_id") if isinstance(command, Mapping) else None
         try:
             parent_turn_id = self._validate_turn_id(parent_value)
         except Exception:
-            return self._create_schedule_tx(command)
+            return self._create_schedule_tx(command, principal=principal)
         try:
-            return self._create_schedule_tx(command)
+            return self._create_schedule_tx(command, principal=principal)
+        except (UnauthorizedError, NotFoundError):
+            raise
         except Exception:
-            self._record_schedule_failure(parent_turn_id)
+            try:
+                self._record_schedule_failure(parent_turn_id, principal=principal)
+            except Exception:
+                # The schedule operation's original failure is authoritative;
+                # a secondary failure receipt must not replace it.
+                pass
             raise
 
-    def _create_schedule_tx(self, command: Mapping[str, Any]) -> dict[str, Any]:
+    def _create_schedule_tx(
+        self,
+        command: Mapping[str, Any],
+        *,
+        principal: tuple[str, str] | None = None,
+    ) -> dict[str, Any]:
         command = dict(command)
         parent_turn_id = self._validate_turn_id(command.get("parent_turn_id"))
         schedule_id = self._schedule_identifier(
@@ -3500,15 +3567,31 @@ class RecorderStore:
         }
         request_sha = sha256_json(request)
         with self._tx() as conn:
-            existing = conn.execute("SELECT request_sha256 FROM schedules WHERE schedule_id=?", (schedule_id,)).fetchone()
+            parent = self._schedule_parent_for_principal_tx(conn, parent_turn_id, principal)
+            existing = conn.execute(
+                "SELECT request_sha256, user_id, parent_turn_id FROM schedules WHERE schedule_id=?",
+                (schedule_id,),
+            ).fetchone()
             if existing is not None:
+                if principal is not None and (
+                    existing["user_id"] != principal[0]
+                    or existing["parent_turn_id"] != parent_turn_id
+                ):
+                    raise NotFoundError("schedule not found")
                 if existing["request_sha256"] != request_sha:
                     raise ConflictError("schedule_id already has a different immutable definition")
                 return self._schedule_payload(conn, schedule_id)
-            by_request = conn.execute("SELECT schedule_id FROM schedules WHERE request_sha256=?", (request_sha,)).fetchone()
+            by_request = conn.execute(
+                "SELECT schedule_id, user_id, parent_turn_id FROM schedules WHERE request_sha256=?",
+                (request_sha,),
+            ).fetchone()
             if by_request is not None:
+                if principal is not None and (
+                    by_request["user_id"] != principal[0]
+                    or by_request["parent_turn_id"] != parent_turn_id
+                ):
+                    raise NotFoundError("schedule not found")
                 return self._schedule_payload(conn, by_request["schedule_id"])
-            parent = self._turn_row(conn, parent_turn_id)
             if parent["state"] in TERMINAL_TURN_STATES or parent["final_event_version"]:
                 raise ConflictError("schedule confirmation requires a parent turn without a FINAL")
             origin_device_id = command.get("origin_device_id") or parent["origin_device_id"]
@@ -3640,6 +3723,45 @@ class RecorderStore:
         if manifest != expected_manifest or existing_turn["initial_fingerprint"] != sha256_json(expected_manifest):
             raise ConflictError("deterministic scheduled turn envelope is incompatible")
 
+    def _validate_scheduled_occurrence_ownership_tx(
+        self,
+        conn: sqlite3.Connection,
+        occurrence: sqlite3.Row,
+        *,
+        require_active: bool = True,
+    ) -> None:
+        """Recheck schedule authority before any scheduled-turn write."""
+        parent = self._turn_row(conn, occurrence["parent_turn_id"])
+        if parent["user_id"] != occurrence["user_id"]:
+            raise ConflictError("scheduled occurrence parent user is inconsistent")
+        if parent["origin_device_id"] != occurrence["origin_device_id"]:
+            raise ConflictError("scheduled occurrence origin is inconsistent with its parent")
+        schedule_target = occurrence["schedule_delivery_target_device_id"]
+        occurrence_target = occurrence["delivery_target_device_id"]
+        targets = {item for item in (schedule_target, occurrence_target) if item}
+        if not targets:
+            raise ConflictError("scheduled occurrence has no durable delivery target")
+        for device_id in {occurrence["origin_device_id"], *targets}:
+            row = conn.execute(
+                "SELECT status FROM devices WHERE user_id=? AND device_id=?",
+                (occurrence["user_id"], device_id),
+            ).fetchone()
+            if row is None:
+                raise ConflictError("scheduled occurrence device binding is not registered")
+        if require_active:
+            self._assert_device(conn, occurrence["user_id"], occurrence["origin_device_id"])
+        for target in targets:
+            if require_active:
+                self._assert_device(conn, occurrence["user_id"], target)
+        project = conn.execute(
+            "SELECT default_session_key, status FROM projects WHERE stable_project_id=? AND user_id=?",
+            (occurrence["project_id"], occurrence["user_id"]),
+        ).fetchone()
+        if project is None or project["default_session_key"] != occurrence["session_key"]:
+            raise ConflictError("scheduled occurrence project/session is not active for its user")
+        if require_active and project["status"] != "active":
+            raise ConflictError("scheduled occurrence project/session is not active for its user")
+
     def claim_due_occurrence(
         self,
         *,
@@ -3697,6 +3819,8 @@ class RecorderStore:
             ).fetchone()
             if occurrence is None:
                 raise NotFoundError("scheduled occurrence not found")
+            is_replay = occurrence["state"] == "FIRED" and bool(occurrence["turn_id"])
+            self._validate_scheduled_occurrence_ownership_tx(conn, occurrence, require_active=not is_replay)
             turn_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"recorder-next:scheduled-turn:{schedule_id}:{trigger_instance_id}"))
             occurrence_target_device_id = occurrence["delivery_target_device_id"]
             schedule_target_device_id = occurrence["schedule_delivery_target_device_id"]
@@ -4425,7 +4549,7 @@ class RecorderStore:
         with self._tx() as conn:
             turn = self._turn_row(conn, turn_id)
             if turn["user_id"] != user_id:
-                raise UnauthorizedError("turn belongs to another user")
+                raise NotFoundError("turn not found")
             if device_id is not None:
                 self._assert_turn_owner_tx(conn, turn, user_id, device_id)
             now = self._now()

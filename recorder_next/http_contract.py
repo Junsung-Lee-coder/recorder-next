@@ -106,8 +106,13 @@ class Operation:
     deprecated: bool = False
     public: bool = False
     principal_policy: str = "principal"
+    requires_internal: bool = False
     responses: tuple[ResponseSpec, ...] = ()
     allow_empty_body_with_query_identity: bool = False
+
+    def __post_init__(self) -> None:
+        if self.requires_internal and not self.requires_principal:
+            raise ValueError("internal operations must require a verified principal")
 
     @property
     def requires_principal(self) -> bool:
@@ -192,6 +197,7 @@ def _errors(*statuses: int, forbidden: bool = False) -> tuple[ResponseSpec, ...]
     values = list(statuses)
     if forbidden:
         values.append(403)
+    values.append(408)
     seen: set[int] = set()
     result: list[ResponseSpec] = []
     for status in values:
@@ -229,6 +235,7 @@ def _op(
     deprecated: bool = False,
     public: bool = False,
     principal_policy: str = "principal",
+    requires_internal: bool = False,
     allow_empty_body_with_query_identity: bool = False,
 ) -> Operation:
     upper = method.upper()
@@ -245,6 +252,7 @@ def _op(
         deprecated,
         public,
         principal_policy,
+        requires_internal,
         responses,
         allow_empty_body_with_query_identity,
     )
@@ -280,9 +288,9 @@ _BASE_OPERATIONS: tuple[Operation, ...] = (
     _op("/v1/projects/{project_id}", "PATCH", request_model=PROJECT_PATCH, request_required=True, parameters=_protected(_path("project_id")), responses=_responses((_json_success(200, "ProjectResponse", "CAS update"),))),
     _op("/v1/turns/{turn_id}/archive", "POST", request_model=ARCHIVE_TURN, request_required=True, parameters=_protected(_path("turn_id", format="uuid")), responses=_responses((_json_success(200, "TurnResponse", "Archive-only turn retention"),))),
     _op("/v1/projects/{project_id}/archive", "POST", request_model=EXPECTED_VERSION, request_required=True, parameters=_protected(_path("project_id")), responses=_responses((_json_success(200, "ProjectResponse", "Archive-only transition"),))),
-    _op("/v1/internal/schedule_create", "POST", request_model=SCHEDULE_CREATE, request_required=True, parameters=_protected(_header("X-Recorder-Internal-Trusted", required=True)), responses=_responses((_json_success(201, "ScheduleResponse", "Durably scheduled with atomic confirmation FINAL"),), errors=(400, 401, 409, 413, 415, 500))),
-    _op("/v1/internal/scheduler/fire", "POST", request_model=SCHEDULER_FIRE, request_required=True, parameters=_protected(), responses=_responses((_json_success(200, "SchedulerFireResponse", "Scheduled FINAL readback"),), forbidden=True)),
-    _op("/v1/internal/scheduler/recover", "POST", request_model=SCHEDULER_RECOVER, request_required=True, parameters=_protected(), responses=_responses((_json_success(200, "SchedulerRecoveryResponse", "Recovery counts"),), forbidden=True)),
+    _op("/v1/internal/schedule_create", "POST", request_model=SCHEDULE_CREATE, request_required=True, parameters=_protected(), responses=_responses((_json_success(201, "ScheduleResponse", "Durably scheduled with atomic confirmation FINAL"),), errors=(400, 401, 409, 413, 415, 500), forbidden=True), requires_internal=True),
+    _op("/v1/internal/scheduler/fire", "POST", request_model=SCHEDULER_FIRE, request_required=True, parameters=_protected(), responses=_responses((_json_success(200, "SchedulerFireResponse", "Scheduled FINAL readback"),), forbidden=True), requires_internal=True),
+    _op("/v1/internal/scheduler/recover", "POST", request_model=SCHEDULER_RECOVER, request_required=True, parameters=_protected(), responses=_responses((_json_success(200, "SchedulerRecoveryResponse", "Recovery counts"),), forbidden=True), requires_internal=True),
     _op("/v1/schedules/{schedule_id}", "GET", parameters=_protected(_path("schedule_id")), responses=_responses((_json_success(200, "ScheduleResponse", "Schedule and occurrence readback"),))),
     _op("/v1/updates/{channel}/manifest", "GET", parameters=(_path("channel"), _header("If-None-Match")), responses=_responses((_json_success(200, "UpdateManifestResponse", "Current immutable channel manifest"), ResponseSpec(304, "ETag matched", None, None, ("ETag", "Cache-Control"), True)), errors=(400, 404, 500)), principal_policy="none"),
     _op("/v1/updates/{channel}/{generation}/{artifact_name}", "GET", parameters=(_path("channel"), _path("generation", schema_type="integer", minimum=1), _path("artifact_name"), _header("Range"), _header("If-Range"), _header("If-None-Match")), responses=_responses((ResponseSpec(200, "Hash-bound APK bytes", "BinaryBody", "application/vnd.android.package-archive", ("Content-Type", "Content-Length", "ETag", "Accept-Ranges", "Cache-Control")), ResponseSpec(206, "Byte range", "BinaryBody", "application/vnd.android.package-archive", ("Content-Type", "Content-Length", "ETag", "Accept-Ranges", "Cache-Control", "Content-Range")), ResponseSpec(304, "ETag matched", None, None, ("Content-Type", "Content-Length", "ETag", "Accept-Ranges", "Cache-Control"), True), ResponseSpec(416, "Unsatisfiable range", None, None, ("Content-Type", "Content-Length", "ETag", "Accept-Ranges", "Content-Range", "Cache-Control"), True)), errors=(400, 404, 409, 500)), principal_policy="none"),
@@ -301,12 +309,12 @@ _BASE_OPERATIONS: tuple[Operation, ...] = (
     _op("/v1/diagnostics", "GET", parameters=_protected(_query("category"), _query("stage"), _query("limit", schema_type="integer", minimum=1)), responses=_responses((_json_success(200, "DiagnosticListResponse", "Diagnostic metadata"),))),
     _op("/v1/diagnostics", "DELETE", request_model=DIAGNOSTICS_DELETE, request_required=True, parameters=_protected(), responses=_responses((_json_success(200, "DeletionReceipt", "Deletion receipt and tombstones"),), errors=(400, 401, 409, 413, 415, 500)), allow_empty_body_with_query_identity=True),
     _op("/v1/diagnostics/delete", "POST", request_model=DIAGNOSTICS_DELETE, request_required=True, parameters=_PRINCIPAL, responses=_responses((_json_success(200, "DeletionReceipt", "Deletion receipt and tombstones"),), errors=(400, 401, 409, 413, 415, 500))),
-    _op("/v1/internal/worker/claim", "POST", request_model=WORKER_CLAIM, request_required=True, parameters=_protected(), responses=_responses((_json_success(200, "WorkerClaimResponse", "Claim one durable worker lease"),), forbidden=True)),
-    _op("/v1/internal/worker/recover", "POST", request_model=WORKER_RECOVER, request_required=True, parameters=_protected(), responses=_responses((_json_success(200, "WorkerRecoveryResponse", "Recover expired worker leases"),), forbidden=True)),
-    _op("/v1/internal/worker/complete", "POST", request_model=WORKER_COMPLETE, request_required=True, parameters=_protected(), responses=_responses((_json_success(200, "WorkerMutationResponse", "Complete one durable worker lease"),), forbidden=True)),
-    _op("/v1/internal/worker/fail", "POST", request_model=WORKER_FAIL, request_required=True, parameters=_protected(), responses=_responses((_json_success(200, "WorkerMutationResponse", "Record one durable worker failure"),), forbidden=True)),
-    _op("/v1/internal/worker/run", "POST", request_model=WORKER_RUN, request_required=True, parameters=_protected(), responses=_responses((_json_success(200, "WorkerRunResponse", "Run one durable worker lease operation"),), forbidden=True)),
-    _op("/v1/internal/worker/health", "GET", parameters=_protected(), responses=_responses((_json_success(200, "WorkerHealth", "Bounded worker backlog and lease health"),), forbidden=True)),
+    _op("/v1/internal/worker/claim", "POST", request_model=WORKER_CLAIM, request_required=True, parameters=_protected(), responses=_responses((_json_success(200, "WorkerClaimResponse", "Claim one durable worker lease"),), forbidden=True), requires_internal=True),
+    _op("/v1/internal/worker/recover", "POST", request_model=WORKER_RECOVER, request_required=True, parameters=_protected(), responses=_responses((_json_success(200, "WorkerRecoveryResponse", "Recover expired worker leases"),), forbidden=True), requires_internal=True),
+    _op("/v1/internal/worker/complete", "POST", request_model=WORKER_COMPLETE, request_required=True, parameters=_protected(), responses=_responses((_json_success(200, "WorkerMutationResponse", "Complete one durable worker lease"),), forbidden=True), requires_internal=True),
+    _op("/v1/internal/worker/fail", "POST", request_model=WORKER_FAIL, request_required=True, parameters=_protected(), responses=_responses((_json_success(200, "WorkerMutationResponse", "Record one durable worker failure"),), forbidden=True), requires_internal=True),
+    _op("/v1/internal/worker/run", "POST", request_model=WORKER_RUN, request_required=True, parameters=_protected(), responses=_responses((_json_success(200, "WorkerRunResponse", "Run one durable worker lease operation"),), forbidden=True), requires_internal=True),
+    _op("/v1/internal/worker/health", "GET", parameters=_protected(), responses=_responses((_json_success(200, "WorkerHealth", "Bounded worker backlog and lease health"),), forbidden=True), requires_internal=True),
     _op("/v1/eavesdrop/{session_id}/segments/{segment_sequence}/route", "POST", request_model=EAVESDROP_ROUTE_PATH, request_required=True, parameters=_protected(_path("session_id"), _path("segment_sequence", schema_type="integer", minimum=0)), responses=_responses((_json_success(200, "RoutingDecisionResponse", "Idempotent fixed-project routing decision"),))),
     _op("/v1/eavesdrop/{session_id}/segments/route", "POST", request_model=EAVESDROP_ROUTE, request_required=True, parameters=_protected(_path("session_id")), responses=_responses((_json_success(200, "RoutingDecisionResponse", "Deprecated body-sequence routing alias"),)), operation_id="EavesdropRouteBodyAlias", deprecated=True),
     _op("/v1/eavesdrop/{session_id}/decisions", "GET", parameters=_protected(_path("session_id"), phone=True), responses=_responses((_json_success(200, "RoutingDecisionsResponse", "Eavesdrop routing decision ledger"),))),
@@ -345,6 +353,7 @@ def _head_operation(operation: Operation) -> Operation:
         operation.deprecated,
         operation.public,
         operation.principal_policy,
+        operation.requires_internal,
         responses,
     )
 
@@ -406,18 +415,31 @@ def _validate_parameter(parameter: Parameter, value: str, *, path: str) -> None:
         raise ValidationError(f"{path} has an invalid format")
 
 
-def validate_request(
+def _header_values(headers: Mapping[str, str], name: str) -> list[str]:
+    wanted = name.lower()
+    return [value for key, value in headers.items() if str(key).lower() == wanted]
+
+
+def _header_media_type(headers: Mapping[str, str]) -> str | None:
+    values = _header_values(headers, "Content-Type")
+    if len(values) != 1 or not isinstance(values[0], str):
+        return None
+    return values[0].split(";", 1)[0].strip().lower()
+
+
+def validate_request_headers(
     operation: Operation,
     *,
     path: str,
     query: Mapping[str, str],
     headers: Mapping[str, str],
-    body: bytes,
-    decoded: Mapping[str, Any] | None = None,
+    body_length: int,
     network: bool = False,
-) -> dict[str, Any] | None:
-    """Validate a request without invoking a handler or mutating state."""
+) -> None:
+    """Validate framing, route parameters, and body metadata before body read."""
 
+    if not isinstance(body_length, int) or isinstance(body_length, bool) or body_length < 0:
+        raise ValidationError("body length must be a non-negative integer")
     values = _path_values(operation, path)
     parameters_by_location = {
         location: {item.name: item for item in operation.parameters if item.location == location}
@@ -439,35 +461,70 @@ def validate_request(
             raise ValidationError("server time cannot be supplied by a client")
         _validate_parameter(parameter, value, path=parameter.name)
     for parameter in parameters_by_location["header"].values():
-        values_for_header = [value for key, value in headers.items() if str(key).lower() == parameter.name.lower()]
+        values_for_header = _header_values(headers, parameter.name)
         if len(values_for_header) > 1:
             raise ValidationError(f"duplicate {parameter.name} headers are not permitted")
         if parameter.required and not values_for_header and network:
             raise ValidationError(f"header {parameter.name} is required")
+    for framing_header in ("Content-Length", "Transfer-Encoding", "Content-Type"):
+        if len(_header_values(headers, framing_header)) > 1:
+            raise ValidationError(f"duplicate {framing_header} headers are not permitted")
+    transfer_values = _header_values(headers, "Transfer-Encoding")
+    if transfer_values and any(value.strip().lower() != "identity" for value in transfer_values):
+        raise ValidationError("Transfer-Encoding is not supported")
 
     if operation.method == "HEAD":
-        if body:
+        if body_length:
             raise ValidationError("HEAD requests do not accept a body")
-        return None
+        return
     if not operation.request_model:
-        if body:
+        if body_length:
             if operation.request_media_types == _BINARY:
-                if network:
-                    content_type = next((value for key, value in headers.items() if str(key).lower() == "content-type"), None)
-                    media = content_type.split(";", 1)[0].strip().lower() if isinstance(content_type, str) else None
-                    if media != "application/octet-stream":
-                        raise UnsupportedMediaType("chunk routes require an octet-stream body")
-                return None
+                if network and _header_media_type(headers) != "application/octet-stream":
+                    raise UnsupportedMediaType("chunk routes require an octet-stream body")
+                return
             raise ValidationError("request body is not declared for this operation")
         if operation.request_required:
             raise ValidationError("request body is required")
+        return
+    if body_length:
+        if network and _header_media_type(headers) not in operation.request_media_types:
+            raise UnsupportedMediaType("JSON routes require Content-Type: application/json")
+        return
+    if operation.request_required and not operation.allow_empty_body_with_query_identity:
+        required = {item.name for item in operation.request_model.fields if item.required}
+        if required:
+            try:
+                operation.request_model.validate({})
+            except ModelValidationError as exc:
+                raise ValidationError(str(exc)) from exc
+
+
+def validate_request(
+    operation: Operation,
+    *,
+    path: str,
+    query: Mapping[str, str],
+    headers: Mapping[str, str],
+    body: bytes,
+    decoded: Mapping[str, Any] | None = None,
+    network: bool = False,
+) -> dict[str, Any] | None:
+    """Validate a request without invoking a handler or mutating state."""
+
+    validate_request_headers(
+        operation,
+        path=path,
+        query=query,
+        headers=headers,
+        body_length=len(body),
+        network=network,
+    )
+    if operation.method == "HEAD":
+        return None
+    if not operation.request_model:
         return None
     if body:
-        if network:
-            content_type = next((value for key, value in headers.items() if str(key).lower() == "content-type"), None)
-            media = content_type.split(";", 1)[0].strip().lower() if isinstance(content_type, str) else None
-            if media not in operation.request_media_types:
-                raise UnsupportedMediaType("JSON routes require Content-Type: application/json")
         if decoded is None:
             try:
                 decoded_value = strict_json_loads(body)
@@ -479,12 +536,6 @@ def validate_request(
             raise ValidationError("request body must be a JSON object")
     else:
         decoded_value = {}
-        if operation.request_required and not (operation.allow_empty_body_with_query_identity and query.get("user_id") and query.get("device_id")):
-            # Optional-field internal controls intentionally accept an empty
-            # object, while required public DTOs fail closed.
-            required = {item.name for item in operation.request_model.fields if item.required}
-            if required:
-                operation.request_model.validate(decoded_value)
     if network:
         internal_names = {item.name for item in operation.request_model.fields if item.internal}
         if internal_names.intersection(decoded_value):
@@ -985,6 +1036,8 @@ def _component_parameters() -> dict[str, dict[str, Any]]:
 
 def _operation_document(operation: Operation) -> dict[str, Any]:
     document: dict[str, Any] = {"operationId": operation.operation_id, "x-handler-key": operation.handler_key, "responses": {}}
+    if operation.requires_internal:
+        document["x-recorder-internal-principal"] = True
     public_parameters = [item for item in operation.parameters if not item.internal]
     if public_parameters:
         document["parameters"] = [{"$ref": f"#/components/parameters/{_parameter_component_name(item)}"} for item in public_parameters]
@@ -1061,6 +1114,7 @@ def operation_coverage() -> dict[str, Any]:
                 "path": operation.path_template,
                 "operation_id": operation.operation_id,
                 "handler_key": operation.handler_key,
+                "requires_internal": operation.requires_internal,
                 "request": {"required": operation.request_required, "media_types": list(operation.request_media_types), "schema": operation.request_model.name if operation.request_model else None},
                 "responses": [{"status": item.status, "body": "none" if item.no_body else item.schema_name, "media_type": item.media_type, "headers": list(item.headers)} for item in operation.responses],
             }
@@ -1079,5 +1133,5 @@ OPENAPI = build_openapi_document()
 
 __all__ = [
     "OPENAPI", "Operation", "Parameter", "ResponseSpec", "build_openapi_document", "match_operation", "operation_catalog_fingerprint",
-    "operation_coverage", "project_response", "response_schemas", "route_catalog", "validate_openapi_contract", "validate_request", "validate_response",
+    "operation_coverage", "project_response", "response_schemas", "route_catalog", "validate_openapi_contract", "validate_request", "validate_request_headers", "validate_response",
 ]

@@ -11,7 +11,7 @@ import uuid
 from pathlib import Path
 
 from recorder_next.clock import DeterministicClock
-from recorder_next.errors import ConflictError, NotReadyError, UnauthorizedError, ValidationError
+from recorder_next.errors import ConflictError, NotFoundError, NotReadyError, UnauthorizedError, ValidationError
 from recorder_next.http import create_http_server
 from recorder_next.models import TTSResult
 from recorder_next.service import RecorderService
@@ -239,6 +239,7 @@ class ScheduledFinalStoreTests(unittest.TestCase):
             store.create_schedule(_schedule_command(project, fire_at="2026-08-26T00:00:00+00:00"))
             first = store.fire_due_schedules(owner="scheduler")[0]
             occurrence = store.get_schedule("schedule-1")["occurrences"][0]
+            store.revoke_device("schedule-user", "watch-1", actor_device_id="phone-1")
             before_replay = store.db_snapshot()
 
             replay = store.commit_scheduled_occurrence(
@@ -676,12 +677,27 @@ class ScheduledFinalStoreTests(unittest.TestCase):
 
 
 class ScheduledFinalHTTPAndMigrationTests(unittest.TestCase):
+    def test_principal_aware_schedule_create_accepts_backend_device_for_owned_parent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            clock = DeterministicClock("2026-08-26T00:00:00+00:00")
+            store, _parent, project = _accepted_parent(root, clock)
+            store.register_device("schedule-user", "backend-1", "phone")
+            command = _schedule_command(project, fire_at="2026-08-26T00:00:10+00:00")
+            result = store.create_schedule(command, principal=("schedule-user", "backend-1"))
+            self.assertEqual(result["schedule_id"], "schedule-1")
+
     def test_trusted_adapter_http_and_readback_surfaces(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             clock = DeterministicClock("2026-08-26T00:00:00+00:00")
             store, _, project = _accepted_parent(root, clock)
-            service = RecorderService(store)
+            store.register_device("schedule-user", "backend-1", "phone")
+            service = RecorderService(
+                store,
+                ingress_secret="test-secret",
+                internal_worker_principals=(("schedule-user", "backend-1"),),
+            )
             server = create_http_server(service, host="127.0.0.1", port=0)
             try:
                 self.assertNotIn(server.server_address[1], {5000, 8642})
@@ -714,6 +730,7 @@ class ScheduledFinalHTTPAndMigrationTests(unittest.TestCase):
                 "/v1/internal/schedule_create",
                 {},
                 json.dumps({**command, "schedule_id": "schedule-denied"}).encode(),
+                peer_addr=("127.0.0.1", 1),
             )
             self.assertEqual(denied, 401)
 
@@ -722,7 +739,12 @@ class ScheduledFinalHTTPAndMigrationTests(unittest.TestCase):
             root = Path(tmp)
             clock = DeterministicClock("2026-08-26T00:00:00+00:00")
             store, _, project = _accepted_parent(root, clock)
-            service = RecorderService(store)
+            store.register_device("schedule-user", "backend-1", "phone")
+            service = RecorderService(
+                store,
+                ingress_secret="test-secret",
+                internal_worker_principals=(("schedule-user", "backend-1"),),
+            )
             server = create_http_server(service, host="127.0.0.1", port=0)
             try:
                 self.assertNotIn(server.server_address[1], {5000, 8642})
@@ -741,6 +763,7 @@ class ScheduledFinalHTTPAndMigrationTests(unittest.TestCase):
                     "/v1/internal/schedule_create",
                     headers,
                     json.dumps({**command, "schedule_id": f"schedule-denied-{index}"}).encode(),
+                    peer_addr=("127.0.0.1", 1),
                 )
                 self.assertEqual(denied, 401)
                 self.assertEqual(store.db_snapshot(), before)
@@ -753,6 +776,68 @@ class ScheduledFinalHTTPAndMigrationTests(unittest.TestCase):
             clock.advance(seconds=10)
             fired = service.run_scheduler(owner="in-process-scheduler", now=clock.now())
             self.assertEqual(len(fired), 1)
+
+    def test_foreign_schedule_parent_is_not_enumerable_and_cannot_receive_failure_final(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            clock = DeterministicClock("2026-08-26T00:00:00+00:00")
+            store, _parent, project = _accepted_parent(root, clock)
+            store.register_device("schedule-user", "backend-1", "phone")
+            other_turn_id = "018f5a2e-7b6e-7abc-8d11-1234567890f2"
+            store.register_device("other-user", "other-watch", "watch")
+            other_manifest = _manifest(other_turn_id, user="other-user", device="other-watch", project_number="P-2")
+            store.create_turn(other_manifest)
+            payload = b"remind me"
+            store.put_chunk(other_turn_id, "text-1", 0, payload)
+            store.finish_part(
+                other_turn_id,
+                "text-1",
+                total_chunks=1,
+                total_bytes=len(payload),
+                whole_stream_sha256=hashlib.sha256(payload).hexdigest(),
+            )
+            store.accept_turn(other_turn_id)
+            other_project = store.create_project("other-user", project_number="P-2", name="Other project")
+            other_command = {
+                **_schedule_command(
+                    other_project,
+                    fire_at="2026-08-26T00:00:10+00:00",
+                    origin="other-watch",
+                    target="other-watch",
+                    schedule_id="foreign-schedule",
+                ),
+                "parent_turn_id": other_turn_id,
+            }
+            store.create_schedule(other_command)
+            command = _schedule_command(project, fire_at="2026-08-26T00:00:10+00:00", schedule_id="foreign-schedule")
+            before = store.db_snapshot()
+            with self.assertRaises(NotFoundError):
+                store.create_schedule(command, principal=("schedule-user", "backend-1"))
+            self.assertEqual(store.db_snapshot(), before)
+            with self.assertRaises(NotFoundError):
+                store.get_schedule("foreign-schedule", user_id="schedule-user", device_id="backend-1")
+            self.assertEqual(store.get_turn(other_turn_id)["final_event_version"], 1)
+
+    def test_scheduled_commit_rechecks_active_origin_before_turn_write(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            clock = DeterministicClock("2026-08-26T00:00:00+00:00")
+            store, _parent, project = _accepted_parent(root, clock)
+            store.create_schedule(_schedule_command(project, fire_at="2026-08-26T00:00:00+00:00"))
+            claim = store.claim_due_occurrence(owner="scheduler", now=clock.now())
+            assert claim is not None
+            store.revoke_device("schedule-user", "watch-1", actor_device_id="phone-1")
+            before = store.db_snapshot()
+            with self.assertRaises(UnauthorizedError):
+                store.commit_scheduled_occurrence(
+                    claim["schedule_id"],
+                    claim["trigger_instance_id"],
+                    owner="scheduler",
+                    now=clock.now(),
+                )
+            after = store.db_snapshot()
+            self.assertEqual(after["turns"], before["turns"])
+            self.assertEqual(after["events"], before["events"])
 
     def test_r4_database_upgrades_additively_to_scheduled_schema(self):
         with tempfile.TemporaryDirectory() as tmp:

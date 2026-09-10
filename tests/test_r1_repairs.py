@@ -390,7 +390,7 @@ class RecorderR1RepairTests(unittest.TestCase):
                 {},
                 b"",
             )
-            self.assertEqual(status, 401)
+            self.assertEqual(status, 404)
             status, _, response = service.handle_http(
                 "GET",
                 f"/v1/outbox?user_id=attacker&device_id=shared-phone",
@@ -535,6 +535,73 @@ class RecorderR1RepairTests(unittest.TestCase):
                         self.assertIn(b"Connection: close", raw)
                         self.assertNotIn(b"200 OK", raw)
                         sock.close()
+            finally:
+                server.shutdown()
+                server.server_close()
+
+    def test_expect_continue_authenticates_before_body_and_preserves_valid_body(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = RecorderStore(root / "db.sqlite3", storage_root=root / "data")
+            store.register_device("repair-user", "repair-phone", "phone")
+            service = RecorderService(store, ingress_secret=INGRESS_SECRET)
+            server = create_http_server(service, port=0)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                host = "127.0.0.1"
+                port = int(server.server_address[1])
+                denied = socket.create_connection((host, port), timeout=2)
+                denied.sendall(
+                    b"POST /v1/turns HTTP/1.1\r\nHost: localhost\r\nExpect: 100-continue\r\n"
+                    b"Content-Type: application/json\r\nContent-Length: 128\r\n\r\n"
+                )
+                denied_response = b""
+                while True:
+                    part = denied.recv(4096)
+                    if not part:
+                        break
+                    denied_response += part
+                denied.close()
+                self.assertIn(b"HTTP/1.1 401", denied_response)
+                self.assertNotIn(b"100 Continue", denied_response)
+                self.assertEqual(store.db_snapshot()["turns"], 0)
+
+                turn_id = "018f5a2e-7b6e-7abc-8d11-1234567899f1"
+                body = json.dumps(
+                    {
+                        **BASE_TURN,
+                        "turn_id": turn_id,
+                        "parts": [],
+                        "text": "expect body",
+                    }
+                ).encode()
+                signature = hmac.new(INGRESS_SECRET.encode(), b"repair-user\x00repair-phone", hashlib.sha256).hexdigest()
+                valid = socket.create_connection((host, port), timeout=2)
+                valid.settimeout(2)
+                valid.sendall(
+                    (
+                        f"POST /v1/turns HTTP/1.1\r\nHost: localhost\r\nExpect: 100-continue\r\n"
+                        f"Content-Type: application/json\r\nContent-Length: {len(body)}\r\n"
+                        "X-Recorder-Principal-User: repair-user\r\n"
+                        "X-Recorder-Principal-Device: repair-phone\r\n"
+                        f"X-Recorder-Principal-Signature: {signature}\r\n\r\n"
+                    ).encode()
+                )
+                interim = b""
+                while b"\r\n\r\n" not in interim:
+                    interim += valid.recv(4096)
+                self.assertIn(b"HTTP/1.1 100 Continue", interim)
+                valid.sendall(body)
+                valid_response = b""
+                while True:
+                    part = valid.recv(4096)
+                    if not part:
+                        break
+                    valid_response += part
+                valid.close()
+                self.assertIn(b"HTTP/1.1 202", valid_response)
+                self.assertIn(b'"state":"ACCEPTED"', valid_response)
             finally:
                 server.shutdown()
                 server.server_close()

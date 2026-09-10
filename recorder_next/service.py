@@ -44,7 +44,7 @@ from .config import RecorderConfig
 from .errors import ForbiddenError, GatewayRequestTooLargeError, LeaseConflict, NotFoundError, RecorderError, UnauthorizedError, UnsupportedMediaType, ValidationError
 from .features import DurableWorker
 from .hermes_wire import GatewayRequestTooLarge, SubmissionContext, WirePolicy, estimate_run_body_upper_bound, serialize_json
-from .http_contract import match_operation, project_response, validate_request, validate_response
+from .http_contract import match_operation, project_response, validate_request, validate_request_headers, validate_response
 from .ingress_contract import strict_json_loads
 from .media import MediaValidationError, validate_wav
 from .models import AsrResult, HermesResult, RouterDecision, TTSResult
@@ -1011,8 +1011,15 @@ class RecorderService:
     def get_ingress_for_turn(self, turn_id: str) -> dict[str, Any] | None:
         return self.store.get_ingress_for_turn(turn_id)
 
-    def schedule_create(self, command: Mapping[str, Any]) -> dict[str, Any]:
-        return self.schedule_adapter.schedule_create(command)
+    def schedule_create(
+        self,
+        command: Mapping[str, Any],
+        *,
+        principal: tuple[str, str] | None = None,
+    ) -> dict[str, Any]:
+        if principal is None:
+            return self.schedule_adapter.schedule_create(command)
+        return self.schedule_adapter.schedule_create(command, principal=principal)
 
     def run_scheduler(
         self,
@@ -1544,15 +1551,11 @@ class RecorderService:
         self.store.assert_active_device(user_id, device_id)
         return user_id, device_id
 
-    def _verify_network_principal(
+    def _verify_principal_headers(
         self,
         query: Mapping[str, str],
         headers: Mapping[str, str],
-        body: bytes,
-        *,
-        path: str,
-        raw_chunk: bool = False,
-    ) -> dict[str, Any] | None:
+    ) -> tuple[str, str]:
         if self._ingress_secret is None:
             raise UnauthorizedError("authenticated ingress is not configured")
         principal_names = (
@@ -1577,6 +1580,9 @@ class RecorderService:
         # authority boundary.  In particular this prevents a revoked identity
         # from reaching the registration/worker handlers.
         self.store.assert_active_device(principal_user, principal_device)
+        for name in ("X-Recorder-User-ID", "X-Recorder-Device-ID"):
+            if len(self._header_values(headers, name)) > 1:
+                raise ValidationError(f"duplicate {name} headers are not permitted")
         query_pairs = {key: query.get(key) for key in ("user_id", "device_id", "phone_device_id")}
         claimed_header_user = self._header_value(headers, "X-Recorder-User-ID")
         claimed_header_device = self._header_value(headers, "X-Recorder-Device-ID")
@@ -1590,6 +1596,20 @@ class RecorderService:
             expected_value = principal_user if key == "user_id" else principal_device
             if value != expected_value:
                 raise UnauthorizedError("request identity does not match verified principal")
+        return principal_user, principal_device
+
+    def _verify_network_principal(
+        self,
+        query: Mapping[str, str],
+        headers: Mapping[str, str],
+        body: bytes,
+        *,
+        path: str,
+        raw_chunk: bool = False,
+        principal: tuple[str, str] | None = None,
+    ) -> dict[str, Any] | None:
+        principal = principal or self._verify_principal_headers(query, headers)
+        principal_user, principal_device = principal
         content_type = self._header_value(headers, "Content-Type")
         media_type = content_type.split(";", 1)[0].strip().lower() if isinstance(content_type, str) else None
         if body and not raw_chunk and media_type != "application/json":
@@ -1609,17 +1629,81 @@ class RecorderService:
                 value = decoded.get(key)
                 if value is None:
                     continue
+                if key == "origin_device_id" and path == "/v1/internal/schedule_create":
+                    # A scheduler principal is an internal backend identity;
+                    # the durable schedule origin is authorized against the
+                    # parent turn in RecorderStore.
+                    continue
                 expected_value = principal_user if key == "user_id" else principal_device
                 if value != expected_value:
                     raise UnauthorizedError("request identity does not match verified principal")
             return decoded
         return None
 
-    def _assert_worker_principal(self, headers: Mapping[str, str]) -> None:
-        user = self._header_value(headers, "X-Recorder-Principal-User")
-        device = self._header_value(headers, "X-Recorder-Principal-Device")
-        if not self._internal_worker_principals or (user, device) not in self._internal_worker_principals:
+    def _assert_internal_principal(self, principal: tuple[str, str]) -> None:
+        if not self._internal_worker_principals or principal not in self._internal_worker_principals:
             raise ForbiddenError("worker controls are not enabled for this principal")
+
+    def _assert_worker_principal(self, principal: tuple[str, str]) -> None:
+        """Compatibility name for callers that used the old worker gate."""
+        self._assert_internal_principal(principal)
+
+    def _prepare_http_request(
+        self,
+        method: str,
+        target: str,
+        headers: Mapping[str, str],
+        *,
+        body_length: int,
+        peer_addr: tuple[str, int] | None,
+    ) -> tuple[str, dict[str, str], list[str], Any, tuple[str, str] | None]:
+        requested_method = method.upper()
+        parsed = urlsplit(target)
+        path = parsed.path.rstrip("/") or "/"
+        query_pairs = parse_qsl(parsed.query, keep_blank_values=True, strict_parsing=False)
+        query_counts: dict[str, int] = {}
+        for key, _value in query_pairs:
+            query_counts[key] = query_counts.get(key, 0) + 1
+        query = dict(query_pairs)
+        segments = [unquote(item) for item in path.split("/") if item]
+        operation = match_operation(path, requested_method)
+        network = peer_addr is not None
+        principal: tuple[str, str] | None = None
+        if network and operation.requires_principal:
+            principal = self._verify_principal_headers(query, headers)
+            if operation.requires_internal:
+                self._assert_internal_principal(principal)
+        if any(count > 1 for count in query_counts.values()):
+            raise ValidationError("duplicate query parameters are not permitted")
+        validate_request_headers(
+            operation,
+            path=path,
+            query=query,
+            headers=headers,
+            body_length=body_length,
+            network=network,
+        )
+        return path, query, segments, operation, principal
+
+    def preflight_http(
+        self,
+        method: str,
+        target: str,
+        headers: Mapping[str, str],
+        *,
+        body_length: int,
+        peer_addr: tuple[str, int],
+    ) -> None:
+        """Authenticate and validate an HTTP request without reading its body."""
+        if body_length > self._wire_policy.gateway_max_request_bytes:
+            raise GatewayRequestTooLargeError("request exceeds the configured Gateway limit")
+        self._prepare_http_request(
+            method,
+            target,
+            headers,
+            body_length=body_length,
+            peer_addr=peer_addr,
+        )
 
     def _handle_http(
         self,
@@ -1634,23 +1718,13 @@ class RecorderService:
         method = requested_method
         if method == "HEAD":
             method = "GET"
-        parsed = urlsplit(target)
-        path = parsed.path.rstrip("/") or "/"
-        query_pairs = parse_qsl(parsed.query, keep_blank_values=True, strict_parsing=False)
-        query_counts: dict[str, int] = {}
-        for key, _value in query_pairs:
-            query_counts[key] = query_counts.get(key, 0) + 1
-        if any(count > 1 for count in query_counts.values()):
-            raise ValidationError("duplicate query parameters are not permitted")
-        query = dict(query_pairs)
-        segments = [unquote(item) for item in path.split("/") if item]
-        operation = match_operation(path, requested_method)
-        if method == "GET" and path in {"/healthz", "/v1/health"}:
-            return 200, {}, {"status": "ok", "product_identity": "recorder-next-server-product-items-1-through-8", "api_version": "v1", "worker": self.store.worker_health()}
-        if method == "GET" and path == "/v1/openapi.json":
-            from .openapi import OPENAPI
-
-            return 200, {}, OPENAPI
+        path, query, segments, operation, principal = self._prepare_http_request(
+            requested_method,
+            target,
+            headers,
+            body_length=len(body),
+            peer_addr=peer_addr,
+        )
         decoded_payload: dict[str, Any] | None = None
 
         def json_body() -> dict[str, Any]:
@@ -1661,7 +1735,7 @@ class RecorderService:
 
         if peer_addr is not None and operation.requires_principal:
             raw_chunk = len(segments) == 7 and segments[:2] == ["v1", "turns"] and segments[3] == "parts" and segments[5] == "chunks"
-            decoded_payload = self._verify_network_principal(query, headers, body, path=path, raw_chunk=raw_chunk)
+            decoded_payload = self._verify_network_principal(query, headers, body, path=path, raw_chunk=raw_chunk, principal=principal)
             if "now" in query:
                 raise ValidationError("server time cannot be supplied by a client")
         decoded_payload = validate_request(
@@ -1673,9 +1747,13 @@ class RecorderService:
             decoded=decoded_payload,
             network=peer_addr is not None,
         )
+        if method == "GET" and path in {"/healthz", "/v1/health"}:
+            return 200, {}, {"status": "ok", "product_identity": "recorder-next-server-product-items-1-through-8", "api_version": "v1", "worker": self.store.worker_health()}
+        if method == "GET" and path == "/v1/openapi.json":
+            from .openapi import OPENAPI
+
+            return 200, {}, OPENAPI
         if segments[:3] == ["v1", "internal", "worker"] and len(segments) == 4 and method == "POST":
-            if peer_addr is not None:
-                self._assert_worker_principal(headers)
             payload = json_body()
             action = segments[3]
             if action == "claim":
@@ -1745,8 +1823,6 @@ class RecorderService:
             )
             return result["status"], result["headers"], result["body"]
         if segments[:4] == ["v1", "internal", "worker", "health"] and method == "GET":
-            if peer_addr is not None:
-                self._assert_worker_principal(headers)
             return 200, {}, self.store.worker_health(now=query.get("now"))
         if segments[:2] == ["v1", "history"] and len(segments) == 2 and method == "GET":
             user_id, _device_id = self._authenticated_owner(query, headers)
@@ -1872,9 +1948,10 @@ class RecorderService:
                 self.store.assert_active_device(user_id, device_id)
             return 200, {}, self.store.delete_diagnostics(user_id, device_id, now=query.get("now") or payload.get("now"))
         if segments[:3] == ["v1", "internal", "schedule_create"] and method == "POST":
-            if self._header_value(headers, "X-Recorder-Internal-Trusted") != "1":
-                raise UnauthorizedError("schedule_create requires the trusted Recorder adapter")
-            return 201, {}, self.schedule_create(json_body())
+            return 201, {}, self.schedule_create(
+                json_body(),
+                principal=principal if peer_addr is not None else None,
+            )
         if segments[:3] == ["v1", "internal", "scheduler"] and len(segments) == 4 and segments[3] == "fire" and method == "POST":
             payload = json_body()
             owner = self._json_string(payload, "owner") if "owner" in payload else "scheduler-1"

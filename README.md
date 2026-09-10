@@ -102,6 +102,24 @@ must agree with matching query, header, and JSON fields, and must be an active
 registered device. Legacy `X-Recorder-User-ID` and `X-Recorder-Device-ID`
 headers are optional matching assertions.
 
+Internal worker and scheduler controls use the same signed principal, but also
+require the exact active `(user_id, device_id)` pair configured in
+`internal_worker_principals`. The legacy `X-Recorder-Internal-Trusted` header
+does not grant access; neither loopback, an owner label, nor a device name by
+itself is a privilege. Internal requests are authenticated and checked before
+their request body is read. Schedule creation may act for the principal's own
+client-origin turn, while the parent turn, project, session, origin device, and
+delivery target are checked transactionally for that user.
+
+The stdlib listener admits at most eight concurrent connections and uses a
+backlog of sixteen. Request headers have a 64 KiB limit and a five-second
+absolute/idle read budget. After admission, bodies use a thirty-second
+absolute/five-second idle budget and the configured request-size limit (capped
+at 10,000,000 bytes); response writes use the same thirty-second absolute and
+five-second idle limits. Each connection handles one request and closes. The
+server validates framing, authentication, and the operation contract before
+consuming a declared body, including `Expect: 100-continue` requests.
+
 When the Hermes provider is enabled, `hermes_api_key_file` names an owner-only
 credential file containing exactly one ASCII `API_SERVER_KEY=<value>` entry.
 The adapter reads it at startup and sends an in-memory Bearer authorization
