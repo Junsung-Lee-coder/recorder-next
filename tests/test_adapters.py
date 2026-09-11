@@ -270,6 +270,20 @@ class HermesAdapterContractTests(unittest.TestCase):
                     elif case == "unsupported":
                         self.send_header("Content-Length", str(len(body)))
                         self.send_header("Content-Encoding", "gzip")
+                    elif case == "duplicate-content-encoding":
+                        self.send_header("Content-Length", str(len(body)))
+                        self.send_header("Content-Encoding", "identity")
+                        self.send_header("Content-Encoding", "gzip")
+                    elif case == "unsupported-transfer-encoding":
+                        self.send_header("Content-Length", str(len(body)))
+                        self.send_header("Transfer-Encoding", "compress")
+                    elif case == "combined-transfer-encoding":
+                        self.send_header("Content-Length", str(len(body)))
+                        self.send_header("Transfer-Encoding", "chunked, compress")
+                    elif case == "duplicate-transfer-encoding":
+                        self.send_header("Content-Length", str(len(body)))
+                        self.send_header("Transfer-Encoding", "compress")
+                        self.send_header("Transfer-Encoding", "compress")
                     elif case == "oversize":
                         self.send_header("Content-Length", "1024")
                     elif case == "oversize-body":
@@ -295,7 +309,16 @@ class HermesAdapterContractTests(unittest.TestCase):
         thread.start()
         endpoint = f"http://127.0.0.1:{server.server_port}"
         try:
-            for case in ("truncated", "duplicate", "unsupported", "bad-chunk"):
+            for case in (
+                "truncated",
+                "duplicate",
+                "unsupported",
+                "duplicate-content-encoding",
+                "unsupported-transfer-encoding",
+                "combined-transfer-encoding",
+                "duplicate-transfer-encoding",
+                "bad-chunk",
+            ):
                 for request_method in ("json", "bytes"):
                     with self.subTest(case=case, request_method=request_method):
                         provider = _HTTPProvider(f"{endpoint}/{case}", timeout=1.0, credential_file=None)
@@ -348,7 +371,11 @@ class HermesAdapterContractTests(unittest.TestCase):
                     self.close_connection = True
                     self.send_response(200)
                     self.send_header("Content-Type", "application/json")
-                    self.send_header("Content-Length", "4")
+                    if self.path.endswith("/unsupported-transfer"):
+                        self.send_header("Content-Length", "2")
+                        self.send_header("Transfer-Encoding", "compress")
+                    else:
+                        self.send_header("Content-Length", "4")
                     self.end_headers()
                     self.wfile.write(b"{}")
                     self.wfile.flush()
@@ -374,6 +401,36 @@ class HermesAdapterContractTests(unittest.TestCase):
             self.assertEqual(result.transcript, "fallback transcript")
             self.assertEqual(result.metadata["winner"], "fallback")
             self.assertEqual(result.metadata["fallback_count"], 1)
+
+            unsupported_primary = HttpASRProvider(
+                f"{endpoint}/unsupported-transfer",
+                model="primary",
+                timeout=1.0,
+                credential_file=None,
+            )
+            unsupported_chain = ProviderChain(
+                "asr",
+                [
+                    ProviderTarget(
+                        "primary",
+                        "asr",
+                        "http-asr",
+                        unsupported_primary,
+                        declared={"endpoint": unsupported_primary.endpoint, "model": "primary"},
+                    ),
+                    ProviderTarget(
+                        "fallback",
+                        "asr",
+                        "fixture",
+                        fallback,
+                        declared={"endpoint": "http://127.0.0.1:1", "model": "fallback"},
+                    ),
+                ],
+            )
+            unsupported_result = unsupported_chain.execute_asr(canonical_wav(), turn_id="turn-unsupported")
+            self.assertEqual(unsupported_result.transcript, "fallback transcript")
+            self.assertEqual(unsupported_result.metadata["winner"], "fallback")
+            self.assertEqual(unsupported_result.metadata["fallback_count"], 1)
         finally:
             server.shutdown()
             server.server_close()

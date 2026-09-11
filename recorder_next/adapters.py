@@ -309,6 +309,42 @@ def _read_bounded_response(response: Any, limit: int, *, deadline_at: float | No
     """Read a bounded response while enforcing one monotonic deadline."""
 
     headers = getattr(response, "headers", None)
+    def header_values(name: str) -> list[Any]:
+        if headers is None:
+            return []
+        get_all = getattr(headers, "get_all", None)
+        if callable(get_all):
+            values = get_all(name)
+            if values is not None:
+                if isinstance(values, (str, bytes)):
+                    return [values]
+                return list(values)
+        get = getattr(headers, "get", None)
+        value = get(name) if callable(get) else None
+        return [] if value is None else [value]
+
+    content_encoding_values = header_values("Content-Encoding")
+    content_encodings = [
+        coding.strip().lower()
+        for value in content_encoding_values
+        if isinstance(value, str)
+        for coding in value.split(",")
+    ]
+    if any(not isinstance(value, str) for value in content_encoding_values) or (
+        content_encodings and (len(content_encodings) != 1 or content_encodings[0] not in {"", "identity"})
+    ):
+        raise _ProviderResponseFramingError("provider response Content-Encoding is unsupported or duplicated")
+    transfer_encoding_values = header_values("Transfer-Encoding")
+    transfer_encodings = [
+        coding.strip().lower()
+        for value in transfer_encoding_values
+        if isinstance(value, str)
+        for coding in value.split(",")
+    ]
+    if any(not isinstance(value, str) for value in transfer_encoding_values) or (
+        transfer_encodings and (len(transfer_encodings) != 1 or transfer_encodings[0] != "chunked")
+    ):
+        raise _ProviderResponseFramingError("provider response Transfer-Encoding is unsupported or duplicated")
     declared_values = headers.get_all("Content-Length") if headers is not None and hasattr(headers, "get_all") else None
     if declared_values is not None and len(declared_values) != 1:
         raise _ProviderResponseFramingError("provider response Content-Length is duplicated")
@@ -323,9 +359,6 @@ def _read_bounded_response(response: Any, limit: int, *, deadline_at: float | No
             raise _ProviderResponseFramingError("provider response Content-Length is invalid")
         if declared_size > limit:
             raise _ProviderResponseTooLargeError("provider response exceeds the configured limit")
-    encoding = headers.get("Content-Encoding") if headers is not None else None
-    if encoding is not None and encoding.strip().lower() not in {"", "identity"}:
-        raise _ProviderResponseFramingError("provider response Content-Encoding is unsupported")
     chunks: list[bytes] = []
     total = 0
     while total <= limit:
