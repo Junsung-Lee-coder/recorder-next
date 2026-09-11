@@ -10,11 +10,17 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from recorder_next.adapters import (
     HttpHermesGateway,
+    HttpASRProvider,
+    ProviderChain,
     ProviderFailure,
+    ProviderTarget,
+    StaticASRProvider,
     _HTTPProvider,
     _read_bounded_response,
     _urlopen_no_redirect,
 )
+from recorder_next.models import AsrResult
+from tests.r25_test_helpers import canonical_wav
 
 
 class HermesAdapterContractTests(unittest.TestCase):
@@ -232,6 +238,146 @@ class HermesAdapterContractTests(unittest.TestCase):
         )
         self.assertIsNotNone(result)
         self.assertEqual(result.assistant_message_id, "authoritative-id")
+
+    def test_provider_request_methods_distinguish_framing_from_size_failures(self):
+        class ProviderResponseHandler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, format, *args):
+                pass
+
+            def do_POST(self):
+                try:
+                    request_length = int(self.headers.get("Content-Length", "0"))
+                    if request_length:
+                        self.rfile.read(request_length)
+                    case = self.path.rsplit("/", 1)[-1]
+                    self.close_connection = True
+                    if case == "truncated":
+                        self.send_response(200)
+                        self.send_header("Content-Type", "application/json")
+                        self.send_header("Content-Length", "4")
+                        self.end_headers()
+                        self.wfile.write(b"{}")
+                        self.wfile.flush()
+                        return
+                    body = b"{}"
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    if case == "duplicate":
+                        self.send_header("Content-Length", "2")
+                        self.send_header("Content-Length", "2")
+                    elif case == "unsupported":
+                        self.send_header("Content-Length", str(len(body)))
+                        self.send_header("Content-Encoding", "gzip")
+                    elif case == "oversize":
+                        self.send_header("Content-Length", "1024")
+                    elif case == "oversize-body":
+                        body = b"123456789"
+                        self.send_header("Content-Length", str(len(body)))
+                    elif case == "bad-chunk":
+                        self.send_header("Transfer-Encoding", "chunked")
+                    else:
+                        body = b'{"text":"ok"}'
+                        self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    if case == "bad-chunk":
+                        self.wfile.write(b"invalid\r\n")
+                    else:
+                        self.wfile.write(body)
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), ProviderResponseHandler)
+        server.daemon_threads = True
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        endpoint = f"http://127.0.0.1:{server.server_port}"
+        try:
+            for case in ("truncated", "duplicate", "unsupported", "bad-chunk"):
+                for request_method in ("json", "bytes"):
+                    with self.subTest(case=case, request_method=request_method):
+                        provider = _HTTPProvider(f"{endpoint}/{case}", timeout=1.0, credential_file=None)
+                        with self.assertRaises(ProviderFailure) as caught:
+                            if request_method == "json":
+                                provider._request({"input": "test"}, max_response_bytes=8)
+                            else:
+                                provider._request_bytes(b"audio", content_type="audio/wav", max_response_bytes=8)
+                        self.assertEqual(caught.exception.kind, "response_framing")
+                        self.assertTrue(caught.exception.retryable)
+
+            for case in ("oversize", "oversize-body"):
+                for request_method in ("json", "bytes"):
+                    with self.subTest(case=case, request_method=request_method):
+                        provider = _HTTPProvider(f"{endpoint}/{case}", timeout=1.0, credential_file=None)
+                        with self.assertRaises(ProviderFailure) as caught:
+                            if request_method == "json":
+                                provider._request({"input": "test"}, max_response_bytes=8)
+                            else:
+                                provider._request_bytes(b"audio", content_type="audio/wav", max_response_bytes=8)
+                        self.assertEqual(caught.exception.kind, "response_too_large")
+                        self.assertFalse(caught.exception.retryable)
+
+            for request_method in ("json", "bytes"):
+                with self.subTest(case="valid", request_method=request_method):
+                    provider = _HTTPProvider(f"{endpoint}/valid", timeout=1.0, credential_file=None)
+                    if request_method == "json":
+                        content_type, raw = provider._request({"input": "test"}, max_response_bytes=64)
+                    else:
+                        content_type, raw = provider._request_bytes(b"audio", content_type="audio/wav", max_response_bytes=64)
+                    self.assertEqual(content_type, "application/json")
+                    self.assertEqual(raw, b'{"text":"ok"}')
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=1)
+
+    def test_provider_chain_falls_back_after_response_framing_failure(self):
+        class TruncatedHandler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, format, *args):
+                pass
+
+            def do_POST(self):
+                try:
+                    request_length = int(self.headers.get("Content-Length", "0"))
+                    if request_length:
+                        self.rfile.read(request_length)
+                    self.close_connection = True
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", "4")
+                    self.end_headers()
+                    self.wfile.write(b"{}")
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), TruncatedHandler)
+        server.daemon_threads = True
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        endpoint = f"http://127.0.0.1:{server.server_port}"
+        try:
+            primary = HttpASRProvider(endpoint, model="primary", timeout=1.0, credential_file=None)
+            fallback = StaticASRProvider("fallback", AsrResult.valid("fallback transcript"))
+            chain = ProviderChain(
+                "asr",
+                [
+                    ProviderTarget("primary", "asr", "http-asr", primary, declared={"endpoint": endpoint, "model": "primary"}),
+                    ProviderTarget("fallback", "asr", "fixture", fallback, declared={"endpoint": "http://127.0.0.1:1", "model": "fallback"}),
+                ],
+            )
+            result = chain.execute_asr(canonical_wav(), turn_id="turn")
+            self.assertEqual(result.transcript, "fallback transcript")
+            self.assertEqual(result.metadata["winner"], "fallback")
+            self.assertEqual(result.metadata["fallback_count"], 1)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=1)
 
     def test_http_deadline_interrupts_all_response_framings(self):
         class DribbleHandler(BaseHTTPRequestHandler):

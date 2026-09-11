@@ -37,6 +37,14 @@ class _DeadlineExceeded(TimeoutError):
     """Raised when an interruptible provider I/O operation hits its deadline."""
 
 
+class _ProviderResponseFramingError(ValueError):
+    """Raised when an upstream response cannot be safely framed."""
+
+
+class _ProviderResponseTooLargeError(ValueError):
+    """Raised when an upstream response exceeds the configured byte limit."""
+
+
 class _DeadlineSocket:
     """Socket facade that makes send and receive progress deadline-aware."""
 
@@ -303,21 +311,21 @@ def _read_bounded_response(response: Any, limit: int, *, deadline_at: float | No
     headers = getattr(response, "headers", None)
     declared_values = headers.get_all("Content-Length") if headers is not None and hasattr(headers, "get_all") else None
     if declared_values is not None and len(declared_values) != 1:
-        raise ValueError("provider response Content-Length is duplicated")
+        raise _ProviderResponseFramingError("provider response Content-Length is duplicated")
     declared = headers.get("Content-Length") if headers is not None else None
     declared_size: int | None = None
     if declared is not None:
         try:
             declared_size = int(declared)
         except (TypeError, ValueError):
-            raise ValueError("provider response Content-Length is invalid") from None
+            raise _ProviderResponseFramingError("provider response Content-Length is invalid") from None
         if declared_size < 0:
-            raise ValueError("provider response Content-Length is invalid")
+            raise _ProviderResponseFramingError("provider response Content-Length is invalid")
         if declared_size > limit:
-            raise ValueError("provider response exceeds the configured limit")
+            raise _ProviderResponseTooLargeError("provider response exceeds the configured limit")
     encoding = headers.get("Content-Encoding") if headers is not None else None
     if encoding is not None and encoding.strip().lower() not in {"", "identity"}:
-        raise ValueError("provider response Content-Encoding is unsupported")
+        raise _ProviderResponseFramingError("provider response Content-Encoding is unsupported")
     chunks: list[bytes] = []
     total = 0
     while total <= limit:
@@ -328,20 +336,22 @@ def _read_bounded_response(response: Any, limit: int, *, deadline_at: float | No
             chunk = response.read(requested)
         except socket.timeout as exc:
             raise TimeoutError("provider response deadline expired") from exc
+        except (http.client.HTTPException, ValueError) as exc:
+            raise _ProviderResponseFramingError("provider response body framing is invalid") from exc
         if deadline_at is not None and time.monotonic() >= deadline_at:
             raise TimeoutError("provider response deadline expired")
         if not isinstance(chunk, (bytes, bytearray)):
-            raise ValueError("provider response body is invalid")
+            raise _ProviderResponseFramingError("provider response body is invalid")
         if len(chunk) > requested:
-            raise ValueError("provider response reader exceeded its bound")
+            raise _ProviderResponseFramingError("provider response reader exceeded its bound")
         if not chunk:
             break
         total += len(chunk)
         if total > limit:
-            raise ValueError("provider response exceeds the configured limit")
+            raise _ProviderResponseTooLargeError("provider response exceeds the configured limit")
         chunks.append(bytes(chunk))
     if declared is not None and total != declared_size:
-        raise ValueError("provider response length does not match Content-Length")
+        raise _ProviderResponseFramingError("provider response length does not match Content-Length")
     return b"".join(chunks)
 
 
@@ -1566,8 +1576,10 @@ class _HTTPProvider:
             with _urlopen_no_redirect(request, timeout=remaining) as response:
                 try:
                     raw = _read_bounded_response(response, max_response_bytes, deadline_at=deadline_at)
-                except ValueError as exc:
+                except _ProviderResponseTooLargeError as exc:
                     raise ProviderFailure("response_too_large", retryable=False) from exc
+                except _ProviderResponseFramingError as exc:
+                    raise ProviderFailure("response_framing", retryable=True) from exc
                 return response.headers.get("Content-Type", ""), raw
         except urllib.error.HTTPError as exc:
             status_code = exc.code
@@ -1575,6 +1587,8 @@ class _HTTPProvider:
             raise _provider_failure_for_http(status_code) from None
         except (socket.timeout, TimeoutError):
             raise ProviderFailure("timeout", retryable=True) from None
+        except http.client.HTTPException:
+            raise ProviderFailure("response_framing", retryable=True) from None
         except urllib.error.URLError:
             raise ProviderFailure("transport", retryable=True) from None
 
@@ -1609,8 +1623,10 @@ class _HTTPProvider:
             with _urlopen_no_redirect(request, timeout=remaining) as response:
                 try:
                     raw = _read_bounded_response(response, max_response_bytes, deadline_at=deadline_at)
-                except ValueError as exc:
+                except _ProviderResponseTooLargeError as exc:
                     raise ProviderFailure("response_too_large", retryable=False) from exc
+                except _ProviderResponseFramingError as exc:
+                    raise ProviderFailure("response_framing", retryable=True) from exc
                 return response.headers.get("Content-Type", ""), raw
         except urllib.error.HTTPError as exc:
             status_code = exc.code
@@ -1618,6 +1634,8 @@ class _HTTPProvider:
             raise _provider_failure_for_http(status_code) from None
         except (socket.timeout, TimeoutError):
             raise ProviderFailure("timeout", retryable=True) from None
+        except http.client.HTTPException:
+            raise ProviderFailure("response_framing", retryable=True) from None
         except urllib.error.URLError:
             raise ProviderFailure("transport", retryable=True) from None
 
@@ -2495,7 +2513,7 @@ class ProviderTarget:
 class ProviderChain:
     """Ordered, frozen, fail-closed provider execution for ASR or TTS."""
 
-    _eligible = {"transport", "dns", "connect", "timeout", "rate_limited", "server", "provider_unavailable", "unavailable", "capacity"}
+    _eligible = {"transport", "dns", "connect", "timeout", "rate_limited", "server", "response_framing", "provider_unavailable", "unavailable", "capacity"}
 
     def __init__(self, kind: str, targets: Sequence[ProviderTarget], *, overall_deadline_seconds: float = 60.0):
         if kind not in {"asr", "tts"}:
