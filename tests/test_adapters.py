@@ -1,10 +1,20 @@
 import io
 import hashlib
 import json
+import threading
+import time
 import unittest
 import urllib.error
+import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from recorder_next.adapters import HttpHermesGateway
+from recorder_next.adapters import (
+    HttpHermesGateway,
+    ProviderFailure,
+    _HTTPProvider,
+    _read_bounded_response,
+    _urlopen_no_redirect,
+)
 
 
 class HermesAdapterContractTests(unittest.TestCase):
@@ -222,6 +232,121 @@ class HermesAdapterContractTests(unittest.TestCase):
         )
         self.assertIsNotNone(result)
         self.assertEqual(result.assistant_message_id, "authoritative-id")
+
+    def test_http_deadline_interrupts_all_response_framings(self):
+        class DribbleHandler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, format, *args):
+                pass
+
+            def do_GET(self):
+                try:
+                    if self.path == "/content-length":
+                        self.send_response(200)
+                        self.send_header("Content-Length", "8")
+                        self.end_headers()
+                        for value in b"abcdefgh":
+                            self.wfile.write(bytes((value,)))
+                            self.wfile.flush()
+                            time.sleep(0.03)
+                    elif self.path == "/chunked":
+                        self.send_response(200)
+                        self.send_header("Transfer-Encoding", "chunked")
+                        self.end_headers()
+                        for value in (b"ab", b"cd", b"ef", b"gh"):
+                            self.wfile.write(f"{len(value):x}".encode() + b"\r\n")
+                            self.wfile.flush()
+                            time.sleep(0.03)
+                            self.wfile.write(value + b"\r\n")
+                            self.wfile.flush()
+                            time.sleep(0.03)
+                        self.wfile.write(b"0\r\n\r\n")
+                        self.wfile.flush()
+                    elif self.path == "/eof":
+                        self.send_response(200)
+                        self.end_headers()
+                        self.wfile.write(b"a")
+                        self.wfile.flush()
+                        time.sleep(1)
+                except BrokenPipeError:
+                    pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), DribbleHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            for path in ("/content-length", "/chunked", "/eof"):
+                with self.subTest(path=path):
+                    started = time.monotonic()
+                    deadline = started + 0.12
+                    request = urllib.request.Request(
+                        f"http://127.0.0.1:{server.server_port}{path}",
+                        method="GET",
+                    )
+                    with self.assertRaises(TimeoutError):
+                        with _urlopen_no_redirect(request, timeout=0.12, deadline_at=deadline) as response:
+                            _read_bounded_response(response, 1024, deadline_at=deadline)
+                    self.assertLess(time.monotonic() - started, 0.3)
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_http_deadline_is_shared_by_gateway_provider_and_probe(self):
+        class DribbleHandler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, format, *args):
+                pass
+
+            def _dribble(self):
+                body = b'{"ok":true}'
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                try:
+                    for value in body:
+                        self.wfile.write(bytes((value,)))
+                        self.wfile.flush()
+                        time.sleep(0.03)
+                except BrokenPipeError:
+                    pass
+
+            def do_GET(self):
+                self._dribble()
+
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length", "0"))
+                if length:
+                    self.rfile.read(length)
+                self._dribble()
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), DribbleHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        endpoint = f"http://127.0.0.1:{server.server_port}"
+        try:
+            gateway = HttpHermesGateway(endpoint, poll_interval_seconds=0, run_timeout_seconds=0.12)
+            started = time.monotonic()
+            with self.assertRaises(TimeoutError):
+                gateway._request("POST", "/v1/runs", {"input": "hello"}, timeout_seconds=0.12)
+            self.assertLess(time.monotonic() - started, 0.3)
+
+            provider = _HTTPProvider(endpoint, timeout=0.12, credential_file=None, health_path="/health")
+            started = time.monotonic()
+            with self.assertRaises(ProviderFailure) as request_failure:
+                provider._request({"input": "hello"}, timeout_seconds=0.12)
+            self.assertEqual(request_failure.exception.kind, "timeout")
+            self.assertLess(time.monotonic() - started, 0.3)
+
+            started = time.monotonic()
+            with self.assertRaises(ProviderFailure) as probe_failure:
+                provider._probe("/health", timeout_seconds=0.12)
+            self.assertEqual(probe_failure.exception.kind, "timeout")
+            self.assertLess(time.monotonic() - started, 0.3)
+        finally:
+            server.shutdown()
+            server.server_close()
 
 
 if __name__ == "__main__":

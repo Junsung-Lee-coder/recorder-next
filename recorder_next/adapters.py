@@ -8,11 +8,15 @@ from __future__ import annotations
 
 import base64
 import binascii
+import http.client
 import inspect
+import io
 import json
 import os
 import re
+import select
 import socket
+import ssl
 import stat
 import time
 import urllib.error
@@ -29,6 +33,230 @@ from .media import ASRInput, MediaValidationError, validate_wav
 from .models import AsrResult, HermesResult, RouterDecision, TTSResult
 
 
+class _DeadlineExceeded(TimeoutError):
+    """Raised when an interruptible provider I/O operation hits its deadline."""
+
+
+class _DeadlineSocket:
+    """Socket facade that makes send and receive progress deadline-aware."""
+
+    def __init__(self, sock: Any, deadline_at: float):
+        self._sock = sock
+        self._deadline_at = deadline_at
+        self._closed = False
+        self._socket_closed = False
+        self._file_count = 0
+        self._sock.setblocking(False)
+
+    def _wait_for_io(self, *, readable: bool, writable: bool) -> None:
+        if self._socket_closed:
+            raise OSError("provider socket is closed")
+        if readable:
+            try:
+                pending = getattr(self._sock, "pending", None)
+                if callable(pending) and pending():
+                    return
+            except OSError:
+                pass
+        while True:
+            remaining = self._deadline_at - time.monotonic()
+            if remaining <= 0:
+                raise _DeadlineExceeded("provider I/O deadline expired")
+            try:
+                ready_read, ready_write, _ = select.select(
+                    [self._sock] if readable else [],
+                    [self._sock] if writable else [],
+                    [],
+                    remaining,
+                )
+            except InterruptedError:
+                continue
+            if ready_read or ready_write:
+                return
+            raise _DeadlineExceeded("provider I/O deadline expired")
+
+    def sendall(self, data: Any) -> None:
+        view = memoryview(data)
+        wait_for_read = False
+        while view:
+            self._wait_for_io(readable=wait_for_read, writable=not wait_for_read)
+            try:
+                sent = self._sock.send(view)
+                wait_for_read = False
+            except ssl.SSLWantReadError:
+                wait_for_read = True
+                continue
+            except ssl.SSLWantWriteError:
+                wait_for_read = False
+                continue
+            except (BlockingIOError, InterruptedError):
+                continue
+            if sent <= 0:
+                raise OSError("provider socket closed during write")
+            view = view[sent:]
+
+    def send(self, data: Any, *args: Any) -> int:
+        self._wait_for_io(readable=False, writable=True)
+        while True:
+            try:
+                return self._sock.send(data, *args)
+            except ssl.SSLWantReadError:
+                self._wait_for_io(readable=True, writable=False)
+            except ssl.SSLWantWriteError:
+                self._wait_for_io(readable=False, writable=True)
+            except (BlockingIOError, InterruptedError):
+                self._wait_for_io(readable=False, writable=True)
+
+    def recv_into(self, buffer: Any, *args: Any) -> int:
+        wait_for_write = False
+        while True:
+            self._wait_for_io(readable=not wait_for_write, writable=wait_for_write)
+            try:
+                return self._sock.recv_into(buffer, *args)
+            except ssl.SSLWantReadError:
+                wait_for_write = False
+            except ssl.SSLWantWriteError:
+                wait_for_write = True
+            except (BlockingIOError, InterruptedError):
+                pass
+
+    def recv(self, bufsize: int, *args: Any) -> bytes:
+        buffer = bytearray(bufsize)
+        size = self.recv_into(buffer, *args)
+        return bytes(buffer[:size])
+
+    def makefile(self, mode: str = "r", buffering: int | None = None, *args: Any, **kwargs: Any) -> Any:
+        if "b" not in mode or "r" not in mode:
+            return self._sock.makefile(mode, -1 if buffering is None else buffering, *args, **kwargs)
+        raw = _DeadlineSocketRaw(self)
+        self._file_count += 1
+        if buffering == 0:
+            return raw
+        buffer_size = io.DEFAULT_BUFFER_SIZE if buffering is None or buffering < 0 else buffering
+        return io.BufferedReader(raw, buffer_size=buffer_size)
+
+    def _file_closed(self) -> None:
+        self._file_count = max(0, self._file_count - 1)
+        if self._closed and self._file_count == 0:
+            self._force_close()
+
+    def _force_close(self) -> None:
+        if self._socket_closed:
+            return
+        self._closed = True
+        self._socket_closed = True
+        self._sock.close()
+
+    def close(self) -> None:
+        self._closed = True
+        if self._file_count == 0:
+            self._force_close()
+
+    def fileno(self) -> int:
+        if self._socket_closed:
+            return -1
+        return self._sock.fileno()
+
+    def settimeout(self, value: float | None) -> None:
+        if not self._socket_closed:
+            self._sock.settimeout(value)
+
+    def gettimeout(self) -> float | None:
+        return None if self._socket_closed else self._sock.gettimeout()
+
+    def __getattr__(self, name: str) -> Any:
+        sock = self.__dict__.get("_sock")
+        if sock is None:
+            raise AttributeError(name)
+        return getattr(sock, name)
+
+
+class _DeadlineSocketRaw(io.RawIOBase):
+    """Raw binary reader used by HTTPResponse without buffered blocking I/O."""
+
+    def __init__(self, owner: _DeadlineSocket):
+        super().__init__()
+        self._owner = owner
+
+    def readable(self) -> bool:
+        return True
+
+    def writable(self) -> bool:
+        return False
+
+    def readinto(self, buffer: Any) -> int:
+        return self._owner.recv_into(buffer)
+
+    def fileno(self) -> int:
+        return self._owner.fileno()
+
+    def close(self) -> None:
+        if not self.closed:
+            try:
+                super().close()
+            finally:
+                self._owner._file_closed()
+
+
+class _DeadlineConnectionMixin:
+    """Install a deadline socket after the HTTP connection is established."""
+
+    timeout: float | None
+    sock: Any
+
+    def __init__(self, *args: Any, deadline_at: float | None = None, **kwargs: Any):
+        self._deadline_at = deadline_at
+        self._deadline_socket: _DeadlineSocket | None = None
+        super().__init__(*args, **kwargs)
+
+    def connect(self) -> None:
+        if self._deadline_at is None:
+            getattr(super(), "connect")()
+            return
+        remaining = self._deadline_at - time.monotonic()
+        if remaining <= 0:
+            raise _DeadlineExceeded("provider I/O deadline expired")
+        original_timeout = self.timeout
+        if original_timeout is None or original_timeout > remaining:
+            self.timeout = remaining
+        try:
+            getattr(super(), "connect")()
+        finally:
+            self.timeout = original_timeout
+        if time.monotonic() >= self._deadline_at:
+            getattr(super(), "close")()
+            raise _DeadlineExceeded("provider I/O deadline expired")
+        if self.sock is not None:
+            self._deadline_socket = _DeadlineSocket(self.sock, self._deadline_at)
+            self.sock = self._deadline_socket
+
+class _DeadlineHTTPConnection(_DeadlineConnectionMixin, http.client.HTTPConnection):
+    pass
+
+
+class _DeadlineHTTPSConnection(_DeadlineConnectionMixin, http.client.HTTPSConnection):
+    pass
+
+
+class _DeadlineHTTPHandler(urllib.request.HTTPHandler):
+    def http_open(self, req):
+        return self.do_open(
+            _DeadlineHTTPConnection,
+            req,
+            deadline_at=getattr(req, "_recorder_deadline_at", None),
+        )
+
+
+class _DeadlineHTTPSHandler(urllib.request.HTTPSHandler):
+    def https_open(self, req):
+        return self.do_open(
+            _DeadlineHTTPSConnection,
+            req,
+            context=self._context,
+            deadline_at=getattr(req, "_recorder_deadline_at", None),
+        )
+
+
 class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
     """Never replay a credential-bearing request at a redirected origin."""
 
@@ -36,11 +264,27 @@ class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
         raise urllib.error.HTTPError(req.full_url, code, "redirects are disabled for provider requests", headers, fp)
 
 
-_NO_REDIRECT_OPENER = urllib.request.build_opener(_NoRedirectHandler())
+_NO_REDIRECT_OPENER = urllib.request.build_opener(
+    _DeadlineHTTPHandler(),
+    _DeadlineHTTPSHandler(),
+    _NoRedirectHandler(),
+)
 
 
-def _urlopen_no_redirect(request: urllib.request.Request, *, timeout: float):
-    return _NO_REDIRECT_OPENER.open(request, timeout=timeout)
+def _urlopen_no_redirect(
+    request: urllib.request.Request,
+    *,
+    timeout: float,
+    deadline_at: float | None = None,
+):
+    if deadline_at is not None:
+        setattr(request, "_recorder_deadline_at", deadline_at)
+    try:
+        return _NO_REDIRECT_OPENER.open(request, timeout=timeout)
+    except urllib.error.URLError as exc:
+        if isinstance(exc.reason, _DeadlineExceeded):
+            raise exc.reason from None
+        raise
 
 
 def _close_http_error(exc: urllib.error.HTTPError) -> None:
@@ -439,6 +683,7 @@ class HttpHermesGateway:
             raise TimeoutError("Hermes request deadline expired")
         if deadline_at is None:
             deadline_at = time.monotonic() + timeout
+        setattr(request, "_recorder_deadline_at", deadline_at)
         remaining = min(timeout, deadline_at - time.monotonic())
         if remaining <= 0:
             raise TimeoutError("Hermes request deadline expired")
@@ -1316,6 +1561,7 @@ class _HTTPProvider:
         if remaining <= 0:
             raise ProviderFailure("timeout", retryable=True)
         request = urllib.request.Request(self.endpoint, data=body, method="POST", headers=headers)
+        setattr(request, "_recorder_deadline_at", deadline_at)
         try:
             with _urlopen_no_redirect(request, timeout=remaining) as response:
                 try:
@@ -1358,6 +1604,7 @@ class _HTTPProvider:
         if remaining <= 0:
             raise ProviderFailure("timeout", retryable=True)
         request = urllib.request.Request(self.endpoint, data=body, method="POST", headers=headers)
+        setattr(request, "_recorder_deadline_at", deadline_at)
         try:
             with _urlopen_no_redirect(request, timeout=remaining) as response:
                 try:
@@ -1391,6 +1638,7 @@ class _HTTPProvider:
         timeout = self.timeout if timeout_seconds is None else min(self.timeout, float(timeout_seconds))
         if deadline_at is None:
             deadline_at = time.monotonic() + timeout
+        setattr(request, "_recorder_deadline_at", deadline_at)
         remaining = min(timeout, deadline_at - time.monotonic())
         if remaining <= 0:
             raise ProviderFailure("timeout", retryable=True)
