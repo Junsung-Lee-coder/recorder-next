@@ -2603,6 +2603,20 @@ class RecorderStore:
                 raise ConflictError("router project_record_version is stale")
             if decision.session_key != project["default_session_key"]:
                 raise ConflictError("router session key does not match the project registry")
+            session = conn.execute(
+                "SELECT * FROM sessions WHERE project_id=? AND session_key=?",
+                (decision.project_id, decision.session_key),
+            ).fetchone()
+            if session is None or not isinstance(session["gateway_session_key"], str) or not session["gateway_session_key"]:
+                raise ValidationError("route session has no canonical gateway binding")
+            gateway_key = session["gateway_session_key"]
+            conflicting_session = conn.execute(
+                "SELECT 1 FROM sessions s JOIN projects p ON p.stable_project_id=s.project_id "
+                "WHERE s.gateway_session_key=? AND s.project_id<>? AND p.status='active' LIMIT 1",
+                (gateway_key, decision.project_id),
+            ).fetchone()
+            if conflicting_session is not None:
+                raise ValidationError("canonical gateway session is already bound to another active project")
             payload = self._payload_for_turn_tx(conn, turn_id)
             route_payload = {
                 "type": "ROUTED",
@@ -2644,7 +2658,6 @@ class RecorderStore:
                 "route": route_payload,
             }
             ingress_hash = sha256_json(ingress_payload)
-            gateway_key = decision.session_key
             conn.execute(
                 "INSERT INTO session_ingress(hermes_submission_id, turn_id, user_id, target_session_id, gateway_session_key, accepted_seq, payload_sha256, payload_json, marker, wire_revision, gateway_identity, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (submission_id, turn_id, turn["user_id"], decision.project_id, gateway_key, turn["accepted_seq"], ingress_hash, _json(ingress_payload), marker, wire_revision, gateway_identity, now, now),
@@ -2828,6 +2841,19 @@ class RecorderStore:
                 (target_session_id, row["accepted_seq"]),
             ).fetchone()
             if earlier is not None:
+                return None
+            target_conflict = conn.execute(
+                "SELECT 1 FROM session_ingress WHERE gateway_identity=? AND gateway_session_key=? "
+                "AND hermes_submission_id<>? AND (status='IN_PROGRESS' OR "
+                "(accepted_seq < ? AND status NOT IN ('SUBMITTED','FAILED'))) LIMIT 1",
+                (
+                    row["gateway_identity"],
+                    row["gateway_session_key"],
+                    row["hermes_submission_id"],
+                    row["accepted_seq"],
+                ),
+            ).fetchone()
+            if target_conflict is not None:
                 return None
             attempt = int(row["attempt_count"]) + 1
             lease_token = str(uuid.uuid5(uuid.NAMESPACE_URL, f"recorder-next:hermes-lease:{row['hermes_submission_id']}:{attempt}"))

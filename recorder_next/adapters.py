@@ -335,6 +335,9 @@ def _read_bounded_response(response: Any, limit: int, *, deadline_at: float | No
     ):
         raise _ProviderResponseFramingError("provider response Content-Encoding is unsupported or duplicated")
     transfer_encoding_values = header_values("Transfer-Encoding")
+    declared_values = header_values("Content-Length")
+    if transfer_encoding_values and declared_values:
+        raise _ProviderResponseFramingError("provider response framing is ambiguous")
     transfer_encodings = [
         coding.strip().lower()
         for value in transfer_encoding_values
@@ -345,18 +348,14 @@ def _read_bounded_response(response: Any, limit: int, *, deadline_at: float | No
         transfer_encodings and (len(transfer_encodings) != 1 or transfer_encodings[0] != "chunked")
     ):
         raise _ProviderResponseFramingError("provider response Transfer-Encoding is unsupported or duplicated")
-    declared_values = headers.get_all("Content-Length") if headers is not None and hasattr(headers, "get_all") else None
-    if declared_values is not None and len(declared_values) != 1:
+    if len(declared_values) > 1:
         raise _ProviderResponseFramingError("provider response Content-Length is duplicated")
-    declared = headers.get("Content-Length") if headers is not None else None
+    declared = declared_values[0] if declared_values else None
     declared_size: int | None = None
     if declared is not None:
-        try:
-            declared_size = int(declared)
-        except (TypeError, ValueError):
-            raise _ProviderResponseFramingError("provider response Content-Length is invalid") from None
-        if declared_size < 0:
+        if not isinstance(declared, str) or re.fullmatch(r"[ \t]*[0-9]+[ \t]*", declared, flags=re.ASCII) is None:
             raise _ProviderResponseFramingError("provider response Content-Length is invalid")
+        declared_size = int(declared.strip(" \t"))
         if declared_size > limit:
             raise _ProviderResponseTooLargeError("provider response exceeds the configured limit")
     chunks: list[bytes] = []
@@ -672,6 +671,7 @@ class HttpHermesGateway:
         run_timeout_seconds: float = 120.0,
         max_request_bytes: int = 10_000_000,
         max_response_bytes: int = 1_048_576,
+        require_existing_session: bool = False,
     ):
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
@@ -690,6 +690,7 @@ class HttpHermesGateway:
         self.poll_interval_seconds = float(poll_interval_seconds)
         self.run_timeout_seconds = float(run_timeout_seconds)
         self.max_response_bytes = max_response_bytes
+        self.require_existing_session = bool(require_existing_session)
         self._wire_policy = WirePolicy(
             gateway_max_request_bytes=max_request_bytes,
             gateway_max_response_bytes=max_response_bytes,
@@ -700,6 +701,45 @@ class HttpHermesGateway:
         if self._api_key is not None:
             headers["Authorization"] = f"Bearer {self._api_key}"
         return headers
+
+    def capability_check(self) -> dict[str, Any]:
+        payload = self._request(
+            "GET",
+            "/v1/capabilities",
+            extra_headers=self._session_headers(self.gateway_session_key or "recorder-readiness"),
+            timeout_seconds=self.timeout,
+        )
+        if not isinstance(payload, Mapping):
+            raise ProviderFailure("capability_unavailable", retryable=True)
+        features = payload.get("features")
+        if not isinstance(features, Mapping) or features.get("run_submission") is not True:
+            raise ProviderFailure("run_submission_unavailable", retryable=False)
+        return dict(payload)
+
+    def _preflight_existing_session(self, session_key: str, *, deadline_at: float) -> None:
+        try:
+            payload = self._request(
+                "GET",
+                "/api/sessions/" + quote(session_key, safe=""),
+                extra_headers=self._session_headers(session_key),
+                deadline_at=deadline_at,
+            )
+        except urllib.error.HTTPError as exc:
+            status_code = exc.code
+            _close_http_error(exc)
+            raise _provider_failure_for_http(status_code) from None
+        except (urllib.error.URLError, TimeoutError):
+            raise ProviderFailure("transport", retryable=True) from None
+        session = payload.get("session") if isinstance(payload, Mapping) else None
+        if (
+            not isinstance(payload, Mapping)
+            or payload.get("object") != "hermes.session"
+            or not isinstance(session, Mapping)
+            or session.get("id") != session_key
+            or bool(session.get("archived"))
+            or session.get("ended_at") is not None
+        ):
+            raise ProviderFailure("session_preflight", retryable=False)
 
     def _request(
         self,
@@ -941,7 +981,13 @@ class HttpHermesGateway:
             return None
         if context is None and status and status not in self._RUN_TERMINAL_STATUSES:
             return None
-        text = self._run_text(result)
+        if context is not None and self.require_existing_session:
+            if result.get("session_id") != context.gateway_session_key:
+                return None
+            output = result.get("output")
+            text = output.strip() if isinstance(output, str) else ""
+        else:
+            text = self._run_text(result)
         if not text:
             return None
         response_run_id = result.get("run_id") or result.get("id")
@@ -1106,6 +1152,8 @@ class HttpHermesGateway:
         deadline = time.monotonic() + self.run_timeout_seconds
         accepted: Mapping[str, Any] | None = None
         accepted_run_id: str | None = context.run_id if context is not None else None
+        if self.require_existing_session and context is not None and accepted_run_id is None:
+            self._preflight_existing_session(session_key, deadline_at=deadline)
         for attempt in range(self.max_submit_attempts):
             if accepted_run_id is not None:
                 accepted = {"run_id": accepted_run_id}
@@ -1524,19 +1572,25 @@ def _read_provider_credential(path: str | os.PathLike[str]) -> str:
     return _parse_credential_record(raw)
 
 
+def _http_status_is_retryable(status_code: int) -> bool:
+    return status_code in {408, 409, 425, 429} or 500 <= status_code <= 599
+
+
 def _provider_failure_for_http(status_code: int) -> ProviderFailure:
-    if status_code == 429:
-        return ProviderFailure("rate_limited", retryable=True, status_code=status_code)
-    if status_code == 408:
-        return ProviderFailure("timeout", retryable=True, status_code=status_code)
-    if 500 <= status_code <= 599:
-        return ProviderFailure("server", retryable=True, status_code=status_code)
+    if _http_status_is_retryable(status_code):
+        if status_code == 429:
+            kind = "rate_limited"
+        elif status_code == 408:
+            kind = "timeout"
+        elif 500 <= status_code <= 599:
+            kind = "server"
+        else:
+            kind = "transport"
+        return ProviderFailure(kind, retryable=True, status_code=status_code)
     if status_code in {401, 403}:
         return ProviderFailure("auth", retryable=False, status_code=status_code)
     if status_code == 415:
         return ProviderFailure("unsupported_media", retryable=False, status_code=status_code)
-    if status_code in {409, 425}:
-        return ProviderFailure("transport", retryable=True, status_code=status_code)
     return ProviderFailure("client", retryable=False, status_code=status_code)
 
 
@@ -2671,7 +2725,7 @@ class ProviderChain:
                     client_terminal = (
                         isinstance(exc.status_code, int)
                         and 400 <= exc.status_code < 500
-                        and exc.status_code not in {408, 429}
+                        and not _http_status_is_retryable(exc.status_code)
                     )
                     eligible = not client_terminal and (
                         (exc.retryable and exc.kind in self._eligible)

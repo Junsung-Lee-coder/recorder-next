@@ -11,11 +11,14 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from recorder_next.adapters import (
     HttpHermesGateway,
     HttpASRProvider,
+    ChainFailure,
     ProviderChain,
     ProviderFailure,
     ProviderTarget,
     StaticASRProvider,
     _HTTPProvider,
+    _ProviderResponseFramingError,
+    _provider_failure_for_http,
     _read_bounded_response,
     _urlopen_no_redirect,
 )
@@ -435,6 +438,77 @@ class HermesAdapterContractTests(unittest.TestCase):
             server.shutdown()
             server.server_close()
             thread.join(timeout=1)
+
+    def test_response_framing_rejects_ambiguous_and_malformed_lengths_before_body_read(self):
+        class Headers:
+            def __init__(self, pairs):
+                self.pairs = pairs
+
+            def get_all(self, name):
+                return [value for key, value in self.pairs if key.lower() == name.lower()] or None
+
+            def get(self, name, default=None):
+                values = self.get_all(name)
+                return values[0] if values else default
+
+        class UnreadableResponse:
+            def __init__(self, pairs):
+                self.headers = Headers(pairs)
+                self.body_read = False
+
+            def read(self, _size=-1):
+                self.body_read = True
+                raise AssertionError("body must not be read after framing rejection")
+
+        cases = (
+            (("Transfer-Encoding", "chunked"), ("Content-Length", "2")),
+            (("Content-Length", "2"), ("Content-Length", "2")),
+            (("Content-Length", ""),),
+            (("Content-Length", "+2"),),
+            (("Content-Length", "\u00a02"),),
+            (("Content-Length", 2),),
+        )
+        for pairs in cases:
+            with self.subTest(pairs=pairs):
+                response = UnreadableResponse(pairs)
+                with self.assertRaises(_ProviderResponseFramingError):
+                    _read_bounded_response(response, 64)
+                self.assertFalse(response.body_read)
+
+    def test_provider_chain_uses_http_status_policy_for_retry_and_terminal_client_errors(self):
+        class StatusASR:
+            name = "status"
+
+            def __init__(self, status):
+                self.status = status
+
+            def transcribe(self, _audio, *, turn_id, generation, timeout_seconds=None, deadline_at=None):
+                del turn_id, generation, timeout_seconds, deadline_at
+                raise _provider_failure_for_http(self.status)
+
+        fallback = StaticASRProvider("fallback", AsrResult.valid("fallback transcript"))
+        for status in (409, 425):
+            primary = StatusASR(status)
+            chain = ProviderChain(
+                "asr",
+                [
+                    ProviderTarget("primary", "asr", "http-asr", primary, declared={"endpoint": "http://127.0.0.1:9"}),
+                    ProviderTarget("fallback", "asr", "fixture", fallback, declared={"endpoint": "http://127.0.0.1:1"}),
+                ],
+            )
+            result = chain.execute_asr(canonical_wav(), turn_id=f"turn-{status}")
+            self.assertEqual(result.transcript, "fallback transcript")
+            self.assertEqual(result.metadata["fallback_count"], 1)
+
+        terminal_chain = ProviderChain(
+            "asr",
+            [
+                ProviderTarget("primary", "asr", "http-asr", StatusASR(400), declared={"endpoint": "http://127.0.0.1:9"}),
+                ProviderTarget("fallback", "asr", "fixture", fallback, declared={"endpoint": "http://127.0.0.1:1"}),
+            ],
+        )
+        with self.assertRaises(ChainFailure):
+            terminal_chain.execute_asr(canonical_wav(), turn_id="turn-400")
 
     def test_http_deadline_interrupts_all_response_framings(self):
         class DribbleHandler(BaseHTTPRequestHandler):

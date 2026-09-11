@@ -5,6 +5,7 @@ import hashlib
 import shutil
 import sqlite3
 import tempfile
+import time
 import unittest
 import io
 import wave
@@ -13,9 +14,11 @@ import zlib
 from pathlib import Path
 from unittest.mock import patch
 
-from recorder_next.adapters import HermesResult
+from recorder_next import __main__ as recorder_main
+from recorder_next.adapters import CredentialError, HermesResult, MemoryHermesGateway, StaticTTSProvider
+from recorder_next.config import RecorderConfig
 from recorder_next.errors import ConflictError, LeaseConflict, SourceUnavailableError, ValidationError
-from recorder_next.service import RecorderService
+from recorder_next.service import RecorderService, create_configured_service
 from recorder_next.features import FeatureGroups
 from recorder_next.models import AsrResult
 from recorder_next.store import RecorderStore
@@ -63,6 +66,56 @@ def _logical_database_snapshot(db_path: Path) -> dict:
 
 
 class R25IntegratedRegressionTests(unittest.TestCase):
+    def test_missing_explicit_config_fails_before_service_or_storage_creation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = Path(tmp) / "missing.toml"
+            with patch("sys.argv", ["recorder-next", "--config", str(missing)]), patch.object(
+                recorder_main, "create_configured_service"
+            ) as create_service:
+                with self.assertRaises(FileNotFoundError):
+                    recorder_main.main()
+            create_service.assert_not_called()
+
+    def test_production_health_requires_live_successful_background_loops(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = RecorderStore(root / "db.sqlite3", storage_root=root / "data")
+            service = RecorderService(
+                store,
+                hermes=MemoryHermesGateway(),
+                tts=StaticTTSProvider(),
+                production_readiness={"asr": True, "tts": True, "hermes": True},
+            )
+
+            status, _headers, payload = service.handle_http("GET", "/v1/health", {}, b"")
+            self.assertEqual(status, 500)
+            self.assertEqual(payload["error"]["code"], "VOICE_NOT_READY")
+
+            service.start_background_workers(worker_poll_seconds=0.01, scheduler_poll_seconds=0.01)
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline:
+                status, _headers, payload = service.handle_http("GET", "/v1/health", {}, b"")
+                if status == 200:
+                    break
+                time.sleep(0.01)
+            self.assertEqual(status, 200)
+            self.assertEqual(payload["status"], "ok")
+
+            service.stop_background_workers(timeout=1)
+            status, _headers, payload = service.handle_http("GET", "/v1/health", {}, b"")
+            self.assertEqual(status, 500)
+            self.assertEqual(payload["error"]["code"], "VOICE_NOT_READY")
+
+    def test_production_admission_rejects_fixture_dependencies_before_storage_open(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = RecorderConfig(database=str(root / "db.sqlite3"), storage_root=str(root / "data"))
+
+            with self.assertRaises(CredentialError):
+                create_configured_service(config, ingress_secret="test-secret", require_production=True)
+
+            self.assertFalse((root / "db.sqlite3").exists())
+
     def test_project_create_omitted_aliases_uses_empty_canonical_array(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

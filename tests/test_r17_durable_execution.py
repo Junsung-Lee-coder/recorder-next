@@ -19,7 +19,8 @@ from recorder_next.adapters import (
 from recorder_next.config import RecorderConfig
 from recorder_next.errors import ChunkConflict, LeaseConflict
 from recorder_next.features import DurableProcessingWorker
-from recorder_next.models import AsrResult, HermesResult
+from recorder_next.hermes_wire import SubmissionContext
+from recorder_next.models import AsrResult, HermesResult, RouterDecision
 from recorder_next.openapi import OPENAPI
 from recorder_next.service import RecorderService
 from recorder_next.store import RecorderStore, utc_now
@@ -166,6 +167,161 @@ class R17HermesBindingTests(unittest.TestCase):
             self.assertEqual(second_result["final_content"], "second final")
             self.assertEqual(gateway.calls[0]["submission_id"], first["hermes_submission_id"])
             self.assertEqual(gateway.calls[1]["submission_id"], second["hermes_submission_id"])
+
+    def test_logical_session_can_bind_a_distinct_canonical_gateway_session(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = RecorderStore(root / "db.sqlite3", storage_root=root / "data")
+            project = store.create_project("r17-user", project_number="R17-PROJECT", name="R17")
+            logical_session = project["default_session_key"]
+            gateway_session = "existing-hermes-transcript"
+            with store._tx() as conn:
+                conn.execute(
+                    "UPDATE sessions SET gateway_session_key=? WHERE project_id=? AND session_key=?",
+                    (gateway_session, project["stable_project_id"], logical_session),
+                )
+            service = RecorderService(store, hermes=MemoryHermesGateway(), tts=StaticTTSProvider())
+            turn_id = "018f5a2e-7b6e-7abc-8d11-1234567890b1"
+            _accept(store, turn_id, b"canonical target")
+
+            routed = service.route_next("r17-user")
+            ingress = store.get_ingress_for_turn(turn_id)
+            assert routed is not None
+            assert ingress is not None
+
+            self.assertEqual(routed["session_key"], logical_session)
+            self.assertEqual(ingress["target_session_id"], project["stable_project_id"])
+            self.assertEqual(ingress["gateway_session_key"], gateway_session)
+            self.assertEqual(store.submission_context(ingress["hermes_submission_id"]).gateway_session_key, gateway_session)
+
+    def test_gateway_target_order_blocks_reverse_claim_across_misbound_projects(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store, _service, project, ingress = _routed_pair(Path(tmp))
+            first, second = ingress
+            with store._tx() as conn:
+                conn.execute(
+                    "UPDATE session_ingress SET target_session_id=? WHERE hermes_submission_id=?",
+                    ("misbound-project", second["hermes_submission_id"]),
+                )
+
+            blocked = store.claim_session_ingress(
+                "misbound-project",
+                "second-owner",
+                hermes_submission_id=second["hermes_submission_id"],
+            )
+            self.assertIsNone(blocked)
+            claimed = store.claim_session_ingress(
+                project["stable_project_id"],
+                "first-owner",
+                hermes_submission_id=first["hermes_submission_id"],
+            )
+            assert claimed is not None
+            self.assertEqual(claimed["hermes_submission_id"], first["hermes_submission_id"])
+
+    def test_commit_route_rejects_known_cross_project_gateway_session_alias(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = RecorderStore(root / "db.sqlite3", storage_root=root / "data")
+            first = store.create_project("r17-user", project_number="R17-PROJECT", name="First")
+            second = store.create_project("r17-user", project_number="R17-OTHER", name="Second")
+            gateway_session = "shared-hermes-transcript"
+            with store._tx() as conn:
+                conn.execute(
+                    "UPDATE sessions SET gateway_session_key=? WHERE project_id IN (?, ?)",
+                    (gateway_session, first["stable_project_id"], second["stable_project_id"]),
+                )
+            turn_id = "018f5a2e-7b6e-7abc-8d11-1234567890b2"
+            _accept(store, turn_id, b"reject alias")
+            decision = RouterDecision(
+                "route-alias",
+                first["stable_project_id"],
+                first["default_session_key"],
+                first["record_version"],
+                "reject alias",
+                "test",
+            )
+
+            with self.assertRaises(Exception):
+                store.commit_route(turn_id, decision)
+
+
+class R17HermesSessionPreflightTests(unittest.TestCase):
+    @staticmethod
+    def _context(session_key: str) -> SubmissionContext:
+        return SubmissionContext(
+            submission_id="submission-1",
+            subject_kind="turn",
+            marker="marker-1",
+            gateway_session_key=session_key,
+            canonical_request_sha256="a" * 64,
+            wire_revision="test-v1",
+            request={"input": "normalized"},
+            turn_id="018f5a2e-7b6e-7abc-8d11-1234567890b3",
+        )
+
+    def test_preflight_failures_never_post_a_run(self):
+        session_key = "existing-hermes-transcript"
+        cases = {
+            "missing": ProviderFailure("client_error", retryable=False, status_code=404),
+            "archived": {"object": "hermes.session", "session": {"id": session_key, "archived": True, "ended_at": None}},
+            "mismatch": {"object": "hermes.session", "session": {"id": "other-session", "archived": False, "ended_at": None}},
+            "wrong_object": {"object": "list", "session": {"id": session_key, "archived": False, "ended_at": None}},
+        }
+
+        for name, response in cases.items():
+            with self.subTest(name=name):
+                class ProbeGateway(HttpHermesGateway):
+                    def __init__(self):
+                        super().__init__("http://127.0.0.1:9", poll_interval_seconds=0, require_existing_session=True)
+                        self.calls = []
+
+                    def _request(self, method, path, payload=None, *, extra_headers=None, timeout_seconds=None, deadline_at=None):
+                        del payload, extra_headers, timeout_seconds, deadline_at
+                        self.calls.append((method, path))
+                        if isinstance(response, Exception):
+                            raise response
+                        return response
+
+                gateway = ProbeGateway()
+                with self.assertRaises(ProviderFailure):
+                    gateway.submit(
+                        session_key=session_key,
+                        request={"input": "normalized"},
+                        submission_id="submission-1",
+                        marker="marker-1",
+                        context=self._context(session_key),
+                    )
+                self.assertEqual([method for method, _path in gateway.calls], ["GET"])
+
+    def test_matching_session_and_completed_run_status_produce_final(self):
+        session_key = "existing-hermes-transcript"
+
+        class ProbeGateway(HttpHermesGateway):
+            def __init__(self):
+                super().__init__("http://127.0.0.1:9", poll_interval_seconds=0, require_existing_session=True)
+                self.calls = []
+
+            def _request(self, method, path, payload=None, *, extra_headers=None, timeout_seconds=None, deadline_at=None):
+                del payload, extra_headers, timeout_seconds, deadline_at
+                self.calls.append((method, path))
+                if path.startswith("/api/sessions/"):
+                    return {"object": "hermes.session", "session": {"id": session_key, "archived": False, "ended_at": None}}
+                if method == "POST":
+                    return {"run_id": "run-1", "status": "queued"}
+                return {"run_id": "run-1", "status": "completed", "session_id": session_key, "output": "actual final"}
+
+        gateway = ProbeGateway()
+        result = gateway.submit(
+            session_key=session_key,
+            request={"input": "normalized"},
+            submission_id="submission-1",
+            marker="marker-1",
+            context=self._context(session_key),
+        )
+
+        assert result is not None
+        self.assertEqual(result.content, "actual final")
+        self.assertEqual([method for method, _path in gateway.calls], ["GET", "POST", "GET"])
 
 
 class R17HermesTerminalityTests(unittest.TestCase):

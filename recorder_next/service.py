@@ -6,6 +6,7 @@ import hashlib
 import hmac
 import inspect
 import json
+import logging
 import math
 import os
 import sqlite3
@@ -51,6 +52,15 @@ from .models import AsrResult, HermesResult, RouterDecision, TTSResult
 from .store import DEFAULT_MISSING_PAGE_SIZE, MAX_MISSING_PAGE_SIZE, FINAL_ERROR_MESSAGES, RecorderStore
 
 
+logger = logging.getLogger(__name__)
+
+
+class VoiceNotReadyError(RecorderError):
+    code = "VOICE_NOT_READY"
+    status = 500
+    default_message = "voice service is not ready"
+
+
 class RecorderService:
     """Application service coordinating adapters around RecorderStore."""
 
@@ -75,6 +85,7 @@ class RecorderService:
         ingress_secret: str | None = None,
         internal_worker_principals: Sequence[tuple[str, str]] = (),
         gateway_max_request_bytes: int = 10_000_000,
+        production_readiness: Mapping[str, bool] | None = None,
     ):
         self.store = store
         self.router = router or DeterministicRouter()
@@ -104,7 +115,122 @@ class RecorderService:
         self._lifecycle_state = "RUNNING"
         self._background_stop: threading.Event | None = None
         self._background_threads: list[threading.Thread] = []
+        self._background_state = {
+            "worker": {"started": False, "alive": False, "last_iteration_success": None, "active_deadline": None, "error_streak": 0, "error_category": None},
+            "scheduler": {"started": False, "alive": False, "last_iteration_success": None, "active_deadline": None, "error_streak": 0, "error_category": None},
+        }
+        self._production_readiness = None if production_readiness is None else {
+            name: bool(production_readiness.get(name)) for name in ("asr", "tts", "hermes")
+        }
         self._shutdown_requested = threading.Event()
+
+    @staticmethod
+    def _background_error_category(exc: BaseException) -> str:
+        if isinstance(exc, (ProviderFailure, ChainFailure)):
+            return "provider"
+        if isinstance(exc, sqlite3.Error):
+            return "storage"
+        if isinstance(exc, LeaseConflict):
+            return "lease"
+        return "internal"
+
+    def _set_background_state(
+        self,
+        name: str,
+        *,
+        started: bool | None = None,
+        alive: bool | None = None,
+        success: bool | None = None,
+        active_deadline: float | None = None,
+        error_category: str | None = None,
+    ) -> None:
+        with self._lock:
+            state = self._background_state[name]
+            previous_alive = state["alive"]
+            previous_success = state["last_iteration_success"]
+            if started is not None:
+                state["started"] = started
+            if alive is not None:
+                state["alive"] = alive
+            state["active_deadline"] = active_deadline
+            if success is True:
+                state["last_iteration_success"] = True
+                state["error_streak"] = 0
+                state["error_category"] = None
+            elif success is False:
+                state["last_iteration_success"] = False
+                state["error_streak"] = min(10, int(state["error_streak"]) + 1)
+                state["error_category"] = error_category if error_category in {"provider", "storage", "lease", "internal"} else "internal"
+            current_alive = state["alive"]
+            current_category = state["error_category"]
+            current_streak = state["error_streak"]
+        if previous_alive != current_alive:
+            logger.info("Recorder background %s alive=%s", name, current_alive)
+        if success is False and previous_success is not False:
+            logger.warning(
+                "Recorder background %s first_failure category=%s streak=%s",
+                name,
+                current_category,
+                current_streak,
+            )
+
+    def _voice_ready(self) -> bool:
+        with self._lock:
+            if self._production_readiness is None:
+                return True
+            if not all(self._production_readiness.values()):
+                return False
+            now = time.monotonic()
+            for state in self._background_state.values():
+                if not state["started"] or not state["alive"] or state["last_iteration_success"] is not True:
+                    return False
+                deadline = state["active_deadline"]
+                if isinstance(deadline, (int, float)) and now > deadline:
+                    return False
+            return True
+
+    def _set_dependency_availability(self, name: str, available: bool) -> None:
+        with self._lock:
+            if self._production_readiness is not None and name in self._production_readiness:
+                self._production_readiness[name] = bool(available)
+
+    @staticmethod
+    def _probe_provider_chain(chain: ProviderChain | None) -> None:
+        if chain is None or not chain.targets:
+            raise ProviderFailure("capability_unavailable", retryable=False)
+        for target in chain.targets:
+            provider = target.provider
+            readiness_check = getattr(provider, "readiness_check", None)
+            if callable(readiness_check):
+                readiness_check()
+                continue
+            health_check = getattr(provider, "health_check", None)
+            capability_check = getattr(provider, "capability_check", None)
+            if not callable(health_check) or not callable(capability_check):
+                raise ProviderFailure("capability_unavailable", retryable=False)
+            for result in (health_check(), capability_check()):
+                if not isinstance(result, Mapping) or result.get("configured") is False or result.get("ok") is False or result.get("ready") is False:
+                    raise ProviderFailure("capability_unavailable", retryable=True)
+
+    def refresh_production_readiness(self) -> bool:
+        """Refresh cached dependency availability without running model work."""
+
+        with self._lock:
+            if self._production_readiness is None:
+                return True
+        for name, probe in (
+            ("asr", lambda: self._probe_provider_chain(self.asr_chain)),
+            ("tts", lambda: self._probe_provider_chain(self.tts_chain)),
+            ("hermes", lambda: getattr(self.hermes, "capability_check")()),
+        ):
+            try:
+                probe()
+            except Exception:
+                self._set_dependency_availability(name, False)
+            else:
+                self._set_dependency_availability(name, True)
+        with self._lock:
+            return bool(self._production_readiness and all(self._production_readiness.values()))
 
     def _begin_operation(self) -> None:
         with self._drain_condition:
@@ -219,42 +345,58 @@ class RecorderService:
             scheduler.start()
 
     def _background_worker_loop(self, stop: threading.Event, owner: str, poll_seconds: float, lease_seconds: int) -> None:
-        self._begin_operation()
+        admitted = False
+        self._set_background_state("worker", started=True, alive=True)
         try:
+            self._begin_operation()
+            admitted = True
             error_streak = 0
             while not stop.is_set():
+                self._set_background_state("worker", active_deadline=time.monotonic() + max(5.0, lease_seconds * 2.0))
                 try:
                     result = self.run_background_worker_once(owner=owner, lease_seconds=lease_seconds)
                     error_streak = 0
+                    self._set_background_state("worker", success=True)
                     delay = poll_seconds if result is None else 0.0
                 except ServiceStoppingError:
                     break
-                except Exception:
+                except Exception as exc:
                     error_streak = min(error_streak + 1, 8)
+                    self._set_background_state("worker", success=False, error_category=self._background_error_category(exc))
                     delay = min(30.0, max(poll_seconds, poll_seconds * (2 ** error_streak)))
                 stop.wait(delay)
         finally:
-            self._end_operation()
+            self._set_background_state("worker", alive=False)
+            if admitted:
+                self._end_operation()
 
     def _background_scheduler_loop(self, stop: threading.Event, owner: str, poll_seconds: float, lease_seconds: int) -> None:
-        self._begin_operation()
+        admitted = False
+        self._set_background_state("scheduler", started=True, alive=True)
         try:
+            self._begin_operation()
+            admitted = True
             error_streak = 0
             while not stop.is_set():
+                self._set_background_state("scheduler", active_deadline=time.monotonic() + max(5.0, lease_seconds * 2.0))
                 try:
                     self.recover_scheduler()
                     self.store.recover_worker_jobs()
                     self.run_scheduler(owner=owner, lease_seconds=lease_seconds)
                     error_streak = 0
+                    self._set_background_state("scheduler", success=True)
                     delay = poll_seconds
                 except ServiceStoppingError:
                     break
-                except Exception:
+                except Exception as exc:
                     error_streak = min(error_streak + 1, 8)
+                    self._set_background_state("scheduler", success=False, error_category=self._background_error_category(exc))
                     delay = min(30.0, max(poll_seconds, poll_seconds * (2 ** error_streak)))
                 stop.wait(delay)
         finally:
-            self._end_operation()
+            self._set_background_state("scheduler", alive=False)
+            if admitted:
+                self._end_operation()
 
     def stop_background_workers(self, *, timeout: float = 10.0) -> bool:
         """Request both lifecycle threads to stop and wait for clean exit."""
@@ -690,6 +832,9 @@ class RecorderService:
                 # and is incorrectly left pending.
                 bound_ingress = self.store.get_ingress(ingress["hermes_submission_id"])
                 ingress = {**ingress, **bound_ingress}
+        except ProviderFailure:
+            self._set_dependency_availability("hermes", False)
+            result = None
         except ValueError:
             failed = self.store.commit_hermes_error(
                 ingress["hermes_submission_id"],
@@ -962,6 +1107,7 @@ class RecorderService:
             try:
                 result = chain.execute_asr(audio, turn_id=turn_id, frozen=frozen)
             except ChainFailure as exc:
+                self._set_dependency_availability("asr", False)
                 result = AsrResult(
                     "PROVIDER_ERROR",
                     detail=exc.kind,
@@ -1083,6 +1229,7 @@ class RecorderService:
             else:
                 result = self.tts.synthesize(artifact["source_text"], artifact_id=artifact_id)
         except ChainFailure as exc:
+            self._set_dependency_availability("tts", False)
             status_code = next(
                 (
                     item.get("status_code")
@@ -1101,6 +1248,7 @@ class RecorderService:
                 worker_claim=worker_claim,
             )
         except ProviderFailure as exc:  # provider failures stay separate from text FINAL
+            self._set_dependency_availability("tts", False)
             if exc.retryable:
                 raise
             return self.store.set_tts_result(
@@ -1230,7 +1378,12 @@ class RecorderService:
             if turn.get("state") in {"FINAL_READY", "DELIVERED", "EXPIRED"}:
                 return None
             raise ValidationError("Hermes worker projection is missing its durable submission")
-        if ingress.get("turn_id") != turn.get("turn_id") or ingress.get("target_session_id") != turn.get("project_id") or ingress.get("gateway_session_key") != turn.get("session_key"):
+        context = self.store.submission_context(str(ingress["hermes_submission_id"]))
+        if (
+            ingress.get("turn_id") != turn.get("turn_id")
+            or ingress.get("target_session_id") != turn.get("project_id")
+            or context.gateway_session_key != ingress.get("gateway_session_key")
+        ):
             raise ValidationError("Hermes worker projection does not match its durable ingress")
         return self._enqueue_stage_job(
             "hermes",
@@ -1889,6 +2042,8 @@ class RecorderService:
             network=peer_addr is not None,
         )
         if method == "GET" and path in {"/healthz", "/v1/health"}:
+            if not self._voice_ready():
+                raise VoiceNotReadyError()
             return 200, {}, {"status": "ok", "product_identity": "recorder-next-server-product-items-1-through-8", "api_version": "v1", "worker": self.store.worker_health()}
         if method == "GET" and path == "/v1/openapi.json":
             from .openapi import OPENAPI
@@ -2287,7 +2442,12 @@ def create_service(db_path: str, storage_root: str, *, clock: Any | None = None,
     return RecorderService(RecorderStore(db_path, storage_root=storage_root, clock=clock), **kwargs)
 
 
-def create_configured_service(config: "RecorderConfig", *, ingress_secret: str | None = None) -> RecorderService:
+def create_configured_service(
+    config: "RecorderConfig",
+    *,
+    ingress_secret: str | None = None,
+    require_production: bool = False,
+) -> RecorderService:
     from .config import ProviderConfig, RecorderConfig
 
     if not isinstance(config, RecorderConfig):
@@ -2387,6 +2547,43 @@ def create_configured_service(config: "RecorderConfig", *, ingress_secret: str |
     if any(chain is None for chain in scoped_asr_chains.values()) or any(chain is None for chain in scoped_tts_chains.values()):
         raise CredentialError("provider overrides must select a usable chain")
 
+    production_readiness: dict[str, bool] | None = None
+    if require_production:
+        effective_ingress_secret = ingress_secret if ingress_secret is not None else os.environ.get("RECORDER_INGRESS_SECRET")
+        if not isinstance(effective_ingress_secret, str) or not effective_ingress_secret:
+            raise CredentialError("production Recorder ingress secret is required")
+        if configured_asr_chain is None or configured_tts_chain is None:
+            raise CredentialError("production Recorder requires configured ASR and TTS chains")
+        if not config.hermes_base_url or not config.hermes_api_key_file:
+            raise CredentialError("production Recorder requires an authenticated Hermes gateway")
+
+        def probe_chain(chain: ProviderChain, kind: str) -> None:
+            for target in chain.targets:
+                if target.source in {"fixture", "static", "test"}:
+                    raise CredentialError(f"production {kind.upper()} chain contains a fixture provider")
+                provider = target.provider
+                readiness_check = getattr(provider, "readiness_check", None)
+                if callable(readiness_check):
+                    readiness_check()
+                    continue
+                health_check = getattr(provider, "health_check", None)
+                capability_check = getattr(provider, "capability_check", None)
+                if not callable(health_check) or not callable(capability_check):
+                    raise CredentialError(f"production {kind.upper()} provider has no bounded capability probes")
+                for result in (health_check(), capability_check()):
+                    if not isinstance(result, Mapping) or result.get("configured") is False or result.get("ok") is False or result.get("ready") is False:
+                        raise CredentialError(f"production {kind.upper()} provider capability is unavailable")
+
+        probe_chain(configured_asr_chain, "asr")
+        probe_chain(configured_tts_chain, "tts")
+        HttpHermesGateway(
+            config.hermes_base_url,
+            api_key_file=config.hermes_api_key_file,
+            max_request_bytes=config.gateway_max_request_bytes,
+            require_existing_session=True,
+        ).capability_check()
+        production_readiness = {"asr": True, "tts": True, "hermes": True}
+
     def build_asr(name: str, endpoint: str | None, model: str | None, credential_file: str | None) -> ASRProvider | None:
         normalized = name.strip().lower()
         if normalized in {"", "disabled", "none", "off"}:
@@ -2484,6 +2681,7 @@ def create_configured_service(config: "RecorderConfig", *, ingress_secret: str |
             config.hermes_base_url,
             api_key_file=config.hermes_api_key_file,
             max_request_bytes=config.gateway_max_request_bytes,
+            require_existing_session=require_production,
         )
 
     store = RecorderStore(
@@ -2521,4 +2719,5 @@ def create_configured_service(config: "RecorderConfig", *, ingress_secret: str |
         ingress_secret=ingress_secret,
         internal_worker_principals=config.internal_worker_principals,
         gateway_max_request_bytes=config.gateway_max_request_bytes,
+        production_readiness=production_readiness,
     )

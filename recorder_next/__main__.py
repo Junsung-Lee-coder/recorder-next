@@ -12,7 +12,7 @@ from typing import Callable
 
 from .config import RecorderConfig
 from .http import create_http_server
-from .service import create_configured_service, create_service
+from .service import create_configured_service
 
 
 SignalHandler = Callable[[int, FrameType | None], object] | int | None
@@ -21,7 +21,8 @@ APPLICATION_MAX_SECONDS = 3900.0
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Recorder Next standalone server")
-    parser.add_argument("--config", default=os.environ.get("RECORDER_NEXT_CONFIG"))
+    configured_path = os.environ.get("RECORDER_NEXT_CONFIG")
+    parser.add_argument("--config", default=configured_path, required=configured_path is None)
     parser.add_argument("--db", default=os.environ.get("RECORDER_NEXT_DB"))
     parser.add_argument("--storage-root", default=os.environ.get("RECORDER_NEXT_STORAGE_ROOT"))
     parser.add_argument("--host", default=os.environ.get("RECORDER_NEXT_HOST"))
@@ -125,11 +126,8 @@ def _credential_value(name: str) -> str | None:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    if args.config:
-        config_path = os.path.abspath(args.config)
-        config = RecorderConfig.from_file(config_path).resolved(base_dir=os.path.dirname(config_path))
-    else:
-        config = RecorderConfig()
+    config_path = os.path.abspath(args.config)
+    config = RecorderConfig.from_file(config_path).resolved(base_dir=os.path.dirname(config_path))
     config = apply_cli_overrides(
         config,
         db=args.db,
@@ -138,16 +136,7 @@ def main(argv: list[str] | None = None) -> int:
         port=args.port,
     )
     ingress_secret = _credential_value("recorder_ingress_secret")
-    if args.config:
-        service = create_configured_service(config, ingress_secret=ingress_secret)
-    else:
-        service = create_service(
-            config.database,
-            config.storage_root,
-            hermes_max_attempts=config.hermes_max_attempts,
-            hermes_grace_seconds=config.hermes_grace_seconds,
-            ingress_secret=ingress_secret,
-        )
+    service = create_configured_service(config, ingress_secret=ingress_secret, require_production=True)
     service.store.recover()
     server = create_http_server(service, host=config.host, port=config.port)
     shutdown = _ShutdownBridge(service, server)
