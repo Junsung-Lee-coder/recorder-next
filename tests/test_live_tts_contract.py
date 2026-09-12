@@ -66,6 +66,39 @@ class _TTSHandler(BaseHTTPRequestHandler):
         self.wfile.write(encoded)
         cast(_FixtureServer, self.server).fixture.last_status = status
 
+    def do_GET(self) -> None:
+        # Readiness probes now flow through the shared chain dispatcher, so
+        # the fixture must serve the bounded GET contract the real Hermes
+        # dashboard exposes: an ok/ready health and a supported edge-relay
+        # voice-config.  No synthesize endpoint is reachable via GET.
+        fixture = cast(_FixtureServer, self.server).fixture
+        parsed = urlsplit(self.path)
+        authorization = self.headers.get("Authorization", "")
+        session_token = self.headers.get("X-Hermes-Session-Token", "")
+        fixture.authorization_seen = bool(authorization)
+        fixture.authorization_valid = authorization == "Bearer fixture-secret"
+        fixture.session_token_seen = bool(session_token)
+        fixture.session_token_valid = session_token == "fixture-secret"
+        if parsed.path == "/api/health":
+            self._send(200, {"ok": True, "ready": True})
+            return
+        if parsed.path == "/api/audio/voice-config":
+            if not fixture.authorization_valid or not fixture.session_token_valid:
+                self._send(401, {"detail": "unauthorized"})
+                return
+            self._send(
+                200,
+                {
+                    "ok": True,
+                    "ready": True,
+                    "audio_api": True,
+                    "stt": {"mode": "relay", "reason": "provider 'edge' has no client wire"},
+                    "tts": {"mode": "relay", "reason": "provider 'edge' has no client wire", "provider": "edge", "ok": True},
+                },
+            )
+            return
+        self._send(404, {"detail": "not found"})
+
     def do_POST(self) -> None:
         fixture = cast(_FixtureServer, self.server).fixture
         parsed = urlsplit(self.path)

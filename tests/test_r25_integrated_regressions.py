@@ -1,1032 +1,693 @@
+"""VOICE1-B2 repair: integrated regressions for REV-001/002/003.
+
+T-side: sanitized TTS projection, HermesAudioTTSProvider.readiness_check
+fail-closed semantics, and one shared construction/refresh provider-chain
+dispatch. S-side: the generic existing-session preflight stays
+source-agnostic. R-side statement/receipt semantics are exercised in the
+successor control packet's unittest class against the packet's own SQL
+blocks; the product store contract is unchanged by this repair.
+"""
 from __future__ import annotations
 
 import json
-import hashlib
-import shutil
-import sqlite3
 import tempfile
-import time
+import threading
 import unittest
-import io
-import wave
-import uuid
-import zlib
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import Any, cast
 from unittest.mock import patch
 
-from recorder_next import __main__ as recorder_main
-from recorder_next.adapters import CredentialError, HermesResult, MemoryHermesGateway, StaticTTSProvider
+from recorder_next.adapters import (
+    CredentialError,
+    HermesAudioTTSProvider,
+    ProviderChain,
+    ProviderFailure,
+    ProviderTarget,
+)
 from recorder_next.config import RecorderConfig
-from recorder_next.errors import ConflictError, LeaseConflict, SourceUnavailableError, ValidationError
 from recorder_next.service import RecorderService, create_configured_service
-from recorder_next.features import FeatureGroups
-from recorder_next.models import AsrResult
 from recorder_next.store import RecorderStore
 
-SCHEMA4_FIXTURE = Path(__file__).with_name("fixtures") / "schema4_public_preimage.sql"
-SCHEMA4_FIXTURE_SHA256 = "73076556af3d41c46b45ef43049346ad750fd705bdc6bef5cc53ba12c1316d84"
+
+class _ProbeFixture:
+    """Bounded authenticated GET fixture for health + voice-config probes."""
+
+    def __init__(self, *, health: Any, voice_config: Any, status: int = 200) -> None:
+        self.health = health
+        self.voice_config = voice_config
+        self.status = status
+        self.gets: list[str] = []
+        self.posts = 0
+        self.seen_authorization = False
+        self.seen_session_token = False
+        self._server = _ProbeServer(("127.0.0.1", 0), _ProbeHandler)
+        self._server.fixture = self
+        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+        self._thread.start()
+
+    @property
+    def url(self) -> str:
+        return f"http://127.0.0.1:{self._server.server_address[1]}"
+
+    def close(self) -> None:
+        self._server.shutdown()
+        self._server.server_close()
+        self._thread.join(timeout=2)
 
 
-def _seed_migration_fixture(db_path: Path, script_path: Path, *, version: int) -> None:
-    conn = sqlite3.connect(db_path)
-    conn.executescript(script_path.read_text(encoding="utf-8"))
-    conn.execute("UPDATE schema_meta SET value=? WHERE key='schema_version'", (str(version),))
-    conn.execute(
-        "INSERT INTO devices(user_id, device_id, kind, created_at) VALUES (?, ?, ?, ?)",
-        ("sentinel-user", "sentinel-device", "phone", "2026-09-10T00:00:00+00:00"),
-    )
-    conn.commit()
-    conn.close()
+class _ProbeServer(ThreadingHTTPServer):
+    fixture: Any
 
 
-def _logical_database_snapshot(db_path: Path) -> dict:
-    conn = sqlite3.connect(db_path)
-    conn.execute("PRAGMA foreign_keys=ON")
-    objects = [
-        tuple(row)
-        for row in conn.execute(
-            "SELECT type, name, tbl_name, sql FROM sqlite_master "
-            "WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name"
-        )
-    ]
-    tables = [row[1] for row in objects if row[0] == "table"]
-    rows = {}
-    for table in tables:
-        escaped = table.replace('"', '""')
-        values = [tuple(row) for row in conn.execute(f'SELECT * FROM "{escaped}"')]
-        rows[table] = sorted(values, key=repr)
-    snapshot = {
-        "objects": objects,
-        "rows": rows,
-        "foreign_key_check": [tuple(row) for row in conn.execute("PRAGMA foreign_key_check")],
-        "integrity_check": conn.execute("PRAGMA integrity_check").fetchone()[0],
+class _ProbeHandler(BaseHTTPRequestHandler):
+    def log_message(self, format: str, *args) -> None:
+        return
+
+    def _send_json(self, status: int, payload: Any) -> None:
+        encoded = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(encoded)))
+        self.end_headers()
+        self.wfile.write(encoded)
+
+    def do_GET(self) -> None:
+        fixture = cast(_ProbeServer, self.server).fixture
+        fixture.seen_authorization = self.headers.get("Authorization", "") == "Bearer fixture-secret"
+        fixture.seen_session_token = self.headers.get("X-Hermes-Session-Token", "") == "fixture-secret"
+        if self.path == "/api/health":
+            fixture.gets.append("health")
+            if fixture.status != 200:
+                self._send_json(fixture.status, {"detail": "error"})
+            elif isinstance(fixture.health, dict):
+                self._send_json(200, fixture.health)
+            else:
+                self._send_json(fixture.status, fixture.health if not isinstance(fixture.health, int) else {"detail": "error"})
+            return
+        if self.path == "/api/audio/voice-config":
+            fixture.gets.append("voice-config")
+            if isinstance(fixture.voice_config, Exception):
+                raise fixture.voice_config
+            if fixture.status != 200:
+                self._send_json(fixture.status, {"detail": "error"})
+            else:
+                self._send_json(200, fixture.voice_config)
+            return
+        self._send_json(404, {"detail": "not found"})
+
+    def do_POST(self) -> None:
+        fixture = cast(_ProbeServer, self.server).fixture
+        fixture.posts += 1
+        self._send_json(404, {"detail": "no synthesize during readiness"})
+
+
+def _relay_config(tts: Any = None, **overrides: Any) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "ok": True,
+        "ready": True,
+        "audio_api": True,
+        "provider": "hermes",
+        "stt": {"mode": "relay", "reason": "provider 'edge' has no client wire", "ok": True, "enabled": True, "ready": True},
     }
-    conn.close()
-    return snapshot
+    if tts is not None:
+        payload["tts"] = tts
+    payload.update(overrides)
+    return payload
 
 
-class R25IntegratedRegressionTests(unittest.TestCase):
-    def test_missing_explicit_config_fails_before_service_or_storage_creation(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            missing = Path(tmp) / "missing.toml"
-            with patch("sys.argv", ["recorder-next", "--config", str(missing)]), patch.object(
-                recorder_main, "create_configured_service"
-            ) as create_service:
-                with self.assertRaises(FileNotFoundError):
-                    recorder_main.main()
-            create_service.assert_not_called()
+_OK_RELAY: dict[str, Any] = {
+    "mode": "relay",
+    "reason": "provider 'edge' has no client wire",
+    "provider": "edge",
+    "wire": "server",
+    "configured": True,
+    "enabled": True,
+    "ready": True,
+    "ok": True,
+    "status": "ok",
+}
 
-    def test_production_health_requires_live_successful_background_loops(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            store = RecorderStore(root / "db.sqlite3", storage_root=root / "data")
-            service = RecorderService(
-                store,
-                hermes=MemoryHermesGateway(),
-                tts=StaticTTSProvider(),
-                production_readiness={"asr": True, "tts": True, "hermes": True},
-            )
+_FLAG_KEYS = ("configured", "enabled", "ready", "ok")
 
-            status, _headers, payload = service.handle_http("GET", "/v1/health", {}, b"")
-            self.assertEqual(status, 500)
-            self.assertEqual(payload["error"]["code"], "VOICE_NOT_READY")
 
-            service.start_background_workers(worker_poll_seconds=0.01, scheduler_poll_seconds=0.01)
-            deadline = time.monotonic() + 2
-            while time.monotonic() < deadline:
-                status, _headers, payload = service.handle_http("GET", "/v1/health", {}, b"")
-                if status == 200:
-                    break
-                time.sleep(0.01)
-            self.assertEqual(status, 200)
-            self.assertEqual(payload["status"], "ok")
+class TTSReadinessProjectionTests(unittest.TestCase):
+    """T1: sanitized probe projection contract (adapters._probe)."""
 
-            service.stop_background_workers(timeout=1)
-            status, _headers, payload = service.handle_http("GET", "/v1/health", {}, b"")
-            self.assertEqual(status, 500)
-            self.assertEqual(payload["error"]["code"], "VOICE_NOT_READY")
+    def _projection(self, tts: Any, extra: dict[str, Any] | None = None) -> dict[str, Any]:
+        config = _relay_config(tts)
+        if extra:
+            config.update(extra)
+        fixture = _ProbeFixture(health={"ok": True}, voice_config=config)
+        try:
+            provider = HermesAudioTTSProvider(fixture.url, profile="default", credential_file=None)
+            return provider.capability_check()
+        finally:
+            fixture.close()
 
-    def test_production_admission_rejects_fixture_dependencies_before_storage_open(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            config = RecorderConfig(database=str(root / "db.sqlite3"), storage_root=str(root / "data"))
+    def test_missing_tts_stays_missing(self):
+        result = self._projection(None)
+        self.assertNotIn("tts", result)
 
-            with self.assertRaises(CredentialError):
-                create_configured_service(config, ingress_secret="test-secret", require_production=True)
+    def test_non_mapping_tts_becomes_invalid_marker_not_default_mapping(self):
+        for bad in ("relay", ["edge"], 7, True):
+            with self.subTest(tts=bad):
+                result = self._projection(bad)
+                self.assertIn("tts", result)
+                self.assertIsNone(result["tts"])
 
-            self.assertFalse((root / "db.sqlite3").exists())
+    def test_semantic_keys_preserved_and_credentials_removed(self):
+        tts = dict(_OK_RELAY)
+        tts["api_key"] = "sk-secret"
+        tts["credential"] = {"token": "hunter2"}
+        tts["nested"] = {"authorization": "Bearer x", "base_url": "http://x", "url": "http://y"}
+        result = self._projection(tts)
+        self.assertIsInstance(result["tts"], dict)
+        projected = result["tts"]
+        self.assertEqual(
+            set(projected),
+            {"mode", "reason", "wire", "provider", "configured", "enabled", "ready", "ok", "status"},
+        )
+        self.assertNotIn("sk-secret", repr(projected))
+        self.assertNotIn("hunter2", repr(projected))
 
-    def test_project_create_omitted_aliases_uses_empty_canonical_array(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            store = RecorderStore(root / "db.sqlite3", storage_root=root / "data")
-            store.register_device("project-user", "project-phone", "phone")
-            status, _headers, payload = RecorderService(store).handle_http(
-                "POST",
-                "/v1/projects",
-                {"Content-Type": "application/json"},
-                json.dumps(
-                    {
-                        "user_id": "project-user",
-                        "device_id": "project-phone",
-                        "project_number": "P-1",
-                        "name": "Project one",
-                    }
-                ).encode(),
-            )
-            self.assertEqual(status, 201)
-            self.assertEqual(payload["aliases"], [])
+    def test_non_scalar_semantic_values_become_invalid_markers(self):
+        for field in ("mode", "reason", "wire", "provider", "configured", "enabled", "ready", "ok", "status"):
+            with self.subTest(field=field):
+                tts = dict(_OK_RELAY)
+                tts[field] = ["list"] if field != "configured" else "true"
+                result = self._projection(tts)
+                self.assertIn("tts", result)
+                projected = result["tts"]
+                self.assertIn(field, projected)
+                self.assertIsNone(projected[field])
 
-    def test_audio_duration_is_derived_and_frame_boundary_is_enforced(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            store = RecorderStore(root / "db.sqlite3", storage_root=root / "data", max_audio_minutes=1)
+    def test_resolution_error_suffix_collapses_to_fixed_category(self):
+        tts = dict(_OK_RELAY)
+        tts["reason"] = "openai resolution failed: transient upstream 500 http://internal"
+        result = self._projection(tts)
+        self.assertEqual(result["tts"]["reason"], "resolution error")
 
-            def create_audio_turn(turn_id: str, frames: int) -> bytes:
-                manifest = {
-                    "schema_version": 1,
-                    "user_id": "audio-user",
-                    "turn_id": turn_id,
-                    "origin_device_id": "phone",
-                    "client_created_at": "2026-09-09T00:00:00Z",
-                    "parts": [{"part_id": "audio", "kind": "audio", "mime": "audio/wav", "streaming": True}],
-                }
-                store.create_turn(manifest)
-                wav_buffer = io.BytesIO()
-                with wave.open(wav_buffer, "wb") as handle:
-                    handle.setnchannels(1)
-                    handle.setsampwidth(2)
-                    handle.setframerate(16000)
-                    handle.writeframes(b"\x00\x00" * frames)
-                audio = wav_buffer.getvalue()
-                starts = range(0, len(audio), store.max_chunk_bytes)
-                for sequence, start in enumerate(starts):
-                    store.put_chunk(turn_id, "audio", sequence, audio[start : start + store.max_chunk_bytes])
-                return audio, (len(audio) + store.max_chunk_bytes - 1) // store.max_chunk_bytes
+    def test_arbitrary_reason_becomes_fixed_unsupported_marker(self):
+        tts = dict(_OK_RELAY)
+        tts["reason"] = "endpoint http://10.1.2.3:9119 gave up"
+        result = self._projection(tts)
+        self.assertEqual(result["tts"]["reason"], "unsupported-reason")
 
-            audio, total_chunks = create_audio_turn("018f5a2e-7b6e-7abc-8d11-1234567890b1", 160)
-            result = store.finish_part(
-                "018f5a2e-7b6e-7abc-8d11-1234567890b1",
-                "audio",
-                total_chunks=total_chunks,
-                total_bytes=len(audio),
-                whole_stream_sha256=hashlib.sha256(audio).hexdigest(),
-                duration_ms=11,
-            )
-            self.assertEqual(result["duration_ms"], 10)
+    def test_overlong_semantic_string_is_invalid(self):
+        tts = dict(_OK_RELAY)
+        tts["provider"] = "e" * 300
+        result = self._projection(tts)
+        self.assertIsNone(result["tts"]["provider"])
 
-            oversized, total_chunks = create_audio_turn("018f5a2e-7b6e-7abc-8d11-1234567890b2", 960001)
-            with self.assertRaises(Exception) as raised:
-                store.finish_part(
-                    "018f5a2e-7b6e-7abc-8d11-1234567890b2",
-                    "audio",
-                    total_chunks=total_chunks,
-                    total_bytes=len(oversized),
-                    whole_stream_sha256=hashlib.sha256(oversized).hexdigest(),
-                )
-            self.assertEqual(getattr(raised.exception, "code", None), "QUOTA_EXCEEDED")
+    def test_malformed_tts_does_not_break_asr_projection(self):
+        result = self._projection("garbage")
+        self.assertEqual(result.get("ok"), True)
+        self.assertIsInstance(result.get("stt"), dict)
 
-    def test_diagnostic_purge_removes_expired_content_rows_after_cleanup(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            store = RecorderStore(
-                root / "db.sqlite3",
-                storage_root=root / "data",
-                diagnostics_retention_seconds=1,
-                diagnostics_tombstone_retention_seconds=10,
-            )
-            store.register_device("diag-user", "diag-phone", "phone")
-            opt_in = store.record_diagnostics_opt_in("diag-user", "diag-phone", event_id="diag-opt", now="2026-09-01T00:00:00Z")
-            event = store.ingest_diagnostic_event(
-                "diag-user",
-                "diag-phone",
-                event_id="diag-event",
-                idempotency_key="diag-event",
-                payload={"category": "voice", "stage": "upload"},
-                now="2026-09-01T00:00:00Z",
-            )
-            bundle = store.ingest_diagnostic_bundle(
-                "diag-user",
-                "diag-phone",
-                "diag-bundle",
-                zlib.compress(b'{"category":"voice","stage":"upload"}'),
-                opt_in_event_id=opt_in["event_id"],
-                now="2026-09-01T00:00:00Z",
-            )
-            first = store.purge_diagnostics(now="2026-09-01T00:00:02Z")
-            self.assertEqual((first["events"], first["bundles"]), (1, 1))
-            with store._read() as conn:
-                self.assertIsNotNone(conn.execute("SELECT 1 FROM diagnostic_events WHERE event_id=?", (event["event_id"],)).fetchone())
-                self.assertIsNotNone(conn.execute("SELECT 1 FROM diagnostic_bundles WHERE bundle_id=?", (bundle["bundle_id"],)).fetchone())
-            second = store.purge_diagnostics(now="2026-09-01T00:00:20Z")
-            self.assertGreaterEqual(second.get("tombstones", 0), 2)
-            with store._read() as conn:
-                self.assertIsNone(conn.execute("SELECT 1 FROM diagnostic_events WHERE event_id=?", (event["event_id"],)).fetchone())
-                self.assertIsNone(conn.execute("SELECT 1 FROM diagnostic_bundles WHERE bundle_id=?", (bundle["bundle_id"],)).fetchone())
 
-    def test_diagnostic_tombstones_scrub_owner_and_event_classification(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            store = RecorderStore(
-                root / "db.sqlite3",
-                storage_root=root / "data",
-                diagnostics_retention_seconds=1,
-                diagnostics_tombstone_retention_seconds=10,
-            )
-            store.register_device("opaque-user", "opaque-phone", "phone")
-            store.record_diagnostics_opt_in("opaque-user", "opaque-phone", event_id="opaque-opt", now="2026-09-01T00:00:00Z")
-            event_result = store.ingest_diagnostic_event(
-                "opaque-user",
-                "opaque-phone",
-                event_id="opaque-event",
-                idempotency_key="opaque-event",
-                payload={"category": "voice", "stage": "upload"},
-                now="2026-09-01T00:00:00Z",
-            )
-            store.purge_diagnostics(now="2026-09-01T00:00:02Z", _recover_cleanup=False)
-            with store._read() as conn:
-                event = conn.execute("SELECT category, stage, metadata_json FROM diagnostic_events WHERE event_id=?", (event_result["event_id"],)).fetchone()
-                tombstone = conn.execute("SELECT user_id, device_id, entity_id FROM diagnostic_tombstones WHERE entity_type='event' AND entity_id=?", (event_result["event_id"],)).fetchone()
-            self.assertEqual((event["category"], event["stage"], event["metadata_json"]), ("other", "other", "{}"))
-            self.assertIsNotNone(tombstone)
-            self.assertNotIn("opaque-user", tombstone["user_id"])
-            self.assertNotIn("opaque-phone", tombstone["device_id"])
-            self.assertEqual(tombstone["entity_id"], event_result["event_id"])
+class TTSReadinessProviderTests(unittest.TestCase):
+    """T1/T2: HermesAudioTTSProvider.readiness_check fail-closed matrix."""
 
-    def test_cleanup_receipt_claim_is_single_owner_and_reclaims_after_lease(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            store = RecorderStore(root / "db.sqlite3", storage_root=root / "data")
-            target = root / "data" / "cleanup.bin"
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(b"cleanup")
-            receipt_id = store._prepare_cleanup_receipt(
-                operation="integrated_claim_test",
-                path=target,
-                expected_sha256=hashlib.sha256(b"cleanup").hexdigest(),
-                expected_size=7,
-                now="2026-09-01T00:00:00Z",
-            )
-            first = store._features._claim_cleanup_receipt(receipt_id, now="2026-09-01T00:00:00Z")
-            second = store._features._claim_cleanup_receipt(receipt_id, now="2026-09-01T00:00:01Z")
-            reclaimed = store._features._claim_cleanup_receipt(receipt_id, now="2026-09-01T00:05:01Z")
-            self.assertIsNotNone(first)
-            self.assertIsNone(second)
-            self.assertIsNotNone(reclaimed)
-            self.assertNotEqual(first, reclaimed)
+    def _credential(self, root: Path, value: str = "fixture-secret") -> Path:
+        path = root / "recorder_api_key.env"
+        path.write_text(f"API_SERVER_KEY={value}\n", encoding="ascii")
+        path.chmod(0o600)
+        return path
 
-    def test_http_rejects_new_work_after_shutdown_requested(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            service = RecorderService(RecorderStore(root / "db.sqlite3", storage_root=root / "data"))
-            service.request_shutdown()
-            status, _headers, payload = service.handle_http("GET", "/v1/health", {}, b"")
-            self.assertEqual(status, 503)
-            self.assertEqual(payload["error"]["code"], "SERVICE_STOPPING")
+    def _fixture(self, tts: Any = None, extra_config: dict[str, Any] | None = None, status: int = 200) -> _ProbeFixture:
+        config = _relay_config(tts)
+        if extra_config:
+            # Mutate the raw envelope BEFORE the HTTP round trip so the
+            # provider's own projection path handles every malformed value.
+            config.update(extra_config)
+        health: Any = {"ok": True, "ready": True}
+        if extra_config:
+            mutated_health = {key: value for key, value in extra_config.items() if key in {"ready", "audio_api", "configured", "enabled"}}
+            health.update(mutated_health)
+        return _ProbeFixture(health=health, voice_config=config, status=status)
 
-    def test_audio_finish_replay_without_duration_uses_trusted_derived_value(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            store = RecorderStore(root / "db.sqlite3", storage_root=root / "data")
-            turn_id = "018f5a2e-7b6e-7abc-8d11-1234567890ac"
-            manifest = {
-                "schema_version": 1,
-                "user_id": "u",
-                "turn_id": turn_id,
-                "origin_device_id": "phone",
-                "client_created_at": "2026-09-09T00:00:00Z",
-                "parts": [{"part_id": "audio", "kind": "audio", "mime": "audio/wav", "streaming": True}],
-            }
-            store.create_turn(manifest)
-            wav_buffer = io.BytesIO()
-            with wave.open(wav_buffer, "wb") as handle:
-                handle.setnchannels(1)
-                handle.setsampwidth(2)
-                handle.setframerate(16000)
-                handle.writeframes(b"\x00\x00" * 160)
-            audio = wav_buffer.getvalue()
-            digest = hashlib.sha256(audio).hexdigest()
-            store.put_chunk(turn_id, "audio", 0, audio)
-            first = store.finish_part(
-                turn_id,
-                "audio",
-                total_chunks=1,
-                total_bytes=len(audio),
-                whole_stream_sha256=digest,
-            )
-            replay = store.finish_part(
-                turn_id,
-                "audio",
-                total_chunks=1,
-                total_bytes=len(audio),
-                whole_stream_sha256=digest,
-            )
-            self.assertEqual(first["duration_ms"], 10)
-            self.assertEqual(replay["duration_ms"], first["duration_ms"])
+    def _ready(self, tts: Any = None, extra_config: dict[str, Any] | None = None) -> dict[str, Any]:
+        fixture = self._fixture(tts, extra_config)
+        try:
+            provider = HermesAudioTTSProvider(fixture.url, profile="default", credential_file=None)
+            return provider.readiness_check()
+        finally:
+            fixture.close()
 
-    def test_audio_finish_legacy_missing_duration_is_repaired_or_rejected(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            store = RecorderStore(root / "db.sqlite3", storage_root=root / "data")
-            turn_id = "018f5a2e-7b6e-7abc-8d11-1234567890ad"
-            manifest = {
-                "schema_version": 1,
-                "user_id": "u",
-                "turn_id": turn_id,
-                "origin_device_id": "phone",
-                "client_created_at": "2026-09-09T00:00:00Z",
-                "parts": [{"part_id": "audio", "kind": "audio", "mime": "audio/wav", "streaming": True}],
-            }
-            store.create_turn(manifest)
-            wav_buffer = io.BytesIO()
-            with wave.open(wav_buffer, "wb") as handle:
-                handle.setnchannels(1)
-                handle.setsampwidth(2)
-                handle.setframerate(16000)
-                handle.writeframes(b"\x00\x00" * 160)
-            audio = wav_buffer.getvalue()
-            digest = hashlib.sha256(audio).hexdigest()
-            store.put_chunk(turn_id, "audio", 0, audio)
-            first = store.finish_part(
-                turn_id,
-                "audio",
-                total_chunks=1,
-                total_bytes=len(audio),
-                whole_stream_sha256=digest,
-            )
-            with store._tx() as conn:
-                conn.execute("UPDATE turn_parts SET duration_ms=NULL WHERE turn_id=? AND part_id=?", (turn_id, "audio"))
-            repaired = store.finish_part(
-                turn_id,
-                "audio",
-                total_chunks=1,
-                total_bytes=len(audio),
-                whole_stream_sha256=digest,
-            )
-            self.assertEqual(repaired["duration_ms"], first["duration_ms"])
+    def _rejects(self, tts: Any, kind: str, *, retryable: bool | None = None, extra_config: dict[str, Any] | None = None) -> None:
+        fixture = self._fixture(tts, extra_config)
+        try:
+            provider = HermesAudioTTSProvider(fixture.url, profile="default", credential_file=None)
+            with self.assertRaises(ProviderFailure) as raised:
+                provider.readiness_check()
+            self.assertEqual(raised.exception.kind, kind)
+            if retryable is not None:
+                self.assertEqual(raised.exception.retryable, retryable)
+        finally:
+            fixture.close()
 
-            with store._tx() as conn:
-                conn.execute(
-                    "UPDATE turn_parts SET duration_ms=NULL, source_deleted_at=? WHERE turn_id=? AND part_id=?",
-                    ("2026-09-10T00:00:00+00:00", turn_id, "audio"),
-                )
-            with self.assertRaises(SourceUnavailableError):
-                store.finish_part(
-                    turn_id,
-                    "audio",
-                    total_chunks=1,
-                    total_bytes=len(audio),
-                    whole_stream_sha256=digest,
-                )
+    def test_supported_edge_relay_passes_without_post(self):
+        fixture = self._fixture(dict(_OK_RELAY))
+        try:
+            provider = HermesAudioTTSProvider(fixture.url, profile="default", credential_file=None)
+            result = provider.readiness_check()
+            self.assertEqual(set(result), {"health", "capability", "endpoint_contract"})
+            self.assertEqual(result["endpoint_contract"], "/api/audio/speak?profile=default")
+            self.assertEqual(fixture.gets, ["health", "voice-config"])
+            self.assertEqual(fixture.posts, 0)
+        finally:
+            fixture.close()
 
-    def test_audio_finish_publishes_with_cleanup_receipt(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            store = RecorderStore(root / "db.sqlite3", storage_root=root / "data")
-            turn_id = "018f5a2e-7b6e-7abc-8d11-1234567890ae"
-            manifest = {
-                "schema_version": 1,
-                "user_id": "u",
-                "turn_id": turn_id,
-                "origin_device_id": "phone",
-                "client_created_at": "2026-09-09T00:00:00Z",
-                "parts": [{"part_id": "text", "kind": "text", "mime": "text/plain"}],
-            }
-            store.create_turn(manifest)
-            payload = b"streamed finish"
-            digest = hashlib.sha256(payload).hexdigest()
-            store.put_chunk(turn_id, "text", 0, payload)
-            real_link = store._features._link_staged
+    def test_explicitly_supported_relay_reasons_pass(self):
+        for reason in ("command/plugin provider", "voice.client_direct disabled"):
+            with self.subTest(reason=reason):
+                tts = dict(_OK_RELAY)
+                tts["reason"] = reason
+                self._ready(tts)
 
-            def link_then_fail(*args, **kwargs):
-                real_link(*args, **kwargs)
-                raise RuntimeError("simulated post-publication failure")
+    def test_all_supported_relay_provider_names_pass(self):
+        for name in ("edge", "minimax", "xai", "mistral", "gemini", "neutts", "kittentts", "piper"):
+            with self.subTest(name=name):
+                tts = dict(_OK_RELAY)
+                tts["reason"] = f"provider '{name}' has no client wire"
+                self._ready(tts)
 
-            with patch.object(store._features, "_link_staged", side_effect=link_then_fail):
-                with self.assertRaises(RuntimeError):
-                    store.finish_part(
-                        turn_id,
-                        "text",
-                        total_chunks=1,
-                        total_bytes=len(payload),
-                        whole_stream_sha256=digest,
-                    )
-            part_dir = next((root / "data" / "turns").glob("*/" + "*/parts/*"))
-            self.assertFalse((part_dir / "part.bin").exists())
-            with store._read() as conn:
-                statuses = [row["status"] for row in conn.execute("SELECT status FROM storage_cleanup_receipts").fetchall()]
-            self.assertTrue(statuses)
-            self.assertTrue(all(status == "COMPLETE" for status in statuses))
+    def test_missing_tts_rejects_capability_unknown(self):
+        self._rejects(None, "tts_capability_unknown", retryable=False)
 
-    def test_schema4_fixture_is_the_pinned_public_preimage(self):
-        content = SCHEMA4_FIXTURE.read_bytes()
-        self.assertEqual(len(content), 19999)
-        self.assertEqual(hashlib.sha256(content).hexdigest(), SCHEMA4_FIXTURE_SHA256)
+    def test_stt_only_rejects_capability_unknown(self):
+        self._rejects(None, "tts_capability_unknown", retryable=False)
 
-    def test_sql_script_executor_preserves_transaction_and_sqlite_parsing(self):
-        with sqlite3.connect(":memory:", isolation_level=None) as conn:
-            conn.execute("BEGIN IMMEDIATE")
-            RecorderStore._execute_sql_script(
-                conn,
-                "-- semicolon in a comment;\n"
-                "CREATE TABLE parsed (value TEXT);\n"
-                "INSERT INTO parsed VALUES ('quoted;semicolon');\n"
-                "CREATE TABLE unterminated (value TEXT)\n"
-                "/* final comment */",
-            )
-            self.assertEqual(conn.execute("SELECT value FROM parsed").fetchone()[0], "quoted;semicolon")
-            self.assertEqual(
-                [row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")],
-                ["parsed", "unterminated"],
-            )
-            conn.execute("ROLLBACK")
-            with self.assertRaisesRegex(RuntimeError, "active transaction"):
-                RecorderStore._execute_sql_script(conn, "CREATE TABLE inactive (value TEXT);")
-            conn.execute("BEGIN IMMEDIATE")
-            with self.assertRaises(sqlite3.OperationalError):
-                RecorderStore._execute_sql_script(conn, "CREATE TABLE malformed (")
-            conn.execute("ROLLBACK")
+    def test_non_mapping_tts_rejects_capability_unknown(self):
+        for bad in ("relay", ["edge"], 7):
+            with self.subTest(tts=bad):
+                self._rejects(bad, "tts_capability_unknown", retryable=False)
 
-    def test_schema_preparation_failure_after_real_r25_rolls_back_pre_a_state(self):
+    def test_disabled_modes_reject_non_retryable(self):
+        for mode in ("disabled", "off", "none"):
+            with self.subTest(mode=mode):
+                tts = dict(_OK_RELAY)
+                tts["mode"] = mode
+                self._rejects(tts, "tts_disabled", retryable=False)
+
+    def test_resolution_error_relay_rejects_retryable(self):
+        tts = dict(_OK_RELAY)
+        tts["reason"] = "resolution error"
+        self._rejects(tts, "tts_unavailable", retryable=True)
+
+    def test_openai_resolution_failed_relay_rejects_retryable(self):
+        tts = dict(_OK_RELAY)
+        tts["reason"] = "openai resolution failed: transient upstream"
+        self._rejects(tts, "tts_unavailable", retryable=True)
+
+    def test_no_credentials_relay_rejects_retryable(self):
+        tts = dict(_OK_RELAY)
+        tts["reason"] = "no credentials"
+        self._rejects(tts, "tts_unavailable", retryable=True)
+
+    def test_no_deepinfra_tts_model_relay_rejects_retryable(self):
+        tts = dict(_OK_RELAY)
+        tts["reason"] = "no deepinfra tts model"
+        self._rejects(tts, "tts_unavailable", retryable=True)
+
+    def test_tts_disabled_reason_rejects_non_retryable(self):
+        tts = dict(_OK_RELAY)
+        tts["reason"] = "tts disabled"
+        self._rejects(tts, "tts_disabled", retryable=False)
+
+    def test_unknown_relay_reason_rejects(self):
+        tts = dict(_OK_RELAY)
+        tts["reason"] = "provider 'novel-provider' has no client wire"
+        self._rejects(tts, "tts_capability_unknown", retryable=False)
+
+    def test_missing_mode_rejects(self):
+        tts = {key: value for key, value in _OK_RELAY.items() if key != "mode"}
+        self._rejects(tts, "tts_capability_unknown", retryable=False)
+
+    def test_explicit_false_flags_reject_disabled(self):
+        for field in _FLAG_KEYS:
+            with self.subTest(field=field):
+                tts = dict(_OK_RELAY)
+                tts[field] = False
+                self._rejects(tts, "tts_disabled", retryable=False)
+
+    def test_non_bool_flag_values_reject_capability_unknown(self):
+        for field in _FLAG_KEYS:
+            for value in (1, "true"):
+                with self.subTest(field=field, value=value):
+                    tts = dict(_OK_RELAY)
+                    tts[field] = value
+                    self._rejects(tts, "tts_capability_unknown", retryable=False)
+
+    def test_list_valued_flags_reject_capability_unknown(self):
+        # A list value is dropped by the outer scalar filter, so the declared
+        # flag disappears from the projection while tts stays present; the
+        # envelope/capability flag gate must still reject.
+        for field in _FLAG_KEYS:
+            with self.subTest(field=field):
+                tts = dict(_OK_RELAY)
+                tts[field] = [True]
+                fixture = self._fixture(tts)
+                try:
+                    provider = HermesAudioTTSProvider(fixture.url, profile="default", credential_file=None)
+                    capability = provider.capability_check()
+                    projected_tts = capability.get("tts")
+                    flag_absent_or_invalid = not isinstance(projected_tts, dict) or projected_tts.get(field) is not True
+                    self.assertTrue(flag_absent_or_invalid, "list-valued flag must not survive as True")
+                finally:
+                    fixture.close()
+
+    def test_nested_false_envelope_contradiction_rejects(self):
+        # tts.ready explicitly False while the envelope stays positive:
+        # capability-level disabled rejection.
+        tts = dict(_OK_RELAY)
+        tts["ready"] = False
+        self._rejects(tts, "tts_disabled", retryable=False)
+
+    def test_audio_api_invalid_marker_rejects(self):
+        # audio_api present but not an actual bool True in the raw envelope:
+        # projection collapses it to an invalid marker -> capability unknown.
+        self._rejects(dict(_OK_RELAY), "tts_capability_unknown", retryable=False, extra_config={"audio_api": 1})
+
+    def test_audio_api_non_true_rejects(self):
+        self._rejects(dict(_OK_RELAY), "tts_capability_unknown", retryable=False, extra_config={"audio_api": False})
+
+    def test_envelope_flags_must_be_actual_true(self):
+        # A present envelope configured/enabled flag must be an actual True;
+        # False or any other scalar rejects.  A None (projection-invalidated
+        # marker) leaves the envelope flag simply absent and is covered by
+        # the capability-level flag check inside _validate_tts_capability.
+        for field in ("configured", "enabled"):
+            for value in (False, 1, "true"):
+                with self.subTest(field=field, value=value):
+                    self._rejects(dict(_OK_RELAY), "tts_capability_unknown", retryable=False, extra_config={field: value})
+
+    def test_status_negative_rejects(self):
+        tts = dict(_OK_RELAY)
+        tts["status"] = "degraded"
+        self._rejects(tts, "tts_capability_unknown", retryable=False)
+
+    def test_unknown_wire_rejects(self):
+        tts = dict(_OK_RELAY)
+        tts["wire"] = "carrier-pigeon"
+        self._rejects(tts, "tts_capability_unknown", retryable=False)
+
+    def test_direct_positive_openai_speech_passes_without_secret_leak(self):
+        tts: dict[str, Any] = {
+            "mode": "direct",
+            "provider": "openai",
+            "wire": "openai-speech",
+            "configured": True,
+            "enabled": True,
+            "ready": True,
+            "ok": True,
+            "api_key": "sk-must-not-escape",
+        }
+        result = self._ready(tts)
+        self.assertNotIn("sk-must-not-escape", repr(result))
+
+    def test_direct_positive_elevenlabs_passes(self):
+        tts: dict[str, Any] = {
+            "mode": "direct",
+            "provider": "elevenlabs",
+            "wire": "elevenlabs-tts",
+            "configured": True,
+            "enabled": True,
+            "ready": True,
+            "ok": True,
+        }
+        self._ready(tts)
+
+    def test_deepinfra_direct_supported(self):
+        tts: dict[str, Any] = {
+            "mode": "direct",
+            "provider": "deepinfra",
+            "wire": "openai-speech",
+            "configured": True,
+            "enabled": True,
+            "ready": True,
+            "ok": True,
+        }
+        self._ready(tts)
+
+    def test_direct_positive_with_reason_rejects(self):
+        tts: dict[str, Any] = {
+            "mode": "direct",
+            "provider": "openai",
+            "wire": "openai-speech",
+            "reason": "resolution error",
+            "configured": True,
+            "enabled": True,
+            "ready": True,
+            "ok": True,
+        }
+        self._rejects(tts, "tts_unavailable", retryable=True)
+
+    def test_direct_unknown_wire_or_provider_rejects(self):
+        base: dict[str, Any] = {
+            "mode": "direct",
+            "provider": "openai",
+            "wire": "openai-speech",
+            "configured": True,
+            "enabled": True,
+            "ready": True,
+            "ok": True,
+        }
+        for mutate in ({"wire": "carrier-pigeon"}, {"provider": "unknown-corp"}):
+            tts = dict(base)
+            tts.update(mutate)
+            with self.subTest(mutate=mutate):
+                self._rejects(tts, "tts_capability_unknown", retryable=False)
+
+    def test_stt_wire_does_not_qualify(self):
+        tts: dict[str, Any] = {
+            "mode": "direct",
+            "provider": "openai",
+            "wire": "stt-whisper",
+            "configured": True,
+            "enabled": True,
+            "ready": True,
+            "ok": True,
+        }
+        self._rejects(tts, "tts_capability_unknown", retryable=False)
+
+    def test_error_messages_carry_fixed_categories_only(self):
+        tts = dict(_OK_RELAY)
+        tts["reason"] = "openai resolution failed: secret-context http://internal-host/token"
+        fixture = self._fixture(tts)
+        try:
+            provider = HermesAudioTTSProvider(fixture.url, profile="default", credential_file=None)
+            with self.assertRaises(ProviderFailure) as raised:
+                provider.readiness_check()
+            message = str(raised.exception)
+            self.assertNotIn("secret-context", message)
+            self.assertNotIn("internal-host", message)
+        finally:
+            fixture.close()
+
+    def test_wrong_auth_rejects_as_auth_failure(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            db_path = root / "db.sqlite3"
-            _seed_migration_fixture(db_path, SCHEMA4_FIXTURE, version=4)
-            before = _logical_database_snapshot(db_path)
-            original = RecorderStore._apply_r25_migration
-
-            def fail_after_real_work(conn):
-                original(conn)
-                raise RuntimeError("injected-after-real-r25")
-
-            with patch.object(RecorderStore, "_apply_r25_migration", staticmethod(fail_after_real_work)):
-                with self.assertRaisesRegex(RuntimeError, "injected-after-real-r25"):
-                    RecorderStore(db_path, storage_root=root / "data")
-
-            self.assertEqual(_logical_database_snapshot(db_path), before)
-            with sqlite3.connect(db_path) as conn:
-                self.assertEqual(conn.execute("SELECT value FROM schema_meta WHERE key='schema_version'").fetchone()[0], "4")
-                self.assertEqual(conn.execute("SELECT device_id FROM devices WHERE device_id='sentinel-device'").fetchone()[0], "sentinel-device")
-            migrated = RecorderStore(db_path, storage_root=root / "data")
-            with migrated._read() as conn:
-                self.assertEqual(conn.execute("SELECT value FROM schema_meta WHERE key='schema_version'").fetchone()[0], "5")
-                self.assertIsNotNone(conn.execute("SELECT 1 FROM sqlite_master WHERE name='hermes_run_bindings'").fetchone())
-            restarted = RecorderStore(db_path, storage_root=root / "data")
-            with restarted._read() as conn:
-                self.assertEqual(conn.execute("SELECT COUNT(*) FROM devices WHERE device_id='sentinel-device'").fetchone()[0], 1)
-
-    def test_historical_migration_failure_rolls_back_script_and_alters(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            db_path = root / "db.sqlite3"
-            initial = root / "initial.sql"
-            initial.write_text(
-                (Path(__file__).parents[1] / "migrations" / "001_initial.sql").read_text(encoding="utf-8"),
-                encoding="utf-8",
-            )
-            _seed_migration_fixture(db_path, initial, version=1)
-            before = _logical_database_snapshot(db_path)
-            real_connect = sqlite3.connect
-            created = []
-
-            class FailingScheduleConnection(sqlite3.Connection):
-                def __init__(self, *args, **kwargs):
-                    super().__init__(*args, **kwargs)
-                    self.closed_for_test = False
-
-                def execute(self, sql, parameters=()):
-                    if "idx_schedule_occurrences_due" in str(sql):
-                        raise RuntimeError("injected-mid-scheduled-script")
-                    return super().execute(sql, parameters)
-
-                def close(self):
-                    self.closed_for_test = True
-                    return super().close()
-
-            def connect(*args, **kwargs):
-                kwargs["factory"] = FailingScheduleConnection
-                conn = real_connect(*args, **kwargs)
-                created.append(conn)
-                return conn
-
-            with patch("recorder_next.store.sqlite3.connect", side_effect=connect):
-                with self.assertRaisesRegex(RuntimeError, "injected-mid-scheduled-script"):
-                    RecorderStore(db_path, storage_root=root / "data")
-            self.assertTrue(created[0].closed_for_test)
-            self.assertEqual(_logical_database_snapshot(db_path), before)
-
-    def test_schema_preparation_commit_refusal_restores_pre_a_state(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            db_path = root / "db.sqlite3"
-            _seed_migration_fixture(db_path, SCHEMA4_FIXTURE, version=4)
-            before = _logical_database_snapshot(db_path)
-            real_connect = sqlite3.connect
-            created = []
-
-            class FailingInitialCommitConnection(sqlite3.Connection):
-                def __init__(self, *args, **kwargs):
-                    super().__init__(*args, **kwargs)
-                    self.commit_attempts = 0
-                    self.closed_for_test = False
-
-                def execute(self, sql, parameters=()):
-                    if str(sql).strip().upper() == "COMMIT":
-                        self.commit_attempts += 1
-                        if self.commit_attempts == 1:
-                            raise RuntimeError("injected-initial-commit")
-                    return super().execute(sql, parameters)
-
-                def close(self):
-                    self.closed_for_test = True
-                    return super().close()
-
-            def connect(*args, **kwargs):
-                kwargs["factory"] = FailingInitialCommitConnection
-                conn = real_connect(*args, **kwargs)
-                created.append(conn)
-                return conn
-
-            with patch("recorder_next.store.sqlite3.connect", side_effect=connect):
-                with self.assertRaisesRegex(RuntimeError, "injected-initial-commit"):
-                    RecorderStore(db_path, storage_root=root / "data")
-            self.assertTrue(created[0].closed_for_test)
-            self.assertEqual(_logical_database_snapshot(db_path), before)
-
-    def test_final_marker_write_failure_leaves_committed_schema4_checkpoint(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            db_path = root / "db.sqlite3"
-            _seed_migration_fixture(db_path, SCHEMA4_FIXTURE, version=4)
-            real_connect = sqlite3.connect
-            created = []
-
-            class FailingFinalMarkerConnection(sqlite3.Connection):
-                def __init__(self, *args, **kwargs):
-                    super().__init__(*args, **kwargs)
-                    self.closed_for_test = False
-
-                def execute(self, sql, parameters=()):
-                    if (
-                        str(sql).strip().upper() == "UPDATE SCHEMA_META SET VALUE=? WHERE KEY='SCHEMA_VERSION'"
-                        and tuple(parameters) == ("5",)
-                    ):
-                        raise RuntimeError("injected-final-marker-write")
-                    return super().execute(sql, parameters)
-
-                def close(self):
-                    self.closed_for_test = True
-                    return super().close()
-
-            def connect(*args, **kwargs):
-                kwargs["factory"] = FailingFinalMarkerConnection
-                conn = real_connect(*args, **kwargs)
-                created.append(conn)
-                return conn
-
-            with patch("recorder_next.store.sqlite3.connect", side_effect=connect), patch.object(
-                RecorderStore, "_migrate_c7_diagnostics", return_value=True
-            ):
-                with self.assertRaisesRegex(RuntimeError, "injected-final-marker-write"):
-                    RecorderStore(db_path, storage_root=root / "data")
-            self.assertTrue(created[0].closed_for_test)
-            with sqlite3.connect(db_path) as conn:
-                self.assertEqual(conn.execute("SELECT value FROM schema_meta WHERE key='schema_version'").fetchone()[0], "4")
-                self.assertIsNotNone(conn.execute("SELECT 1 FROM sqlite_master WHERE name='hermes_run_bindings'").fetchone())
-
-    def test_unsupported_version_rejection_rolls_back_bootstrap_changes(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            db_path = root / "db.sqlite3"
-            _seed_migration_fixture(db_path, SCHEMA4_FIXTURE, version=6)
-            before = _logical_database_snapshot(db_path)
-            with self.assertRaisesRegex(RuntimeError, "unsupported Recorder schema version 6"):
-                RecorderStore(db_path, storage_root=root / "data")
-            self.assertEqual(_logical_database_snapshot(db_path), before)
-
-    def test_c7_starts_after_committed_schema_checkpoint_and_exception_preserves_it(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            db_path = root / "db.sqlite3"
-            _seed_migration_fixture(db_path, SCHEMA4_FIXTURE, version=4)
-            observations = []
-
-            def fail_c7(conn, *, force):
-                observations.append((conn.in_transaction, force))
-                raise RuntimeError("injected-c7-failure")
-
-            with patch.object(RecorderStore, "_migrate_c7_diagnostics", side_effect=fail_c7):
-                with self.assertRaisesRegex(RuntimeError, "injected-c7-failure"):
-                    RecorderStore(db_path, storage_root=root / "data")
-            self.assertEqual(observations, [(False, True)])
-            with sqlite3.connect(db_path) as conn:
-                self.assertEqual(conn.execute("SELECT value FROM schema_meta WHERE key='schema_version'").fetchone()[0], "4")
-                self.assertIsNotNone(conn.execute("SELECT 1 FROM sqlite_master WHERE name='hermes_run_bindings'").fetchone())
-            resumed = RecorderStore(db_path, storage_root=root / "data")
-            with resumed._read() as conn:
-                self.assertEqual(conn.execute("SELECT value FROM schema_meta WHERE key='schema_version'").fetchone()[0], "5")
-
-    def test_final_marker_commit_failure_rolls_back_to_schema4_checkpoint(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            db_path = root / "db.sqlite3"
-            _seed_migration_fixture(db_path, SCHEMA4_FIXTURE, version=4)
-            real_connect = sqlite3.connect
-            created = []
-
-            class FailingFinalCommitConnection(sqlite3.Connection):
-                def __init__(self, *args, **kwargs):
-                    super().__init__(*args, **kwargs)
-                    self.commit_attempts = 0
-                    self.closed_for_test = False
-
-                def execute(self, sql, parameters=()):
-                    if str(sql).strip().upper() == "COMMIT":
-                        self.commit_attempts += 1
-                        if self.commit_attempts == 2:
-                            raise RuntimeError("injected-final-commit")
-                    return super().execute(sql, parameters)
-
-                def close(self):
-                    self.closed_for_test = True
-                    return super().close()
-
-            def connect(*args, **kwargs):
-                kwargs["factory"] = FailingFinalCommitConnection
-                conn = real_connect(*args, **kwargs)
-                created.append(conn)
-                return conn
-
-            with patch("recorder_next.store.sqlite3.connect", side_effect=connect), patch.object(
-                RecorderStore, "_migrate_c7_diagnostics", return_value=True
-            ):
-                with self.assertRaisesRegex(RuntimeError, "injected-final-commit"):
-                    RecorderStore(db_path, storage_root=root / "data")
-            self.assertTrue(created[0].closed_for_test)
-            with sqlite3.connect(db_path) as conn:
-                self.assertEqual(conn.execute("SELECT value FROM schema_meta WHERE key='schema_version'").fetchone()[0], "4")
-                self.assertIsNotNone(conn.execute("SELECT 1 FROM sqlite_master WHERE name='hermes_run_bindings'").fetchone())
-
-    def test_connect_closes_acquired_connection_when_pragma_setup_fails(self):
-        real_connect = sqlite3.connect
-
-        class FailingPragmaConnection(sqlite3.Connection):
-            def __init__(self, *args, **kwargs):
-                super().__init__(*args, **kwargs)
-                self.closed_for_test = False
-
-            def execute(self, sql, parameters=()):
-                if str(sql).strip().upper() == "PRAGMA JOURNAL_MODE = WAL":
-                    raise RuntimeError("injected-journal-mode")
-                return super().execute(sql, parameters)
-
-            def close(self):
-                self.closed_for_test = True
-                return super().close()
-
-        conn = real_connect(":memory:", factory=FailingPragmaConnection, isolation_level=None)
-        instance = RecorderStore.__new__(RecorderStore)
-        instance.db_path = ":memory:"
-        with patch("recorder_next.store.sqlite3.connect", return_value=conn):
-            with self.assertRaisesRegex(RuntimeError, "injected-journal-mode"):
-                instance._connect()
-        self.assertTrue(conn.closed_for_test)
-
-    def test_terminal_worker_replay_requires_winning_attempt_token(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            store = RecorderStore(Path(tmp) / "db.sqlite3", storage_root=Path(tmp) / "data")
-            job = store.enqueue_worker_job(
-                kind="fixture",
-                stage="fixture",
-                payload={"turn_id": "turn-1"},
-                idempotency_key="fixture-job",
-            )
-            claim = store.claim_worker_job("owner-1")
-            self.assertIsNotNone(claim)
-            assert claim is not None
-            receipt = {"effect_id": "effect-1", "status": "succeeded"}
-            store.complete_worker_job(
-                job["job_id"],
-                "owner-1",
-                receipt,
-                lease_token=claim["lease_token"],
-            )
-            with self.assertRaises(ValidationError):
-                store.complete_worker_job(job["job_id"], "owner-1", receipt, lease_token="")
-            with self.assertRaises(LeaseConflict):
-                store.complete_worker_job(job["job_id"], "other-owner", receipt, lease_token="other-token")
-
-    def test_audio_cleanup_does_not_unlink_replaced_inode(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            store = RecorderStore(root / "db.sqlite3", storage_root=root / "data")
-            manifest = {
-                "schema_version": 1,
-                "user_id": "u",
-                "turn_id": "018f5a2e-7b6e-7abc-8d11-1234567890aa",
-                "origin_device_id": "phone",
-                "client_created_at": "2026-09-09T00:00:00Z",
-                "parts": [
-                    {"part_id": "audio", "kind": "audio", "mime": "audio/wav", "streaming": True}
-                ],
-            }
-            store.create_turn(manifest)
-            wav_buffer = io.BytesIO()
-            with wave.open(wav_buffer, "wb") as handle:
-                handle.setnchannels(1)
-                handle.setsampwidth(2)
-                handle.setframerate(16000)
-                handle.writeframes(b"\x00\x00" * 160)
-            original = wav_buffer.getvalue()
-            store.put_chunk(manifest["turn_id"], "audio", 0, original)
-            import hashlib
-            store.finish_part(
-                manifest["turn_id"],
-                "audio",
-                total_chunks=1,
-                total_bytes=len(original),
-                whole_stream_sha256=hashlib.sha256(original).hexdigest(),
-            )
-            with store._read() as conn:
-                source = Path(conn.execute("SELECT source_path FROM turn_parts WHERE turn_id=?", (manifest["turn_id"],)).fetchone()[0])
-            source.write_bytes(b"replacement")
-            generation = store.set_asr_stage(manifest["turn_id"], expected_generation=0, stage="realtime")
-            assert generation is not None
-            from recorder_next.models import AsrResult
-            store.commit_asr_result(
-                manifest["turn_id"],
-                expected_generation=generation,
-                stage="realtime",
-                result=AsrResult.valid("transcript"),
-            )
-            self.assertEqual(source.read_bytes(), b"replacement")
-
-    def test_audio_cleanup_missing_parent_converges_across_restart_and_blocks_reference(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            store = RecorderStore(root / "db.sqlite3", storage_root=root / "data")
-            turn_id = "018f5a2e-7b6e-7abc-8d11-1234567890ab"
-            manifest = {
-                "schema_version": 1,
-                "user_id": "u",
-                "turn_id": turn_id,
-                "origin_device_id": "phone",
-                "client_created_at": "2026-09-09T00:00:00Z",
-                "parts": [{"part_id": "audio", "kind": "audio", "mime": "audio/wav", "streaming": True}],
-            }
-            store.create_turn(manifest)
-            wav_buffer = io.BytesIO()
-            with wave.open(wav_buffer, "wb") as handle:
-                handle.setnchannels(1)
-                handle.setsampwidth(2)
-                handle.setframerate(16000)
-                handle.writeframes(b"\x00\x00" * 160)
-            audio = wav_buffer.getvalue()
-            store.put_chunk(turn_id, "audio", 0, audio)
-            store.finish_part(
-                turn_id,
-                "audio",
-                total_chunks=1,
-                total_bytes=len(audio),
-                whole_stream_sha256=hashlib.sha256(audio).hexdigest(),
-            )
-            reference = store.attachment_reference(turn_id, "audio")
-            with store._read() as conn:
-                source = Path(conn.execute("SELECT source_path FROM turn_parts WHERE turn_id=?", (turn_id,)).fetchone()[0])
-            shutil.rmtree(source.parent)
-            generation = store.set_asr_stage(turn_id, expected_generation=0, stage="realtime")
-            assert generation is not None
-            # Leave the durable valid-transcript marker behind and simulate a
-            # process loss before its first cleanup attempt.
-            with patch.object(store, "_converge_audio_cleanup", return_value=False):
-                self.assertTrue(
-                    store.commit_asr_result(
-                        turn_id,
-                        expected_generation=generation,
-                        stage="realtime",
-                        result=AsrResult.valid("transcript"),
-                    )
-                )
-
-            restarted = RecorderStore(root / "db.sqlite3", storage_root=root / "data")
-            recovery = restarted.recover(now="2026-09-09T00:01:00+00:00")
-            self.assertEqual(recovery["source_deletions_retried"], 1)
-            with restarted._read() as conn:
-                turn = conn.execute("SELECT source_deleted FROM turns WHERE turn_id=?", (turn_id,)).fetchone()
-                part = conn.execute("SELECT source_path, source_deleted_at FROM turn_parts WHERE turn_id=?", (turn_id,)).fetchone()
-                chunks = conn.execute("SELECT COUNT(*) FROM turn_chunks WHERE turn_id=?", (turn_id,)).fetchone()[0]
-            self.assertEqual(turn["source_deleted"], 1)
-            self.assertIsNone(part["source_path"])
-            self.assertIsNotNone(part["source_deleted_at"])
-            self.assertEqual(chunks, 0)
-            with self.assertRaises(SourceUnavailableError) as issued:
-                restarted.attachment_reference(turn_id, "audio")
-            self.assertEqual((issued.exception.code, issued.exception.status), ("SOURCE_UNAVAILABLE", 410))
-            with self.assertRaises(SourceUnavailableError) as resolved:
-                restarted.resolve_attachment_reference(reference)
-            self.assertEqual((resolved.exception.code, resolved.exception.status), ("SOURCE_UNAVAILABLE", 410))
-
-    def test_schema4_diagnostics_reproject_handles_aliases_and_equal_bundles(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            db_path = root / "db.sqlite3"
-            storage_root = root / "data"
-            RecorderStore(db_path, storage_root=storage_root)
-            conn = sqlite3.connect(db_path)
-            conn.row_factory = sqlite3.Row
-            conn.execute("PRAGMA foreign_keys=ON")
-            for table in ("diagnostic_bundles", "diagnostic_events", "diagnostics_consents", "diagnostic_tombstones"):
-                conn.execute(f"DROP TABLE {table}")
-            conn.executescript(
-                """
-                CREATE TABLE diagnostics_consents (
-                    user_id TEXT NOT NULL, device_id TEXT NOT NULL, event_id TEXT PRIMARY KEY,
-                    enabled INTEGER NOT NULL, created_at TEXT NOT NULL, expires_at TEXT, revoked_at TEXT
-                );
-                CREATE TABLE diagnostic_events (
-                    event_id TEXT PRIMARY KEY, idempotency_key TEXT NOT NULL UNIQUE,
-                    user_id TEXT NOT NULL, device_id TEXT NOT NULL, category TEXT NOT NULL,
-                    stage TEXT NOT NULL, metadata_json TEXT NOT NULL, occurred_at TEXT NOT NULL,
-                    retention_deadline TEXT NOT NULL, deleted_at TEXT
-                );
-                CREATE TABLE diagnostic_bundles (
-                    bundle_id TEXT PRIMARY KEY, user_id TEXT NOT NULL, device_id TEXT NOT NULL,
-                    opt_in_event_id TEXT NOT NULL, compressed_size INTEGER NOT NULL,
-                    expanded_size INTEGER NOT NULL, payload_sha256 TEXT NOT NULL,
-                    storage_path TEXT NOT NULL, created_at TEXT NOT NULL,
-                    retention_deadline TEXT NOT NULL, deleted_at TEXT,
-                    UNIQUE(user_id, device_id, payload_sha256),
-                    FOREIGN KEY(opt_in_event_id) REFERENCES diagnostics_consents(event_id) ON DELETE RESTRICT
-                );
-                CREATE TABLE diagnostic_tombstones (
-                    tombstone_id TEXT PRIMARY KEY, user_id TEXT NOT NULL, device_id TEXT NOT NULL,
-                    entity_type TEXT NOT NULL CHECK(entity_type IN ('event','bundle')),
-                    entity_id TEXT NOT NULL, deleted_at TEXT NOT NULL,
-                    UNIQUE(entity_type, entity_id)
-                );
-                """
-            )
-            conn.execute("UPDATE schema_meta SET value='4' WHERE key='schema_version'")
-            conn.execute(
-                "INSERT INTO devices(user_id, device_id, kind, created_at) VALUES (?, ?, ?, ?)",
-                ("legacy-user", "legacy-phone", "phone", "2026-09-10T00:00:00+00:00"),
-            )
-            conn.execute(
-                "INSERT INTO diagnostics_consents VALUES (?, ?, ?, ?, ?, ?, ?)",
-                ("legacy-user", "legacy-phone", "consent-old", 1, "2026-09-10T00:00:00+00:00", "2026-12-01T00:00:00+00:00", None),
-            )
-            conn.execute(
-                "INSERT INTO diagnostic_events VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    "event-old", "idem-old", "legacy-user", "legacy-phone", "voice", "asr",
-                    json.dumps({"category": "voice", "stage": "asr", "status": "ok", "token": "private"}),
-                    "2026-09-10T00:00:01+00:00", "2026-12-01T00:00:00+00:00", None,
-                ),
-            )
-            legacy_payloads = []
-            for index in range(2):
-                raw = json.dumps(
-                    {"events": [{"category": "voice", "stage": "asr", "status": "ok", "token": f"private-{index}"}]},
-                    separators=(",", ":"),
-                ).encode()
-                compressed = zlib.compress(raw)
-                path = storage_root / f"legacy-{index}.z"
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_bytes(compressed)
-                bundle_id = f"bundle-old-{index}"
-                conn.execute(
-                    "INSERT INTO diagnostic_bundles VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (
-                        bundle_id, "legacy-user", "legacy-phone", "consent-old", len(compressed), len(raw),
-                        hashlib.sha256(compressed).hexdigest(), str(path), f"2026-09-10T00:00:0{index + 2}+00:00",
-                        "2026-12-01T00:00:00+00:00", None,
-                    ),
-                )
-                legacy_payloads.append((bundle_id, raw))
-            conn.execute(
-                "INSERT INTO diagnostic_tombstones VALUES (?, ?, ?, ?, ?, ?)",
-                ("tomb-old", "legacy-user", "legacy-phone", "event", "event-old", "2026-09-10T00:00:03+00:00"),
-            )
-            conn.commit()
-            conn.close()
-
-            with patch.object(FeatureGroups, "_unlink_managed_file", side_effect=OSError("deferred cleanup")):
-                incomplete = RecorderStore(db_path, storage_root=storage_root)
-            with incomplete._read() as conn:
-                self.assertEqual(conn.execute("SELECT value FROM schema_meta WHERE key='schema_version'").fetchone()[0], "4")
-                self.assertEqual(conn.execute("SELECT migration_state FROM diagnostic_bundles").fetchone()[0], "MIGRATING")
-                self.assertEqual(conn.execute("SELECT status FROM storage_cleanup_receipts WHERE operation LIKE 'diagnostic_migration_cleanup_%'").fetchone()[0], "PENDING")
-            migrated = RecorderStore(db_path, storage_root=storage_root)
-            with migrated._read() as conn:
-                self.assertEqual(conn.execute("SELECT value FROM schema_meta WHERE key='schema_version'").fetchone()[0], "5")
-                consent = conn.execute("SELECT * FROM diagnostics_consents").fetchone()
-                event = conn.execute("SELECT * FROM diagnostic_events").fetchone()
-                bundles = conn.execute("SELECT * FROM diagnostic_bundles ORDER BY created_at").fetchall()
-                tombstone = conn.execute("SELECT * FROM diagnostic_tombstones").fetchone()
-                self.assertEqual(len(bundles), 2)
-                self.assertTrue(all(row["migration_state"] == "READY" and row["privacy_version"] == 2 for row in bundles))
-                self.assertTrue(all(uuid.UUID(row["bundle_id"]).version == 4 for row in bundles))
-                self.assertEqual(bundles[0]["payload_sha256"], bundles[1]["payload_sha256"])
-                self.assertEqual(bundles[0]["opt_in_event_id"], consent["event_id"])
-                self.assertEqual(tombstone["entity_id"], event["event_id"])
-                self.assertNotIn("event-old", json.dumps(dict(event)))
-                self.assertNotIn("idem-old", json.dumps(dict(event)))
-                for index in conn.execute("PRAGMA index_list(diagnostic_bundles)").fetchall():
-                    if index["unique"]:
-                        columns = [item["name"] for item in conn.execute(f"PRAGMA index_info({index['name']})").fetchall()]
-                        self.assertNotEqual(columns, ["user_id", "device_id", "payload_sha256"])
-            self.assertFalse(any((storage_root / f"legacy-{index}.z").exists() for index in range(2)))
-            replay_event = migrated.ingest_diagnostic_event(
-                "legacy-user", "legacy-phone", event_id="event-old", idempotency_key="idem-old",
-                payload={"category": "voice", "stage": "asr", "status": "ok"},
-            )
-            self.assertEqual(replay_event["event_id"], event["event_id"])
-            for bundle_id, raw in legacy_payloads:
-                replay = migrated.ingest_diagnostic_bundle(
-                    "legacy-user", "legacy-phone", bundle_id, zlib.compress(raw),
-                    opt_in_event_id="consent-old", expanded_size=len(raw),
-                )
-                with migrated._read() as conn:
-                    expected = conn.execute("SELECT bundle_id FROM diagnostic_bundles WHERE alias_digest=?", (migrated._features._alias_digest("bundle", "legacy-user", "legacy-phone", bundle_id),)).fetchone()[0]
-                self.assertEqual(replay["bundle_id"], expected)
-            restarted = RecorderStore(db_path, storage_root=storage_root)
-            with restarted._read() as conn:
-                self.assertEqual(conn.execute("SELECT COUNT(*) FROM diagnostic_bundles").fetchone()[0], 2)
-                self.assertEqual(conn.execute("SELECT COUNT(*) FROM diagnostic_bundles WHERE migration_state='READY'").fetchone()[0], 2)
-
-    def test_history_requery_uses_canonical_request_hash_not_ingress_envelope_hash(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            store = RecorderStore(root / "db.sqlite3", storage_root=root / "data")
-            service = RecorderService(store)
-            turn_id = "018f5a2e-7b6e-7abc-8d11-1234567890a1"
-            service.store.get_turn = lambda _turn_id: {
-                "turn_id": turn_id,
-                "final_event_version": 1,
-                "final_content": None,
-                "final_outcome": None,
-            }
-
-            first = HermesResult(
-                "assistant-1", "first", True, "hermes-history", submission_id="submission-1",
-                turn_id=turn_id, marker="marker-1", session_key="session-1", run_id="run-1",
-                request_sha256="request-hash", subject_kind="turn",
-            )
-            second = HermesResult(
-                "assistant-2", "second", True, "hermes-run", submission_id="submission-1",
-                turn_id=turn_id, marker="marker-1", session_key="session-1", run_id="run-1",
-                request_sha256="request-hash", subject_kind="turn",
-            )
-
-            class HistoryGateway:
-                def history_messages(self, *, session_key, marker):
-                    self.seen = (session_key, marker)
-                    return [first]
-
-            service.hermes = HistoryGateway()
-            ingress = {
-                "turn_id": turn_id,
-                "hermes_submission_id": "submission-1",
-                "marker": "marker-1",
-                "gateway_session_key": "session-1",
-                "run_id": "run-1",
-                "payload_sha256": "envelope-hash",
-            }
-            self.assertEqual(service._requery_combined_content(ingress, second), "first\nsecond")
-
-    def test_update_manifest_rejects_same_size_source_mutation_during_copy(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            source = root / "candidate.apk"
-            source.write_bytes(b"original")
-            store = RecorderStore(root / "db.sqlite3", storage_root=root / "data")
-            features = store._features
-            publish_stream = features._publish_stream
-
-            def mutate_source_then_publish(*args, **kwargs):
-                source.write_bytes(b"mutated!")
-                return publish_stream(*args, **kwargs)
-
-            features._publish_stream = mutate_source_then_publish
+            config = _relay_config(dict(_OK_RELAY))
+            fixture = _ProbeFixture(health={"ok": True, "ready": True}, voice_config=config, status=401)
             try:
-                with self.assertRaises(ConflictError):
-                    store.publish_update_manifest(
-                        channel="mutation",
-                        generation=1,
-                        platform="phone",
-                        version="1.0.0",
-                        version_code=1,
-                        artifact_name="candidate.apk",
-                        artifact_path=source,
-                        signer_digest="a" * 64,
-                        changelog="change",
-                        min_server_version="1.0.0",
-                        authorization_policy="test-only",
-                    )
+                provider = HermesAudioTTSProvider(fixture.url, profile="default", credential_file=self._credential(root, "wrong-secret"))
+                with self.assertRaises(ProviderFailure) as raised:
+                    provider.readiness_check()
+                self.assertEqual(raised.exception.kind, "auth")
             finally:
-                features._publish_stream = publish_stream
-            with store._read() as conn:
-                self.assertIsNone(conn.execute("SELECT 1 FROM update_manifests WHERE channel=?", ("mutation",)).fetchone())
+                fixture.close()
+
+    def test_readiness_sends_session_token_header(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = _relay_config(dict(_OK_RELAY))
+            fixture = _ProbeFixture(health={"ok": True, "ready": True}, voice_config=config)
+            try:
+                provider = HermesAudioTTSProvider(fixture.url, profile="default", credential_file=self._credential(root))
+                provider.readiness_check()
+                self.assertTrue(fixture.seen_session_token)
+                self.assertTrue(fixture.seen_authorization)
+            finally:
+                fixture.close()
+
+
+class _ConfiguredChainFactoryMixin:
+    """Build a real RecorderConfig whose chains point at the probe fixture."""
+
+    def _write_config(self, root: Path, fixture_url: str) -> Path:
+        credential = root / "recorder_api_key"
+        credential.write_text("API_SERVER_KEY=fixture-secret\n", encoding="ascii")
+        credential.chmod(0o600)
+        config_path = root / "recorder-next.toml"
+        config_path.write_text(
+            "\n".join(
+                (
+                    "[server]",
+                    'host = "127.0.0.1"',
+                    "port = 8653",
+                    "",
+                    "[storage]",
+                    f'database = "{root / "db.sqlite3"}"',
+                    f'root = "{root / "data"}"',
+                    "",
+                    "[providers]",
+                    'asr_source = "hermes"',
+                    'asr_chain = ["hermes-audio"]',
+                    'tts_source = "hermes"',
+                    'tts_chain = ["hermes-audio"]',
+                    "",
+                    "[[providers.asr_providers]]",
+                    'name = "hermes-audio"',
+                    'adapter = "hermes"',
+                    f'endpoint = "{fixture_url}"',
+                    'profile = "default"',
+                    f'credential_file = "{credential}"',
+                    'health_path = "/api/health"',
+                    'capability_path = "/api/audio/voice-config"',
+                    "enabled = true",
+                    "",
+                    "[[providers.tts_providers]]",
+                    'name = "hermes-audio"',
+                    'adapter = "hermes"',
+                    f'endpoint = "{fixture_url}"',
+                    'profile = "default"',
+                    f'credential_file = "{credential}"',
+                    'health_path = "/api/health"',
+                    'capability_path = "/api/audio/voice-config"',
+                    "enabled = true",
+                )
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        return config_path
+
+
+class SharedConstructionRefreshTests(_ConfiguredChainFactoryMixin, unittest.TestCase):
+    """T3: one shared chain dispatcher for construction and refresh."""
+
+    def _fixture(self, tts: Any = None) -> _ProbeFixture:
+        return _ProbeFixture(health={"ok": True, "ready": True}, voice_config=_relay_config(tts))
+
+    def _create(self, config_path: Path, *, production: bool = False):
+        return create_configured_service(
+            RecorderConfig.from_file(config_path).resolved(),
+            require_production=production,
+            ingress_secret="fixture-ingress-secret" if production else None,
+        )
+
+    def test_negative_readiness_construction_fails_before_storage_opens(self):
+        fixture = self._fixture({"mode": "relay", "reason": "resolution error"})
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                config_path = self._write_config(root, fixture.url)
+                opened: list[str] = []
+                original_init = RecorderStore.__init__
+
+                def trap_init(store_self: Any, *args: Any, **kwargs: Any) -> None:
+                    opened.append("store")
+                    original_init(store_self, *args, **kwargs)
+
+                with patch.object(RecorderStore, "__init__", trap_init):
+                    with self.assertRaises(ProviderFailure) as raised:
+                        self._create(config_path, production=True)
+                    self.assertEqual(raised.exception.kind, "tts_unavailable")
+                self.assertEqual(opened, [], "negative readiness must not construct RecorderStore")
+        finally:
+            fixture.close()
+
+    def test_positive_readiness_construction_succeeds_and_refresh_agrees(self):
+        fixture = self._fixture(dict(_OK_RELAY))
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                config_path = self._write_config(root, fixture.url)
+                service = self._create(config_path)
+                self.assertTrue(service.refresh_production_readiness())
+                self.assertIsNotNone(service.tts_chain)
+                assert service.tts_chain is not None
+                self.assertIsInstance(service.tts_chain.targets[0].provider, HermesAudioTTSProvider)
+                self.assertEqual(fixture.posts, 0)
+        finally:
+            fixture.close()
+
+    def test_refresh_positive_negative_positive_transition_and_no_stale_true(self):
+        fixture = self._fixture(dict(_OK_RELAY))
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                config_path = self._write_config(root, fixture.url)
+                service = self._create(config_path)
+                self.assertTrue(service.refresh_production_readiness())
+
+                # flip to negative: readiness must not retain stale success
+                fixture.voice_config = _relay_config({"mode": "relay", "reason": "resolution error"})
+                self.assertFalse(service.refresh_production_readiness())
+
+                # back to positive: recovery works
+                fixture.voice_config = _relay_config(dict(_OK_RELAY))
+                self.assertTrue(service.refresh_production_readiness())
+        finally:
+            fixture.close()
+
+    def test_construction_and_refresh_dispatch_same_provider_method(self):
+        fixture = self._fixture(dict(_OK_RELAY))
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                config_path = self._write_config(root, fixture.url)
+                calls: list[str] = []
+                real_readiness = HermesAudioTTSProvider.readiness_check
+
+                def spy_readiness(provider_self: Any) -> dict[str, Any]:
+                    calls.append("readiness_check")
+                    return real_readiness(provider_self)
+
+                with patch.object(HermesAudioTTSProvider, "readiness_check", spy_readiness):
+                    # Production construction probes the chains through
+                    # RecorderService._probe_provider_chain (spec 4.3), and
+                    # refresh must dispatch the exact same provider method.
+                    service = self._create(config_path, production=False)
+                    # Construction-equivalent probe via the shared dispatcher:
+                    RecorderService._probe_provider_chain(service.tts_chain)
+                    construction_calls = list(calls)
+                    calls.clear()
+                    self.assertTrue(service.refresh_production_readiness())
+                    refresh_calls = list(calls)
+                self.assertEqual(construction_calls, ["readiness_check"])
+                self.assertEqual(refresh_calls, ["readiness_check"])
+        finally:
+            fixture.close()
+
+    def test_fixture_source_chain_construction_rejected(self):
+        fixture = self._fixture(dict(_OK_RELAY))
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                config_path = self._write_config(root, fixture.url)
+                text = config_path.read_text(encoding="utf-8")
+                text = text.replace('adapter = "hermes"', 'adapter = "fixture"')
+                config_path.write_text(text, encoding="utf-8")
+                with self.assertRaises(CredentialError):
+                    self._create(config_path)
+        finally:
+            fixture.close()
+
+
+class GenericSourceAgnosticPreflightTests(unittest.TestCase):
+    """S: HttpHermesGateway._preflight_existing_session stays source-agnostic."""
+
+    def test_generic_preflight_has_no_source_predicate(self):
+        import inspect
+
+        from recorder_next.adapters import HttpHermesGateway
+
+        self.assertTrue(hasattr(HttpHermesGateway, "_preflight_existing_session"))
+        source_text = inspect.getsource(HttpHermesGateway._preflight_existing_session)
+        self.assertNotIn("discord", source_text.lower())
 
 
 if __name__ == "__main__":

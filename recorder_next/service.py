@@ -213,24 +213,36 @@ class RecorderService:
                     raise ProviderFailure("capability_unavailable", retryable=True)
 
     def refresh_production_readiness(self) -> bool:
-        """Refresh cached dependency availability without running model work."""
+        """Refresh cached dependency availability without running model work.
 
+        A service constructed without production readiness state still
+        refreshes its configured chains so a negative capability result is
+        reported instead of silently keeping a stale success.
+        """
         with self._lock:
-            if self._production_readiness is None:
-                return True
-        for name, probe in (
-            ("asr", lambda: self._probe_provider_chain(self.asr_chain)),
-            ("tts", lambda: self._probe_provider_chain(self.tts_chain)),
-            ("hermes", lambda: getattr(self.hermes, "capability_check")()),
-        ):
+            production = self._production_readiness is not None
+        names = ("asr", "tts", "hermes") if production or self.hermes is not None or self.asr_chain is not None or self.tts_chain is not None else ()
+        probes = {
+            "asr": lambda: self._probe_provider_chain(self.asr_chain),
+            "tts": lambda: self._probe_provider_chain(self.tts_chain),
+            "hermes": lambda: getattr(self.hermes, "capability_check")() if self.hermes is not None else None,
+        }
+        observed: dict[str, bool] = {}
+        for name in names:
             try:
-                probe()
+                probes[name]()
             except Exception:
-                self._set_dependency_availability(name, False)
+                observed[name] = False
             else:
-                self._set_dependency_availability(name, True)
+                observed[name] = True
         with self._lock:
-            return bool(self._production_readiness and all(self._production_readiness.values()))
+            if production:
+                for name, available in observed.items():
+                    self._set_dependency_availability(name, available)
+                return bool(self._production_readiness and all(self._production_readiness.values()))
+            if not observed:
+                return True
+            return all(observed.values())
 
     def _begin_operation(self) -> None:
         with self._drain_condition:
@@ -2468,9 +2480,11 @@ def create_configured_service(
             if not endpoint or not credential_file:
                 raise CredentialError("configured Hermes audio provider requires hermes_audio_base_url and credential file")
             profile = declaration.profile if declaration.profile != "default" else config.hermes_profile
+            health_path = declaration.health_path if declaration.health_path is not None else "/api/health"
+            capability_path = declaration.capability_path if declaration.capability_path is not None else "/api/audio/voice-config"
             if kind == "asr":
-                return HermesAudioASRProvider(endpoint, profile=profile, timeout=declaration.timeout_seconds, credential_file=credential_file, max_bytes=declaration.max_bytes, health_path=declaration.health_path, capability_path=declaration.capability_path)
-            return HermesAudioTTSProvider(endpoint, profile=profile, timeout=declaration.timeout_seconds, credential_file=credential_file, max_bytes=declaration.max_bytes, health_path=declaration.health_path, capability_path=declaration.capability_path)
+                return HermesAudioASRProvider(endpoint, profile=profile, timeout=declaration.timeout_seconds, credential_file=credential_file, max_bytes=declaration.max_bytes, health_path=health_path, capability_path=capability_path)
+            return HermesAudioTTSProvider(endpoint, profile=profile, timeout=declaration.timeout_seconds, credential_file=credential_file, max_bytes=declaration.max_bytes, health_path=health_path, capability_path=capability_path)
         if not endpoint:
             raise CredentialError("configured provider endpoint is required")
         if kind == "asr":
@@ -2548,7 +2562,27 @@ def create_configured_service(
         raise CredentialError("provider overrides must select a usable chain")
 
     production_readiness: dict[str, bool] | None = None
+
+    def probe_chain(chain: ProviderChain | None, kind: str) -> None:
+        if chain is None:
+            return
+        for target in chain.targets:
+            if target.source in {"fixture", "static", "test"}:
+                raise CredentialError(f"production {kind.upper()} chain contains a fixture provider")
+        if require_production:
+            RecorderService._probe_provider_chain(chain)
+        for target in chain.targets:
+            provider = target.provider
+            if not callable(getattr(provider, "readiness_check", None)) and not (
+                callable(getattr(provider, "health_check", None)) and callable(getattr(provider, "capability_check", None))
+            ):
+                raise CredentialError(f"production {kind.upper()} provider has no bounded capability probes")
+
     if require_production:
+        # Production construction verifies the configured chains once through
+        # the shared dispatcher before any storage is opened.
+        probe_chain(configured_asr_chain, "asr")
+        probe_chain(configured_tts_chain, "tts")
         effective_ingress_secret = ingress_secret if ingress_secret is not None else os.environ.get("RECORDER_INGRESS_SECRET")
         if not isinstance(effective_ingress_secret, str) or not effective_ingress_secret:
             raise CredentialError("production Recorder ingress secret is required")
@@ -2556,26 +2590,6 @@ def create_configured_service(
             raise CredentialError("production Recorder requires configured ASR and TTS chains")
         if not config.hermes_base_url or not config.hermes_api_key_file:
             raise CredentialError("production Recorder requires an authenticated Hermes gateway")
-
-        def probe_chain(chain: ProviderChain, kind: str) -> None:
-            for target in chain.targets:
-                if target.source in {"fixture", "static", "test"}:
-                    raise CredentialError(f"production {kind.upper()} chain contains a fixture provider")
-                provider = target.provider
-                readiness_check = getattr(provider, "readiness_check", None)
-                if callable(readiness_check):
-                    readiness_check()
-                    continue
-                health_check = getattr(provider, "health_check", None)
-                capability_check = getattr(provider, "capability_check", None)
-                if not callable(health_check) or not callable(capability_check):
-                    raise CredentialError(f"production {kind.upper()} provider has no bounded capability probes")
-                for result in (health_check(), capability_check()):
-                    if not isinstance(result, Mapping) or result.get("configured") is False or result.get("ok") is False or result.get("ready") is False:
-                        raise CredentialError(f"production {kind.upper()} provider capability is unavailable")
-
-        probe_chain(configured_asr_chain, "asr")
-        probe_chain(configured_tts_chain, "tts")
         HttpHermesGateway(
             config.hermes_base_url,
             api_key_file=config.hermes_api_key_file,
