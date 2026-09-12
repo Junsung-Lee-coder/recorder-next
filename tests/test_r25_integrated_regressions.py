@@ -388,6 +388,214 @@ class TTSReadinessProviderTests(unittest.TestCase):
         tts["status"] = "degraded"
         self._rejects(tts, "tts_capability_unknown", retryable=False)
 
+    # -- B3: presence/type/length and ok-only contract (spec section 4) ----
+
+    def test_ok_only_edge_relay_with_absent_envelope_ready_passes(self):
+        # The live edge shape: capability envelope carries ok but no ready;
+        # the health fixture still requires envelope ok only.
+        fixture = _ProbeFixture(
+            health={"ok": True},
+            voice_config={
+                "ok": True,
+                "audio_api": True,
+                "stt": {"mode": "relay", "reason": "provider 'edge' has no client wire", "ok": True},
+                "tts": {"mode": "relay", "reason": "provider 'edge' has no client wire", "ok": True},
+            },
+        )
+        try:
+            provider = HermesAudioTTSProvider(fixture.url, profile="default", credential_file=None)
+            result = provider.readiness_check()
+            self.assertEqual(result["endpoint_contract"], "/api/audio/speak?profile=default")
+            self.assertEqual(fixture.posts, 0)
+        finally:
+            fixture.close()
+
+    def test_present_invalid_envelope_ready_rejects(self):
+        # ready present but not an actual bool True (None marker from a list
+        # payload) must reject; absent ready stays valid.
+        for bad_ready in (None, False, 1, "true", ["y"], {"y": 1}):
+            with self.subTest(ready=bad_ready):
+                envelope = {
+                    "ok": True,
+                    "ready": bad_ready,
+                    "audio_api": True,
+                    "stt": {"ok": True},
+                    "tts": dict(_OK_RELAY),
+                }
+                fixture = _ProbeFixture(health={"ok": True}, voice_config=envelope)
+                try:
+                    provider = HermesAudioTTSProvider(fixture.url, profile="default", credential_file=None)
+                    if bad_ready is None:
+                        # None raw ready projects to a present invalid marker
+                        # and must reject (never silently treated as absent).
+                        with self.assertRaises(ProviderFailure) as raised:
+                            provider.readiness_check()
+                        self.assertEqual(raised.exception.kind, "tts_capability_unknown")
+                    else:
+                        with self.assertRaises(ProviderFailure) as raised:
+                            provider.readiness_check()
+                        self.assertEqual(raised.exception.kind, "tts_capability_unknown")
+                finally:
+                    fixture.close()
+
+    def test_present_invalid_envelope_flags_reject_across_types(self):
+        # Every envelope flag: absent is fine (ok excepted), but present must
+        # be an actual bool True; list/dict/None markers reject.
+        for flag in ("configured", "enabled", "audio_api"):
+            for bad in (None, False, 0, 1, "true", [], {}, ["x"]):
+                with self.subTest(flag=flag, bad=bad):
+                    envelope = {
+                        "ok": True,
+                        "ready": True,
+                        "audio_api": True,
+                        "stt": {"ok": True},
+                        "tts": dict(_OK_RELAY),
+                    }
+                    envelope[flag] = bad
+                    fixture = _ProbeFixture(health={"ok": True}, voice_config=envelope)
+                    try:
+                        provider = HermesAudioTTSProvider(fixture.url, profile="default", credential_file=None)
+                        with self.assertRaises(ProviderFailure) as raised:
+                            provider.readiness_check()
+                        self.assertEqual(raised.exception.kind, "tts_capability_unknown")
+                    finally:
+                        fixture.close()
+
+    def test_missing_envelope_ok_rejects(self):
+        for ok_value in (None, False, 0, 1, "true"):
+            with self.subTest(ok=ok_value):
+                envelope = {
+                    "ok": ok_value,
+                    "ready": True,
+                    "stt": {"ok": True},
+                    "tts": dict(_OK_RELAY),
+                }
+                fixture = _ProbeFixture(health={"ok": True}, voice_config=envelope)
+                try:
+                    provider = HermesAudioTTSProvider(fixture.url, profile="default", credential_file=None)
+                    with self.assertRaises(ProviderFailure) as raised:
+                        provider.readiness_check()
+                    self.assertEqual(raised.exception.kind, "tts_capability_unknown")
+                finally:
+                    fixture.close()
+
+    def test_nested_ready_dict_and_direct_reason_list_reject(self):
+        # Reviewer cases: nested dict ready and list direct reason must both
+        # survive projection as invalid markers and reject.
+        nested = dict(_OK_RELAY)
+        nested["ready"] = {"state": True}
+        self._rejects(nested, "tts_capability_unknown", retryable=False)
+        direct = {
+            "mode": "direct",
+            "provider": "openai",
+            "wire": "openai-speech",
+            "reason": ["nope"],
+        }
+        self._rejects(direct, "tts_capability_unknown", retryable=False)
+
+    def test_relay_provider_boundary_lengths(self):
+        # provider is descriptive in relay: present must satisfy the string
+        # presence/type/length contract (256 ok, 257 invalid).
+        for length, expect_reject in ((1, False), (256, False), (257, True), (300, True)):
+            with self.subTest(length=length):
+                tts = dict(_OK_RELAY)
+                tts["provider"] = "p" * length
+                if expect_reject:
+                    self._rejects(tts, "tts_capability_unknown", retryable=False)
+                else:
+                    self._ready(tts)
+
+    def test_relay_provider_present_invalid_rejects(self):
+        for bad in (None, 7, True, "", "   ", [], ["edge"]):
+            with self.subTest(bad=bad):
+                tts = dict(_OK_RELAY)
+                tts["provider"] = bad
+                self._rejects(tts, "tts_capability_unknown", retryable=False)
+
+    def test_direct_reason_empty_and_whitespace_passes(self):
+        # Direct mode: absent, empty, and whitespace-only reasons are valid;
+        # any nonempty reason still rejects.
+        for reason in ("", "   ", None):
+            with self.subTest(reason=reason):
+                tts = {
+                    "mode": "direct",
+                    "provider": "openai",
+                    "wire": "openai-speech",
+                    "configured": True,
+                    "enabled": True,
+                    "ready": True,
+                    "ok": True,
+                }
+                if reason is not None:
+                    tts["reason"] = reason
+                self._ready(tts)
+        nonempty = {
+            "mode": "direct",
+            "provider": "openai",
+            "wire": "openai-speech",
+            "reason": "unexpected provider text",
+            "configured": True,
+            "enabled": True,
+            "ready": True,
+            "ok": True,
+        }
+        self._rejects(nonempty, "tts_capability_unknown", retryable=False)
+
+    def test_direct_reason_overlong_rejects(self):
+        tts = {
+            "mode": "direct",
+            "provider": "openai",
+            "wire": "openai-speech",
+            "reason": "r" * 257,
+        }
+        self._rejects(tts, "tts_capability_unknown", retryable=False)
+
+    def test_optional_status_presence_contract(self):
+        # status: positive forms pass; negative, empty, whitespace, None
+        # marker, wrong type, and overlong all reject.
+        for good in ("ok", "ready", "available", "OK", " Ready "):
+            with self.subTest(status=good):
+                tts = dict(_OK_RELAY)
+                tts["status"] = good
+                self._ready(tts)
+        for bad in ("degraded", "", "   ", None, 5, ["ok"], {"s": 1}, "x" * 257):
+            with self.subTest(status=bad):
+                tts = dict(_OK_RELAY)
+                tts["status"] = bad
+                self._rejects(tts, "tts_capability_unknown", retryable=False)
+
+    def test_nested_secret_at_depth_never_survives_projection(self):
+        tts = dict(_OK_RELAY)
+        tts["credential"] = {"token": "deep-secret", "nested": {"api_key": "deeper-secret"}}
+        tts["headers"] = {"Authorization": "Bearer x"}
+        fixture = self._fixture(tts)
+        try:
+            provider = HermesAudioTTSProvider(fixture.url, profile="default", credential_file=None)
+            capability = provider.capability_check()
+            projected = capability.get("tts")
+            self.assertIsInstance(projected, dict)
+            self.assertEqual(
+                set(projected),
+                {"mode", "reason", "wire", "provider", "configured", "enabled", "ready", "ok", "status"},
+            )
+            self.assertNotIn("deep-secret", repr(capability))
+            self.assertNotIn("deeper-secret", repr(capability))
+        finally:
+            fixture.close()
+
+    def test_health_explicit_false_stays_provider_unavailable(self):
+        # Inherited classification: an explicit health false is a provider
+        # outage, not a TTS capability mismatch.
+        fixture = _ProbeFixture(health={"ok": True, "ready": False}, voice_config=_relay_config(dict(_OK_RELAY)))
+        try:
+            provider = HermesAudioTTSProvider(fixture.url, profile="default", credential_file=None)
+            with self.assertRaises(ProviderFailure) as raised:
+                provider.readiness_check()
+            self.assertEqual(raised.exception.kind, "provider_unavailable")
+            self.assertTrue(raised.exception.retryable)
+        finally:
+            fixture.close()
+
     def test_unknown_wire_rejects(self):
         tts = dict(_OK_RELAY)
         tts["wire"] = "carrier-pigeon"

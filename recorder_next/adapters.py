@@ -1609,10 +1609,17 @@ def _sanitize_tts_projection(value: Any) -> Any:
             continue
         raw = value.get(key)
         if key == "reason":
-            if isinstance(raw, str) and 0 < len(raw) <= _TTS_MAX_SEMANTIC_LENGTH:
+            # B3: reason alone distinguishes present-empty from invalid.
+            # A genuine string of bounded length (empty/whitespace included)
+            # projects to its normalized fixed category, "" for empty, so
+            # direct-mode empty reason stays distinguishable from the None
+            # invalid marker; overlong or non-string becomes None.
+            if isinstance(raw, str) and len(raw) <= _TTS_MAX_SEMANTIC_LENGTH:
                 lowered = raw.strip().lower()
                 if lowered == "resolution-error" or lowered.startswith("openai resolution failed"):
                     projected[key] = "resolution error"
+                elif lowered == "":
+                    projected[key] = ""
                 elif lowered in _TTS_FIXED_NEGATIVES:
                     projected[key] = lowered
                 elif lowered in {"command/plugin provider", "voice.client_direct disabled"}:
@@ -1628,7 +1635,9 @@ def _sanitize_tts_projection(value: Any) -> Any:
             # Flags must survive only as actual booleans; any other type is an
             # invalid marker so validation cannot mistake "true"/1 for True.
             projected[key] = raw if isinstance(raw, bool) else None
-        elif isinstance(raw, str) and 0 < len(raw) <= _TTS_MAX_SEMANTIC_LENGTH:
+        elif isinstance(raw, str) and len(raw) <= _TTS_MAX_SEMANTIC_LENGTH and raw.strip():
+            # B3: mode/provider/wire/status must be nonempty after trimming
+            # when present; an empty/whitespace-only string is invalid.
             projected[key] = raw
         else:
             projected[key] = None
@@ -1835,14 +1844,25 @@ class _HTTPProvider:
         if not isinstance(payload, Mapping):
             raise ProviderFailure("malformed_probe", retryable=False)
         allowed = {"ok", "ready", "status", "provider", "model", "profile", "version", "capabilities", "media_types", "audio_api", "stt", "configured", "enabled", "tts"}
+        _TTS_FLAG_KEYS = {"ok", "ready", "configured", "enabled", "audio_api"}
         result: dict[str, Any] = {}
         for key in allowed:
             value = payload.get(key)
-            if isinstance(value, (str, int, float, bool)):
+            if key in _TTS_FLAG_KEYS:
+                # B3: TTS envelope semantic flags must survive presence. A
+                # bool keeps its value; any other value (wrong type, list,
+                # dict) becomes a None invalid marker so downstream
+                # validation can distinguish absence from present-invalid.
+                # A flag absent from the raw payload stays absent in the
+                # projection: only the raw envelope decides membership, and
+                # the validators treat absence per the ratified contract.
+                if key in payload:
+                    result[key] = value if isinstance(value, bool) else None
+            elif isinstance(value, (str, int, float, bool)):
                 result[key] = value
             elif key in {"capabilities", "media_types"} and isinstance(value, list) and all(isinstance(item, str) and len(item) <= 128 for item in value):
                 result[key] = list(value)
-            elif key in {"capabilities", "stt", "tts"} and isinstance(value, Mapping):
+            elif key in {"capabilities", "stt"} and isinstance(value, Mapping):
                 nested: dict[str, Any] = {}
                 for nested_key, nested_value in value.items():
                     if str(nested_key).lower() in {"api_key", "authorization", "credential", "password", "secret", "token"}:
@@ -1853,19 +1873,10 @@ class _HTTPProvider:
                         nested[str(nested_key)] = list(nested_value)
                 result[key] = nested
         if "tts" in payload:
-            raw_tts = payload.get("tts")
-            if isinstance(raw_tts, Mapping):
-                nested_tts: dict[str, Any] = {}
-                for nested_key, nested_value in raw_tts.items():
-                    if str(nested_key).lower() in _TTS_SECRET_KEY_MARKERS:
-                        continue
-                    if isinstance(nested_value, (str, int, float, bool)):
-                        nested_tts[str(nested_key)] = nested_value
-                    elif isinstance(nested_value, list) and all(isinstance(item, str) and len(item) <= 128 for item in nested_value):
-                        nested_tts[str(nested_key)] = list(nested_value)
-                result["tts"] = _sanitize_tts_projection(nested_tts)
-            else:
-                result["tts"] = _sanitize_tts_projection(raw_tts)
+            # B3: hand the raw parsed tts value straight to the sanitizer so
+            # presence survives for wrong-typed/overlong semantic fields
+            # (no lossy pre-projection filtering here).
+            result["tts"] = _sanitize_tts_projection(payload.get("tts"))
         return result
 
     def health_check(self, *, timeout_seconds: float | None = None, deadline_at: float | None = None) -> dict[str, Any]:
@@ -2599,14 +2610,17 @@ class HermesAudioTTSProvider(_HTTPProvider):
 
     @classmethod
     def _envelope_flags_satisfied(cls, envelope: Mapping[str, Any]) -> bool:
-        # Required envelope positives for TTS readiness are ok and ready.
-        # configured/enabled, when present, must be an actual True: an
-        # explicit False means the endpoint declares this configuration
-        # unusable, and any other scalar is an invalid marker that fails
-        # closed (a wholly absent flag is tolerated).
-        for flag in ("ok", "ready"):
-            if envelope.get(flag) is not True:
-                return False
+        # B3: ``ok`` is the required envelope positive and must be present
+        # with the exact value True.  ``ready`` is conditional: absent is
+        # valid (the ok-only edge shape), but a present ready must be an
+        # actual True.  configured/enabled/audio_api, when present, must be
+        # an actual True: an explicit False means the endpoint declares this
+        # configuration unusable, and any other value (including the None
+        # invalid marker emitted by the B3 probe projection) fails closed.
+        if envelope.get("ok") is not True:
+            return False
+        if "ready" in envelope and envelope.get("ready") is not True:
+            return False
         if "audio_api" in envelope and envelope.get("audio_api") is not True:
             return False
         for flag in ("configured", "enabled"):
@@ -2625,20 +2639,24 @@ class HermesAudioTTSProvider(_HTTPProvider):
         if not isinstance(tts, Mapping):
             raise ProviderFailure("tts_capability_unknown", retryable=False)
 
-        # TTS capability flags: a present explicit False rejects as
-        # disabled; a present non-True non-False value (invalid marker)
-        # rejects as capability-unknown; a wholly absent flag is a minimal
-        # producer shape that the relay/direct allowlist below still gates.
+        # B3: a present explicit False rejects as disabled; a present value
+        # that is not an actual bool (invalid marker or wrong type) rejects
+        # as capability-unknown; a wholly absent flag is a minimal producer
+        # shape that the relay/direct allowlist below still gates.
         for flag in ("configured", "enabled", "ready", "ok"):
             value = tts.get(flag)
-            if value is True or value is None and flag not in tts:
+            if value is True:
                 continue
             if flag in tts and isinstance(value, bool):
                 raise ProviderFailure("tts_disabled", retryable=False)
             if flag in tts:
                 raise ProviderFailure("tts_capability_unknown", retryable=False)
         status = tts.get("status")
-        if status is not None:
+        if "status" in tts:
+            # B3: key membership, not value-None inference. A present status
+            # must be a bounded string normalizing to a positive state;
+            # present-invalid (None marker, non-string, empty, overlong,
+            # negative word) rejects as unknown.
             if not isinstance(status, str) or not status.strip() or len(status) > 256:
                 raise ProviderFailure("tts_capability_unknown", retryable=False)
             if status.strip().lower() not in cls._TTS_POSITIVE_STATUSES:
@@ -2651,17 +2669,24 @@ class HermesAudioTTSProvider(_HTTPProvider):
         if normalized_mode in cls._TTS_DISABLED_MODES:
             raise ProviderFailure("tts_disabled", retryable=False)
         if normalized_mode == "relay":
-            # Relay compatibility is a bounded allowlist: a present wire must
-            # be the recognized server-relay value, and the reason must be a
-            # supported fixed reason.  Anything else rejects as unknown.
-            wire = tts.get("wire")
-            if wire is not None:
-                if not isinstance(wire, str) or wire.strip().lower() not in {"server"}:
+            # B3: relay compatibility stays a bounded allowlist with strict
+            # key-membership semantics. A present wire must be the
+            # recognized server-relay value (present-invalid rejects); an
+            # optional provider must satisfy the same presence/type/length
+            # contract (descriptive only); the reason must be a supported
+            # fixed reason. Anything else rejects as unknown.
+            if "wire" in tts:
+                wire = tts.get("wire")
+                if not isinstance(wire, str) or not wire.strip() or len(wire) > 256 or wire.strip().lower() != "server":
                     raise ProviderFailure("tts_capability_unknown", retryable=False)
-            reason = tts.get("reason")
-            if reason is not None and (not isinstance(reason, str) or len(reason) > 256):
+            if "provider" in tts:
+                provider = tts.get("provider")
+                if not isinstance(provider, str) or not provider.strip() or len(provider) > 256:
+                    raise ProviderFailure("tts_capability_unknown", retryable=False)
+            if "reason" not in tts:
                 raise ProviderFailure("tts_capability_unknown", retryable=False)
-            if reason is None or not reason.strip():
+            reason = tts.get("reason")
+            if not isinstance(reason, str) or not reason.strip() or len(reason) > 256:
                 raise ProviderFailure("tts_capability_unknown", retryable=False)
             lowered = reason.strip().lower()
             if lowered == "resolution error" or lowered.startswith("openai resolution failed"):
@@ -2690,9 +2715,20 @@ class HermesAudioTTSProvider(_HTTPProvider):
             if normalized_wire not in cls._TTS_DIRECT_WIRES or normalized_provider not in cls._TTS_DIRECT_WIRES[normalized_wire]:
                 raise ProviderFailure("tts_capability_unknown", retryable=False)
             reason = tts.get("reason")
+            if "reason" in tts and reason is None:
+                # B3: the sanitizer's None invalid marker for a present
+                # wrong-typed/overlong reason must reject even in the
+                # absent-vs-empty-friendly direct branch.
+                raise ProviderFailure("tts_capability_unknown", retryable=False)
             if reason is not None:
-                if not isinstance(reason, str) or not reason.strip():
+                # B3: key membership. Absent reason and a genuine empty or
+                # whitespace-only string are both valid for direct mode;
+                # present-invalid (non-string) rejects; any nonempty reason
+                # rejects through the fixed categories.
+                if not isinstance(reason, str) or len(reason) > 256:
                     raise ProviderFailure("tts_capability_unknown", retryable=False)
+                if not reason.strip():
+                    return
                 lowered = reason.strip().lower()
                 if lowered == "resolution error" or lowered.startswith("openai resolution failed"):
                     raise ProviderFailure("tts_unavailable", retryable=True)

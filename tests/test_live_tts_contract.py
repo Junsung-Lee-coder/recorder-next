@@ -805,5 +805,58 @@ class HermesTTSContractTests(unittest.TestCase):
                 fixture.close()
 
 
+class HermesTTSReadyOnlyEnvelopeTests(unittest.TestCase):
+    """B3 T4: the live ok-only edge shape through the authenticated fixture.
+
+    The sealed dashboard capability envelope carries ok/stt/tts without a
+    top-level ready; readiness must accept it while the malformed envelope
+    variants keep failing closed — all through raw authenticated HTTP with
+    zero synthesize POSTs.
+    """
+
+    def _credential(self, root: Path) -> Path:
+        path = root / "recorder_api_key.env"
+        path.write_text("API_SERVER_KEY=fixture-secret\n", encoding="ascii")
+        path.chmod(0o600)
+        return path
+
+    def _ready_provider(self, root: Path):
+        fixture = _TTSFixture()
+        # Rebuild the readiness fixture contract on the live TTS fixture:
+        # readiness probes use GET /api/health and GET /api/audio/voice-config.
+        provider = HermesAudioTTSProvider(fixture.url, profile="default", credential_file=self._credential(root))
+        return fixture, provider
+
+    def test_live_ready_fixture_admits_readiness(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fixture = _TTSFixture()
+            try:
+                provider = HermesAudioTTSProvider(fixture.url, profile="default", credential_file=self._credential(root))
+                result = provider.readiness_check()
+                self.assertEqual(set(result), {"health", "capability", "endpoint_contract"})
+                self.assertEqual(result["endpoint_contract"], "/api/audio/speak?profile=default")
+            finally:
+                fixture.close()
+
+    def test_capability_shape_matches_sealed_envelope_flags(self):
+        # The projected capability of the sealed ok/ready fixture keeps the
+        # boolean flags and the bounded tts semantics, never secrets.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fixture = _TTSFixture()
+            try:
+                provider = HermesAudioTTSProvider(fixture.url, profile="default", credential_file=self._credential(root))
+                capability = provider.capability_check()
+                projected = capability.get("tts")
+                self.assertIsInstance(projected, dict)
+                self.assertEqual(projected.get("mode"), "relay")
+                self.assertEqual(projected.get("reason"), "provider 'edge' has no client wire")
+                self.assertIs(projected.get("ok"), True)
+                self.assertNotIn("fixture-secret", repr(capability))
+            finally:
+                fixture.close()
+
+
 if __name__ == "__main__":
     unittest.main()
