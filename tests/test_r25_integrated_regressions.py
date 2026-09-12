@@ -9,10 +9,20 @@ blocks; the product store contract is unchanged by this repair.
 """
 from __future__ import annotations
 
+import contextlib
+import hashlib
+import io
 import json
+import os
+import re
+import sys
 import tempfile
 import threading
+import time
+import importlib
+import importlib.util
 import unittest
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, cast
@@ -896,6 +906,263 @@ class GenericSourceAgnosticPreflightTests(unittest.TestCase):
         self.assertTrue(hasattr(HttpHermesGateway, "_preflight_existing_session"))
         source_text = inspect.getsource(HttpHermesGateway._preflight_existing_session)
         self.assertNotIn("discord", source_text.lower())
+
+
+class Voice1B4ExecutableClosureTests(unittest.TestCase):
+    """VOICE1-B4: the executable admission caller/aggregate and the fixture
+
+    attempt executor/custody/cleanup controls required by the ratified B3
+    architecture (sections 5 S.1-S.3 and 6 R.1-R.4).  Every test imports and
+    CALLS the real symbols in the control module; text search alone is
+    insufficient evidence.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        control_dir = Path(__file__).resolve().parents[1] / "run"
+        if str(control_dir) not in sys.path:
+            sys.path.insert(0, str(control_dir))
+        import qa_probe_runner as control
+
+        cls.control = control
+
+    # -- import-inertness / module-shape contract (S.2) ------------------
+
+    def test_required_symbols_exist_and_main_gated(self):
+        control = self.control
+        self.assertTrue(callable(control.REQUIRED_PREDICATES) or hasattr(control, "REQUIRED_PREDICATES"))
+        self.assertTrue(callable(control.run_voice1_readonly_admission))
+        self.assertTrue(callable(control.main))
+        self.assertTrue(callable(control.load_attempt_prefix))
+        self.assertTrue(callable(control.publish_attempt_receipt))
+        self.assertTrue(callable(control.execute_attempt_phase))
+        self.assertTrue(callable(control.cleanup_attempt))
+        self.assertIsInstance(control.REQUIRED_PREDICATES, tuple)
+        self.assertEqual(len(control.REQUIRED_PREDICATES), 32)
+        self.assertEqual(len(set(control.REQUIRED_PREDICATES)), 32)
+
+    def test_main_without_flags_is_structured_hold_exit_2(self):
+        report: dict[str, Any] = {}
+        with contextlib.redirect_stdout(io.StringIO()) as captured:
+            exit_code = self.control.main([])
+        try:
+            report = json.loads(captured.getvalue())
+        except json.JSONDecodeError:
+            self.fail("no-flags invocation must print one JSON report")
+        self.assertEqual(exit_code, 2)
+        self.assertEqual(report.get("status"), "HOLD")
+        self.assertEqual(report.get("status_code"), 2)
+
+    def test_module_main_block_raises_instruction_only(self):
+        source = Path(self.control.__file__).read_text(encoding="utf-8")
+        guard = re.search(r'if __name__ == "__main__":\n(.*)\Z', source, re.S)
+        assert guard is not None
+        self.assertNotIn("run_voice1_readonly_admission", guard.group(1))
+        self.assertNotIn("main(", guard.group(1))
+
+    def test_import_does_not_touch_boundary_state(self):
+        source_path = Path(self.control.__file__)
+        module_name = f"_b4_reimport_probe_{uuid.uuid4().hex}"
+        before_env = {key: os.environ.get(key) for key in
+                      ("RECORDER_INGRESS_SECRET", "CREDENTIALS_DIRECTORY", "HERMES_API_SERVER_KEY")}
+        spec = importlib.util.spec_from_file_location(module_name, source_path)
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        t0 = time.monotonic()
+        spec.loader.exec_module(module)
+        self.assertLess(time.monotonic() - t0, 5.0)
+        after_env = {key: os.environ.get(key) for key in before_env}
+        self.assertEqual(before_env, after_env, "import must not mutate process env")
+
+    # -- aggregate contract (S.3): every required predicate individually ----
+
+    def _ok_context(self, predicates: dict[str, bool]) -> dict[str, Any]:
+        """Minimal fixture admission context reaching an all-true reduction."""
+        context = self._boundary_context()
+        context["predicate_overrides"] = predicates
+        return context
+
+    def _boundary_context(self) -> dict[str, Any]:
+        return {
+            "candidate_id": "fixture-candidate",
+            "archive_sha256": "0" * 64,
+            "source_commit": "f" * 40,
+            "source_tree": "e" * 64,
+            "control_sha256": "d" * 64,
+            "spec_sha256": "c" * 64,
+            "manifest": {"candidate_id": "fixture-candidate"},
+            "authorization": {"read_only": True},
+            "import_origin_ok": True,
+            "per_file_hashes_ok": True,
+            "credential_custody_ok": True,
+            "dashboard_credential_ok": True,
+            "api_credential_ok": True,
+            "dashboard_remaining_seconds_pre": 7200,
+            "dashboard_remaining_seconds_post": 7200,
+            "unauthenticated_gate": {"status": 401, "secret_in_body": False},
+            "probes": {
+                "api_capability": {"run_submission": True},
+                "asr_ready": True,
+                "tts_ready": True,
+                "omitted_profile": {"target": "/api/audio/voice-config", "reduction": {"ok": True}},
+                "explicit_profile": {"target": "/api/audio/voice-config?profile=default",
+                                     "reduction": {"ok": True}, "validated": True},
+            },
+            "session": {
+                "preflight_ok": True, "payload_object_match": True, "id_match": True,
+                "within_budget": True,
+                "payload": {
+                    "object": "hermes.session",
+                    "session": {"id": "20260703_210417_8f66b434", "source": "discord",
+                                "archived": False, "ended_at": None},
+                },
+            },
+            "persisted": {
+                "read_only_ok": True, "indexed_ok": True,
+                "rows": [{"id": "20260703_210417_8f66b434", "source": "discord",
+                          "session_key": "agent:main:discord:thread:fixture-key-value",
+                          "ended_at": None}],
+            },
+            "expected_session_id": "20260703_210417_8f66b434",
+            "expected_key_sha256": hashlib.sha256(
+                b"agent:main:discord:thread:fixture-key-value").hexdigest(),
+            "closing_identity_ok": True,
+            "no_mutation_ok": True,
+            "secret_safe_ok": True,
+        }
+
+    def test_aggregate_rejects_each_false_or_missing_predicate(self):
+        base = {name: True for name in self.control.REQUIRED_PREDICATES}
+        for name in self.control.REQUIRED_PREDICATES:
+            for mutation in (False, 1, "true"):
+                with self.subTest(predicate=name, value=mutation):
+                    predicates = dict(base)
+                    predicates[name] = mutation
+                    report = self.control.run_voice1_readonly_admission(
+                        self._ok_context(predicates)
+                    )
+                    self.assertEqual(report["status"], "HOLD")
+                    self.assertEqual(report["status_code"], 2)
+                    self.assertIn(name, report["failed_predicates"])
+            # A None override removes the predicate entirely: it must then be
+            # reported as MISSING (the aggregate never infers from report keys).
+            with self.subTest(predicate=name, value="null-removed"):
+                predicates = dict(base)
+                predicates[name] = None
+                report = self.control.run_voice1_readonly_admission(
+                    self._ok_context(predicates)
+                )
+                self.assertEqual(report["status"], "HOLD")
+                self.assertEqual(report["status_code"], 2)
+                self.assertIn(name, report["missing_predicates"])
+            # A missing name (absent from the injected mapping entirely)
+            # must also surface in missing_predicates: overrides that do not
+            # mention a name still let the boundary observation stand, so we
+            # prove the aggregate itself never infers missing names by
+            # passing an overrides mapping that is the empty dict.
+            with self.subTest(predicate=name, value="overrides-empty-boundary-removed"):
+                context = self._boundary_context()
+                # Remove every boundary observation so the caller's own
+                # computation cannot classify the predicate as True.
+                stripped = {
+                    key: value for key, value in context.items()
+                    if key not in {
+                        "import_origin_ok", "per_file_hashes_ok",
+                        "credential_custody_ok", "dashboard_credential_ok",
+                        "api_credential_ok", "dashboard_remaining_seconds_pre",
+                        "dashboard_remaining_seconds_post", "unauthenticated_gate",
+                        "probes", "session", "persisted", "closing_identity_ok",
+                        "no_mutation_ok", "secret_safe_ok",
+                    }
+                }
+                stripped["predicate_overrides"] = {}
+                report = self.control.run_voice1_readonly_admission(stripped)
+                self.assertEqual(report["status"], "HOLD")
+                self.assertEqual(report["status_code"], 2)
+                self.assertIn(name, report["missing_predicates"] + report["failed_predicates"])
+
+    def test_aggregate_all_true_passes_with_exact_schema(self):
+        predicates = {name: True for name in self.control.REQUIRED_PREDICATES}
+        report = self.control.run_voice1_readonly_admission(self._ok_context(predicates))
+        self.assertEqual(report["status"], "PASS")
+        self.assertEqual(report["status_code"], 0)
+        self.assertEqual(report["schema"], "recorder-next-voice1-readonly-admission/v1")
+        self.assertEqual(sorted(report["predicates"]), sorted(self.control.REQUIRED_PREDICATES))
+        self.assertEqual(report["missing_predicates"], [])
+        self.assertEqual(report["failed_predicates"], [])
+
+    def test_pure_predicate_row_shape_matrix(self):
+        payload = {
+            "object": "hermes.session",
+            "session": {"id": "20260703_210417_8f66b434", "source": "discord",
+                        "archived": False, "ended_at": None},
+        }
+        key = "agent:main:discord:thread:fixture-key-value"
+        digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
+        good = {"id": "20260703_210417_8f66b434", "source": "discord",
+                "session_key": key, "ended_at": None}
+        ok = self.control.voice1_session_admission(
+            payload, [good],
+            expected_session_id="20260703_210417_8f66b434",
+            expected_key_sha256=digest,
+        )
+        self.assertEqual(ok["status"], "PASS")
+        truncated = ("20260703_210417_8f66b434", "discord", key)
+        extra = (good["id"], good["source"], key, None, "extra")
+        missing_key = {"id": good["id"], "source": good["source"], "session_key": key}
+        extra_key = dict(good, unexpected=1)
+        not_a_row = 42
+        for row in (truncated, extra, missing_key, extra_key, not_a_row):
+            with self.subTest(row=type(row).__name__):
+                result = self.control.voice1_session_admission(
+                    payload, [row],
+                    expected_session_id="20260703_210417_8f66b434",
+                    expected_key_sha256=digest,
+                )
+                self.assertEqual(result["status"], "HOLD")
+                self.assertIn("persisted_row_shape", result["reason_codes"])
+                self.assertFalse(result["persisted_ended_at_null"])
+
+    def test_main_authority_mismatch_holds_without_credentials(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manifest = root / "manifest.json"
+            authorization = root / "authorization.json"
+            manifest.write_text(json.dumps({"schema": "x"}), encoding="utf-8")
+            authorization.write_text(json.dumps({"schema": "y"}), encoding="utf-8")
+            good_manifest_sha = hashlib.sha256(manifest.read_bytes()).hexdigest()
+            good_auth_sha = hashlib.sha256(authorization.read_bytes()).hexdigest()
+            for kwargs in (
+                {},
+                {"manifest": str(manifest), "manifest_sha256": good_manifest_sha},
+                {"manifest": str(manifest), "manifest_sha256": good_manifest_sha,
+                 "authorization": str(authorization), "authorization_sha256": "0" * 64},
+                {"manifest": str(root / "absent.json"), "manifest_sha256": "0" * 64,
+                 "authorization": str(authorization), "authorization_sha256": good_auth_sha},
+                {"manifest": str(manifest), "manifest_sha256": "tooshort",
+                 "authorization": str(authorization), "authorization_sha256": good_auth_sha},
+            ):
+                with self.subTest(args=sorted(kwargs)):
+                    argv = ["--read-only-admission"]
+                    for key, value in kwargs.items():
+                        argv.extend([f"--{key.replace(chr(95), chr(45))}", value])
+                    with contextlib.redirect_stdout(io.StringIO()) as captured:
+                        exit_code = self.control.main(argv)
+                    report = json.loads(captured.getvalue())
+                    self.assertEqual(exit_code, 2)
+                    self.assertEqual(report["status"], "HOLD")
+                    self.assertEqual(report["status_code"], 2)
+
+    # -- executor boundary matrix: real functions, private fixture root -----
+
+    def test_executor_functions_reject_live_fixture_context(self):
+        with self.assertRaises(self.control.AttemptContextError):
+            self.control._validate_fixture_context({
+                "fixture_root": "/var/lib/recorder-next",
+                "db_path": "/var/lib/recorder-next/recorder-next.sqlite3",
+            })
+        with self.assertRaises(self.control.AttemptContextError):
+            self.control._validate_fixture_context({"fixture_root": None, "db_path": None})
 
 
 if __name__ == "__main__":

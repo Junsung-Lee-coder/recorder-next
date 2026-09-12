@@ -1,9 +1,9 @@
 # Recorder Voice1 isolated trial — binding / create / CAS / conditional-rollback packet (B3 successor, STAGED ONLY, NOT APPLIED)
 
 product_identity: recorder-next-server-voice-session-chain
-candidate_id: recorder-next-voice1-b3-repair-builder (pending freeze; assigned by the B3 builder candidate manifest)
-candidate_sha256: pending B3 freeze (null until the integrated manifest seals)
-source commit: B3 successor commit (child of 96860b5166d64fc58eb73d97cd54a55606b89a88, tree recorded at freeze)
+candidate_id: pending B4 freeze (assigned by this successor's builder candidate manifest)
+candidate_sha256: pending B4 freeze (null until the integrated manifest seals)
+source commit: B4 successor commit (child of 607f71846acff0372db186a40a417bc68bb4047f, tree recorded at freeze)
 target database: /var/lib/recorder-next/recorder-next.sqlite3 (never a Hermes DB)
 binding S (owner-selected default transcript): session_id 20260703_210417_8f66b434
 persisted Discord session key (SEPARATE identity, metadata-verified on the owning card, never edited):
@@ -280,21 +280,31 @@ disable only the trial project/principal; report containment separately and do
 NOT claim the absent preimage was restored. Previously accepted work drains and
 terminalizes under its frozen S and normal leases.
 
-## 5. Fixture semantics verification (B3 successor)
+## 5. Fixture semantics verification (B4 successor)
 
-The B3 successor module's unittest classes (Voice1ControlPacketSQLTests and
-AttemptExecutorTests) execute these exact labeled SQL bytes against an
-in-memory/temporary fixture built from the candidate schema's
-devices/projects/sessions definitions plus the release-smoke seed: A3 commit
-produced session->S + version=2 + operation_time with release-smoke rows
-untouched; wrong created_at aborted with zero mutation; a second-insert
-failure AFTER a successful project INSERT rolled the project back; a forced
-record_version mismatch made the second UPDATE rowcount 0 and rolled back the
-session UPDATE too; receipt-authenticated cleanup deleted exactly the new
-rows (FK order) and left the release-smoke set intact; drifted/tampered/
-collision/foreign states refused mutation with all rows preserved. These are
-fixture-executable results — NOT a live-DB rehearsal and not a substitute for
-the executor's own frozen-preimage revalidation at the later live gate.
+The successor control module's unittest classes (Voice1ControlPacketSQLTests,
+Voice1SessionAdmissionTests, and AttemptExecutorTests) execute these exact
+labeled SQL bytes against a temporary file fixture built from the COMPLETE
+candidate schema (recorder_next/schema.sql, per the whole-table protected
+vector) plus the release-smoke seed.  AttemptExecutorTests additionally
+publish and authenticate no-clobber O_EXCL/O_NOFOLLOW fsync receipts under a
+private fixture root: A1/A2/A3 phases commit and publish only after exact
+typed readback (INTENT durable before any product-row write); a second-insert
+failure AFTER a successful project INSERT rolled the project back; A3
+consumes the exact admission report and refuses a bare True; a commit whose
+receipt cannot publish is returned COMMIT_UNCERTAIN with rows preserved; the
+same-attempt prefix resumes only against the pinned out-of-band head;
+receipt-authenticated cleanup deleted exactly the new rows (sessions ->
+projects -> devices) for A1/A2/A3 prefixes; INTENT-only cleanup reported
+no-mutation and an R1_CLEANED prefix reported already_completed; drifted
+updated_at, NULL-to-empty description, dependent turns rows, symlinked and
+tampered/same-byte-different-inode receipts, and foreign contexts all refused
+mutation with rows preserved.  Voice1B4ExecutableClosureTests (integrated
+suite) further prove the 32-name REQUIRED_PREDICATES aggregate HOLD/exit-2
+matrix, the executable main() authority-mismatch HOLD paths, and the exact
+four-key persisted-row shape contract.  These are fixture-executable results
+— NOT a live-DB rehearsal and not a substitute for the executor's own
+frozen-preimage revalidation at the later live gate.
 
 ## 6. Unchanged invariants
 
