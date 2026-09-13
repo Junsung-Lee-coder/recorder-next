@@ -1387,7 +1387,7 @@ class Voice1B6ExecutableClosureTests(unittest.TestCase):
             self.assertIn("credential_custody", report["reason_codes"])
             self.assertEqual(report["predicates"]["credential_custody"], False)
             # No downstream predicate may have been observed.
-            self.assertIsNone(report["predicates"]["unauthenticated_gate"])
+            self.assertFalse(report["predicates"]["unauthenticated_gate"])
 
         # Metadata lifetime below the 3900s floor.
         with tempfile.TemporaryDirectory() as raw:
@@ -1661,6 +1661,139 @@ class Voice1B6E4FindingRegressionTests(unittest.TestCase):
             {"status": 200, "body": json.dumps({"ok": True, "tts": {"configured": "invalid:str"}}).encode("utf-8")},
             {"status": 200, "projection": invalid},
         ))
+
+    def test_admission_report_rejects_extra_and_non_boolean_predicates(self):
+        predicates: dict[str, Any] = {name: True for name in self.control.REQUIRED_PREDICATES}
+        predicates["unexpected"] = True
+        report = self.control._admission_report(
+            {}, predicates, [], time.monotonic(), "2026-09-13T00:00:00Z", {}, observations={},
+        )
+        self.assertEqual(report["status"], "HOLD")
+        self.assertEqual(report["status_code"], 2)
+        self.assertEqual(report["predicates"], {
+            name: True for name in self.control.REQUIRED_PREDICATES
+        })
+
+        predicates = {name: True for name in self.control.REQUIRED_PREDICATES}
+        predicates["authorization_bound"] = 1
+        report = self.control._admission_report(
+            {}, predicates, [], time.monotonic(), "2026-09-13T00:00:00Z", {}, observations={},
+        )
+        self.assertEqual(report["status"], "HOLD")
+        self.assertEqual(report["status_code"], 2)
+        self.assertIs(type(report["predicates"]["authorization_bound"]), bool)
+        self.assertFalse(report["predicates"]["authorization_bound"])
+        self.assertIn("authorization_bound", report["failed_predicates"])
+
+    def test_persisted_lookup_installs_authorizer_and_denies_non_whitelisted_action(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            db_path = root / "state.db"
+            with sqlite3.connect(db_path) as connection:
+                connection.executescript(
+                    """
+                    CREATE TABLE sessions (
+                        id TEXT NOT NULL,
+                        source TEXT NOT NULL,
+                        session_key TEXT NOT NULL,
+                        ended_at TEXT
+                    );
+                    CREATE INDEX sessions_id_idx ON sessions(id);
+                    INSERT INTO sessions VALUES (
+                        '20260703_210417_8f66b434', 'discord', 'fixture-key', NULL
+                    );
+                    """
+                )
+
+            real_connect = sqlite3.connect
+            observed: dict[str, Any] = {}
+
+            class AuditedConnection(sqlite3.Connection):
+                def set_authorizer(self, authorizer_callback):
+                    observed["set_authorizer_calls"] = observed.get("set_authorizer_calls", 0) + 1
+                    observed["delete_decision"] = authorizer_callback(
+                        sqlite3.SQLITE_DELETE, "sessions", None, "main", None
+                    )
+                    return super().set_authorizer(authorizer_callback)
+
+            def connect(*args, **kwargs):
+                kwargs["factory"] = AuditedConnection
+                return real_connect(*args, **kwargs)
+
+            context = {"authorization": {"paths": {"persisted_db": str(db_path)}}}
+            with patch.object(self.control.sqlite3, "connect", side_effect=connect):
+                result = self.control._persisted_lookup(
+                    context, deadline_at=time.monotonic() + 5.0
+                )
+
+        self.assertTrue(result["read_only"])
+        self.assertTrue(result["indexed"])
+        self.assertEqual(observed["set_authorizer_calls"], 1)
+        self.assertEqual(observed["delete_decision"], sqlite3.SQLITE_DENY)
+
+    def test_persisted_lookup_uses_shared_deadline_progress_and_db_identity(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            db_path = root / "state.db"
+            with sqlite3.connect(db_path) as connection:
+                connection.executescript(
+                    """
+                    CREATE TABLE sessions (
+                        id TEXT NOT NULL,
+                        source TEXT NOT NULL,
+                        session_key TEXT NOT NULL,
+                        ended_at TEXT
+                    );
+                    CREATE INDEX sessions_id_idx ON sessions(id);
+                    INSERT INTO sessions VALUES (
+                        '20260703_210417_8f66b434', 'discord', 'fixture-key', NULL
+                    );
+                    """
+                )
+
+            real_connect = sqlite3.connect
+            observed: dict[str, Any] = {}
+
+            class AuditedConnection(sqlite3.Connection):
+                def set_progress_handler(self, progress_handler, n):
+                    observed.setdefault("progress_handlers", []).append((progress_handler, n))
+                    return super().set_progress_handler(progress_handler, n)
+
+            def connect(*args, **kwargs):
+                observed["connect_kwargs"] = dict(kwargs)
+                kwargs["factory"] = AuditedConnection
+                return real_connect(*args, **kwargs)
+
+            deadline_at = time.monotonic() + 2.0
+            context = {"authorization": {"paths": {"persisted_db": str(db_path)}}}
+            with patch.object(self.control.sqlite3, "connect", side_effect=connect):
+                result = self.control._persisted_lookup(context, deadline_at=deadline_at)
+
+            self.assertTrue(result["read_only"])
+            self.assertTrue(result["indexed"])
+            self.assertLessEqual(observed["connect_kwargs"]["timeout"], 2.0)
+            self.assertLessEqual(observed["connect_kwargs"]["timeout"], 5.0)
+            progress_handlers = observed["progress_handlers"]
+            handler, interval = next((item for item in progress_handlers if callable(item[0])))
+            self.assertTrue(callable(handler))
+            self.assertGreater(interval, 0)
+
+            identity = self.control._regular_file_identity_no_follow(db_path)
+            self.assertIsNotNone(identity)
+            with patch.object(
+                self.control,
+                "_regular_file_identity_no_follow",
+                side_effect=[
+                    identity,
+                    {**identity, "inode": identity["inode"] + 1},
+                    {**identity, "inode": identity["inode"] + 1},
+                ],
+            ):
+                drifted = self.control._persisted_lookup(
+                    context, deadline_at=time.monotonic() + 2.0
+                )
+        self.assertFalse(drifted["read_only"])
+        self.assertFalse(drifted["indexed"])
 
     def test_report_projects_scope_specific_persisted_key_digest(self):
         predicates = {name: True for name in self.control.REQUIRED_PREDICATES}

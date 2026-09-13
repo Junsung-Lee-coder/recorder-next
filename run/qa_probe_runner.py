@@ -831,12 +831,17 @@ def _admission_report(context: dict[str, Any], predicates: dict[str, bool],
                       observations: dict[str, Any] | None = None,
                       authorization: dict[str, Any] | None = None) -> dict[str, Any]:
     """Reduce one bounded predicate mapping into the fixed report schema (S.4)."""
+    supplied = predicates if isinstance(predicates, dict) else {}
     missing = [name for name in REQUIRED_PREDICATES
-               if name not in predicates or predicates.get(name) is None]
+               if name not in supplied or supplied.get(name) is None]
     failed = [name for name in REQUIRED_PREDICATES
-              if name in predicates and predicates.get(name) is not None
-              and predicates.get(name) is not True]
-    all_true = all(predicates.get(name) is True for name in REQUIRED_PREDICATES)
+              if name in supplied and supplied.get(name) is not None
+              and supplied.get(name) is not True]
+    exact_shape = (
+        set(supplied) == set(REQUIRED_PREDICATES)
+        and all(type(supplied[name]) is bool for name in REQUIRED_PREDICATES)
+    )
+    all_true = exact_shape and all(supplied[name] is True for name in REQUIRED_PREDICATES)
     finished_utc = _utc_now_iso()
     elapsed_ms = int((time.monotonic() - started_monotonic) * 1000)
     report: dict[str, Any] = {
@@ -850,7 +855,7 @@ def _admission_report(context: dict[str, Any], predicates: dict[str, bool],
         "started_utc": started_utc,
         "finished_utc": finished_utc,
         "elapsed_ms": elapsed_ms,
-        "predicates": {name: predicates.get(name) for name in REQUIRED_PREDICATES},
+        "predicates": {name: supplied.get(name) is True for name in REQUIRED_PREDICATES},
         "missing_predicates": missing,
         "failed_predicates": failed,
         "reason_codes": sorted(set(reason_codes)),
@@ -1928,7 +1933,7 @@ def run_voice1_readonly_admission(context: dict[str, Any]) -> dict[str, Any]:
         )
         predicates["generic_preflight"] = True
         predicates["session_get"] = isinstance(payload, dict)
-        predicates["session_budget"] = bool(session_deadline - time.monotonic() >= 0 or time.monotonic() <= session_deadline)
+        predicates["session_budget"] = bool(time.monotonic() <= session_deadline and within_budget())
         observations["session_payload"] = payload
     except Exception:
         predicates["generic_preflight"] = False
@@ -1943,7 +1948,7 @@ def run_voice1_readonly_admission(context: dict[str, Any]) -> dict[str, Any]:
                                  observations=observations, authorization=authorization)
 
     # -- 6. read-only indexed persisted lookup ------------------------------
-    lookup = _persisted_lookup(context)
+    lookup = _persisted_lookup(context, deadline_at=session_deadline)
     predicates["persisted_lookup_ro"] = bool(lookup.get("read_only"))
     predicates["persisted_lookup_indexed"] = bool(lookup.get("indexed"))
     if not (predicates["persisted_lookup_ro"] and predicates["persisted_lookup_indexed"]):
@@ -2143,26 +2148,74 @@ def _dashboard_remaining_seconds(metadata_raw: str) -> int | None:
     return expires - int(time.time())
 
 
-def _persisted_lookup(context: dict[str, Any]) -> dict[str, Any]:
+def _persisted_lookup(context: dict[str, Any], *, deadline_at: float | None = None) -> dict[str, Any]:
     """Read-only indexed SELECT of the target session row (URI mode=ro)."""
     authorization = context.get("authorization") or {}
     paths = authorization.get("paths") or {}
     db_raw = paths.get("persisted_db")
-    result: dict[str, Any] = {"read_only": False, "indexed": False, "rows": []}
+    result: dict[str, Any] = {
+        "read_only": False,
+        "indexed": False,
+        "rows": [],
+        "authorizer_installed": False,
+        "progress_handler_installed": False,
+        "db_identity_equal": False,
+    }
+    if deadline_at is None:
+        deadline_at = context.get("session_deadline")
+    if isinstance(deadline_at, bool) or not isinstance(deadline_at, (int, float)):
+        return result
+    deadline = float(deadline_at)
+    if not deadline > time.monotonic():
+        return result
     if not isinstance(db_raw, str) or not db_raw:
         return result
-    db_path = Path(db_raw)
-    if not db_path.is_absolute():
+    db_path = _bounded_absolute_path(db_raw)
+    if db_path is None or not _path_has_no_symlink_components(db_path):
         return result
-    try:
-        connection = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=5.0, isolation_level=None)
-    except sqlite3.Error:
+
+    opening_identity = _regular_file_identity_no_follow(db_path)
+    if opening_identity is None:
         return result
+    result["db_identity_opening"] = opening_identity
+
+    def ensure_deadline() -> None:
+        if time.monotonic() >= deadline:
+            raise TimeoutError("admission deadline")
+
+    connection: sqlite3.Connection | None = None
     try:
+        ensure_deadline()
+        remaining = deadline - time.monotonic()
+        busy_timeout_ms = min(5000, int(remaining * 1000))
+        if busy_timeout_ms <= 0:
+            return result
+        connection = sqlite3.connect(
+            f"file:{db_path}?mode=ro",
+            uri=True,
+            timeout=min(5.0, max(remaining, 0.001)),
+            isolation_level=None,
+        )
+        connected_identity = _regular_file_identity_no_follow(db_path)
+        result["db_identity_connected"] = connected_identity
+        if connected_identity != opening_identity:
+            return result
+
+        def interrupt_if_expired() -> int:
+            return 1 if time.monotonic() >= deadline else 0
+
+        connection.set_progress_handler(interrupt_if_expired, 1000)
+        result["progress_handler_installed"] = True
+        connection.set_authorizer(_admission_authorizer)
+        result["authorizer_installed"] = True
+
+        ensure_deadline()
         connection.execute("PRAGMA query_only=ON")
-        connection.execute(f"PRAGMA busy_timeout={max(min(5000, 5000), 0)}")
-        connection.execute("PRAGMA authorizer=_admission_authorizer")
+        ensure_deadline()
+        connection.execute(f"PRAGMA busy_timeout={busy_timeout_ms}")
+        ensure_deadline()
         indexes = connection.execute("PRAGMA index_list('sessions')").fetchall()
+        ensure_deadline()
         columns = [row[1] for row in connection.execute("PRAGMA table_info('sessions')").fetchall()]
         result["read_only"] = True
         result["indexed"] = any(
@@ -2171,41 +2224,67 @@ def _persisted_lookup(context: dict[str, Any]) -> dict[str, Any]:
             ).fetchone()[0] > 0
             for index in indexes
         ) and "id" in columns
+        ensure_deadline()
         plan = connection.execute(
             "EXPLAIN QUERY PLAN SELECT id,source,session_key,ended_at FROM sessions WHERE id=? LIMIT 2",
             (SELECTED_S,),
         ).fetchall()
         uses_index = any("SEARCH" in str(row[-1]) or "USING INDEX" in str(row[-1]).upper() for row in plan)
         result["indexed"] = bool(result["indexed"] and uses_index)
+        ensure_deadline()
         rows = connection.execute(
             "SELECT id,source,session_key,ended_at FROM sessions WHERE id=? LIMIT 2",
             (SELECTED_S,),
         ).fetchall()
         result["rows"] = [tuple(row) for row in rows]
-    except sqlite3.Error:
+    except (sqlite3.Error, OSError, TimeoutError, TypeError, ValueError):
         result["read_only"] = False
         result["indexed"] = False
         result["rows"] = []
     finally:
-        try:
-            connection.close()
-        except sqlite3.Error:
-            pass
+        if connection is not None:
+            closing_identity = _regular_file_identity_no_follow(db_path)
+            result["db_identity_closing"] = closing_identity
+            result["db_identity_equal"] = closing_identity == opening_identity
+            if not result["db_identity_equal"]:
+                result["read_only"] = False
+                result["indexed"] = False
+                result["rows"] = []
+            try:
+                connection.set_progress_handler(None, 0)
+            except sqlite3.Error:
+                pass
+            try:
+                connection.close()
+            except sqlite3.Error:
+                pass
     return result
 
 
 def _admission_authorizer(action: Any, arg1: Any, arg2: Any, db_name: Any, trigger: Any) -> int:
     """Allow only exact schema inspection and the indexed SELECT."""
-    code = int(action) if not isinstance(action, int) else action
-    sqlite3_ok = {  # SELECT(21), READ(20), PRAGMA(19 restricted), FUNCTION(31)
-        21, 20, 31,
-    }
-    if code == 19:  # PRAGMA: allow table_info/index_list/index_info/query_only/busy_timeout only
-        allowed = ("table_info", "index_list", "index_info", "query_only", "busy_timeout")
-        return 0 if any(token in str(arg1 or "") for token in allowed) else 1
-    if code in sqlite3_ok:
-        return 0
-    return 1  # SQLITE_DENY
+    try:
+        code = int(action)
+    except (TypeError, ValueError):
+        return sqlite3.SQLITE_DENY
+    if code == sqlite3.SQLITE_PRAGMA:
+        allowed = {"table_info", "index_list", "index_info", "query_only", "busy_timeout"}
+        return sqlite3.SQLITE_OK if isinstance(arg1, str) and arg1 in allowed else sqlite3.SQLITE_DENY
+    if code == sqlite3.SQLITE_SELECT:
+        return sqlite3.SQLITE_OK
+    if code == sqlite3.SQLITE_FUNCTION:
+        return sqlite3.SQLITE_OK if arg2 == "count" else sqlite3.SQLITE_DENY
+    if code == sqlite3.SQLITE_READ:
+        if arg1 == "sessions":
+            return (
+                sqlite3.SQLITE_OK
+                if arg2 in {"id", "source", "session_key", "ended_at"}
+                else sqlite3.SQLITE_DENY
+            )
+        if arg1 == "pragma_index_info" and arg2 == "name":
+            return sqlite3.SQLITE_OK
+        return sqlite3.SQLITE_DENY
+    return sqlite3.SQLITE_DENY
 
 
 def main(argv: list[str] | None = None) -> int:
