@@ -14,7 +14,15 @@ from typing import Any, cast
 from urllib.parse import parse_qs, urlsplit
 from unittest.mock import patch
 
-from recorder_next.adapters import ChainFailure, HermesAudioTTSProvider, ProviderChain, ProviderFailure, ProviderTarget
+from recorder_next.adapters import (
+    ChainFailure,
+    EdgeTTSProvider,
+    HermesAudioTTSProvider,
+    HttpTTSProvider,
+    ProviderChain,
+    ProviderFailure,
+    ProviderTarget,
+)
 from recorder_next.clock import DeterministicClock
 from recorder_next.config import RecorderConfig
 from recorder_next.models import TTSResult
@@ -854,6 +862,312 @@ class HermesTTSReadyOnlyEnvelopeTests(unittest.TestCase):
                 self.assertEqual(projected.get("reason"), "provider 'edge' has no client wire")
                 self.assertIs(projected.get("ok"), True)
                 self.assertNotIn("fixture-secret", repr(capability))
+            finally:
+                fixture.close()
+
+
+class _GenericTTSHandler(BaseHTTPRequestHandler):
+    """Raw generic TTS fixture: bounded GET health/capability, POST counter.
+
+    ``fixture.payloads`` maps request path -> JSON body (or int status for a
+    bare error).  It serves exactly the two readiness GET paths the provider
+    probes plus a POST trap that only counts requests; readiness must never
+    POST.
+    """
+
+    def log_message(self, format: str, *args) -> None:
+        return
+
+    def _send(self, status: int, payload: Any) -> None:
+        encoded = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(encoded)))
+        self.end_headers()
+        self.wfile.write(encoded)
+
+    def _fixture(self) -> Any:
+        return cast(_FixtureServer, self.server).fixture
+
+    def do_GET(self) -> None:
+        fixture = self._fixture()
+        authorization = self.headers.get("Authorization", "")
+        fixture.authorization_seen = bool(authorization)
+        fixture.authorization_valid = authorization == "Bearer fixture-secret"
+        fixture.gets.append(self.path)
+        if self.path == fixture.health_path:
+            body = fixture.health
+            if isinstance(body, int):
+                self._send(body, {"detail": "error"})
+            else:
+                self._send(200, body)
+            return
+        if self.path == fixture.capability_path:
+            body = fixture.capability
+            if isinstance(body, int):
+                self._send(body, {"detail": "error"})
+            else:
+                self._send(200, body)
+            return
+        if self.path == "/v1/capabilities":
+            # Hermes gateway capability probe used by production construction.
+            self._send(200, {"features": {"run_submission": True}})
+            return
+        self._send(404, {"detail": "not found"})
+
+    def do_POST(self) -> None:
+        fixture = self._fixture()
+        fixture.posts += 1
+        self._send(404, {"detail": "no synthesize during readiness"})
+
+
+class _GenericTTSFixture:
+    """Bounded loopback fixture for raw generic HTTP/Edge readiness probes."""
+
+    def __init__(self, *, health: Any, capability: Any) -> None:
+        self.health = health
+        self.capability = capability
+        self.health_path = "/healthz"
+        self.capability_path = "/tts-config"
+        self.gets: list[str] = []
+        self.posts = 0
+        self.authorization_seen = False
+        self.authorization_valid = False
+        self._server = _FixtureServer(("127.0.0.1", 0), _GenericTTSHandler)
+        self._server.fixture = self
+        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+        self._thread.start()
+
+    @property
+    def url(self) -> str:
+        return f"http://127.0.0.1:{self._server.server_address[1]}"
+
+    def close(self) -> None:
+        self._server.shutdown()
+        self._server.server_close()
+        self._thread.join(timeout=2)
+
+
+_GENERIC_OK_ENVELOPE: dict[str, Any] = {"ok": True, "ready": True}
+_GENERIC_OK_TTS: dict[str, Any] = {"ok": True, "ready": True, "mode": "relay", "reason": "provider 'edge' has no client wire"}
+
+
+class GenericHttpTTSPreparationTests(unittest.TestCase):
+    """B6 T: provider-appropriate strict readiness for HttpTTSProvider/Edge.
+
+    Every case runs raw authenticated loopback GETs through the provider's own
+    probe path and then through an actual readiness_check; malformed semantics
+    must reject regardless of any other positive field, readiness must never
+    POST, and positive->negative->positive refresh must not retain stale True.
+    """
+
+    def _fixture(self, *, health: Any = None, capability: Any = None) -> _GenericTTSFixture:
+        return _GenericTTSFixture(
+            health=dict(_GENERIC_OK_ENVELOPE) if health is None else health,
+            capability=dict(_GENERIC_OK_ENVELOPE, tts={"mode": "relay", "reason": "provider 'edge' has no client wire", "provider": "edge", "wire": "server", "ok": True, "ready": True}) if capability is None else capability,
+        )
+
+    def _provider(self, fixture: _GenericTTSFixture, root: Path, cls: type):
+        credential = root / "recorder_api_key"
+        credential.write_text("API_SERVER_KEY=fixture-secret\n", encoding="ascii")
+        credential.chmod(0o600)
+        return cls(
+            fixture.url,
+            model="korean-tts",
+            voice="ko-KR-1",
+            timeout=5.0,
+            credential_file=credential,
+            health_path=fixture.health_path,
+            capability_path=fixture.capability_path,
+        )
+
+    def test_generic_ok_relay_readiness_passes_without_post(self):
+        for cls in (HttpTTSProvider, EdgeTTSProvider):
+            with self.subTest(cls=cls.__name__):
+                with tempfile.TemporaryDirectory() as tmp:
+                    fixture = self._fixture()
+                    try:
+                        provider = self._provider(fixture, Path(tmp), cls)
+                        result = provider.readiness_check()
+                        self.assertEqual(set(result), {"health", "capability", "endpoint_contract"})
+                        self.assertEqual(result["endpoint_contract"], "http-tts-json/v1")
+                        self.assertEqual(fixture.gets, [fixture.health_path, fixture.capability_path])
+                        self.assertEqual(fixture.posts, 0)
+                        self.assertTrue(fixture.authorization_valid)
+                    finally:
+                        fixture.close()
+
+    def test_ready_only_with_absent_tts_passes(self):
+        # A wholly absent nested tts is valid for a generic endpoint; a
+        # ready-only envelope (ok absent) is also a valid positive.
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = self._fixture(capability={"ready": True})
+            try:
+                provider = self._provider(fixture, Path(tmp), HttpTTSProvider)
+                result = provider.readiness_check()
+                self.assertEqual(set(result), {"health", "capability", "endpoint_contract"})
+                self.assertEqual(fixture.posts, 0)
+            finally:
+                fixture.close()
+
+    def test_generic_ok_only_nested_tts_passes(self):
+        # Nested tts with ok-only and no mode is a valid generic shape when
+        # reason/wire are absent and no other flag contradicts.
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = self._fixture(
+                capability={"ok": True, "tts": {"ok": True}},
+            )
+            try:
+                provider = self._provider(fixture, Path(tmp), HttpTTSProvider)
+                provider.readiness_check()
+                self.assertEqual(fixture.posts, 0)
+            finally:
+                fixture.close()
+
+    def test_malformed_semantics_reject_regardless_of_other_positives(self):
+        # The REV-009 reproductions: wrong-typed/overlong semantics must fail
+        # closed even though other fields express a positive.  Each case
+        # mutates the RAW payload before the HTTP round trip.
+        cases: list[tuple[str, dict[str, Any], dict[str, Any] | None]] = [
+            ("health_ready_object", {"ok": True, "ready": {"state": True}}, None),
+            ("capability_ready_string", {"ok": True, "ready": "yes"}, None),
+            ("capability_configured_int", {"ok": True, "configured": 1}, None),
+            ("nested_tts_ready_list", {"ok": True, "tts": {"ok": True, "ready": ["y"]}}, None),
+            ("nested_tts_empty_rejects", {"ok": True, "tts": {}}, None),
+            ("nested_tts_null_rejects", {"ok": True, "tts": None}, None),
+            ("nested_tts_non_mapping", {"ok": True, "tts": "relay"}, None),
+            ("nested_tts_overlong_string", {"ok": True, "tts": {"ok": True, "provider": "p" * 257}}, None),
+            ("nested_tts_wrong_type_flag", {"ok": True, "tts": {"ok": True, "configured": 1}}, None),
+            ("nested_reason_with_absent_mode", {"ok": True, "tts": {"ok": True, "reason": "resolution error"}}, None),
+            ("nested_wire_without_mode", {"ok": True, "tts": {"ok": True, "wire": "server"}}, None),
+            ("nested_mode_present_no_positive", {"ok": True, "tts": {"mode": "relay"}}, None),
+            ("nested_disabled_mode", {"ok": True, "tts": {"ok": True, "mode": "disabled"}}, None),
+            ("nested_explicit_false", {"ok": True, "tts": {"ok": True, "enabled": False}}, None),
+            ("negative_status_string", {"ok": True, "tts": {"ok": True, "status": "degraded"}}, None),
+        ]
+        for cls in (HttpTTSProvider, EdgeTTSProvider):
+            for name, capability, health in cases:
+                with self.subTest(cls=cls.__name__, case=name):
+                    with tempfile.TemporaryDirectory() as tmp:
+                        fixture = self._fixture(
+                            health=_GENERIC_OK_ENVELOPE if health is None else health,
+                            capability=capability,
+                        )
+                        try:
+                            provider = self._provider(fixture, Path(tmp), cls)
+                            with self.assertRaises(ProviderFailure) as raised:
+                                provider.readiness_check()
+                            self.assertIn(
+                                raised.exception.kind,
+                                {"tts_capability_unknown", "tts_disabled", "tts_unavailable"},
+                            )
+                            if raised.exception.kind == "tts_capability_unknown":
+                                self.assertFalse(raised.exception.retryable)
+                            self.assertEqual(fixture.posts, 0)
+                        finally:
+                            fixture.close()
+
+    def test_transport_auth_precede_semantics(self):
+        # 401 from the capability endpoint is an auth failure even though the
+        # body would be malformed semantics; transport errors are not
+        # capability mismatches.
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = self._fixture(capability=401)
+            try:
+                provider = self._provider(fixture, Path(tmp), HttpTTSProvider)
+                with self.assertRaises(ProviderFailure) as raised:
+                    provider.readiness_check()
+                self.assertEqual(raised.exception.kind, "auth")
+                self.assertEqual(raised.exception.status_code, 401)
+            finally:
+                fixture.close()
+
+    def test_positive_negative_positive_refresh_no_stale_true(self):
+        # The complete chain through real configuration selection: a generic
+        # HTTP TTS provider built by create_configured_service must reject
+        # construction when readiness fails, must pass when it succeeds, and
+        # refresh must flip with the observed state without retaining True.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fixture = self._fixture()
+            try:
+                credential = root / "recorder_api_key"
+                credential.write_text("API_SERVER_KEY=fixture-secret\n", encoding="ascii")
+                credential.chmod(0o600)
+
+                def config_text() -> str:
+                    return "\n".join(
+                        (
+                            "[server]",
+                            'host = "127.0.0.1"',
+                            "port = 8653",
+                            "",
+                            "[storage]",
+                            f'database = "{root / "db.sqlite3"}"',
+                            f'root = "{root / "data"}"',
+                            "",
+                            "[providers]",
+                            f'hermes_base_url = "{fixture.url}"',
+                            f'hermes_api_key_file = "{credential}"',
+                            'asr_source = "http-asr"',
+                            'asr_chain = ["generic-asr"]',
+                            'tts_source = "http-tts"',
+                            'tts_chain = ["generic-tts"]',
+                            "",
+                            "[[providers.asr_providers]]",
+                            'name = "generic-asr"',
+                            'adapter = "http-asr"',
+                            f'endpoint = "{fixture.url}"',
+                            'model = "whisper-fixture"',
+                            f'credential_file = "{credential}"',
+                            f'health_path = "{fixture.health_path}"',
+                            f'capability_path = "{fixture.health_path}"',
+                            "enabled = true",
+                            "",
+                            "[[providers.tts_providers]]",
+                            'name = "generic-tts"',
+                            'adapter = "http-tts"',
+                            f'endpoint = "{fixture.url}"',
+                            'model = "korean-tts"',
+                            'voice = "ko-KR-1"',
+                            f'credential_file = "{credential}"',
+                            f'health_path = "{fixture.health_path}"',
+                            f'capability_path = "{fixture.capability_path}"',
+                            "enabled = true",
+                        )
+                    ) + "\n"
+
+                config_path = root / "recorder-next.toml"
+
+                def construct():
+                    return create_configured_service(
+                        RecorderConfig.from_file(config_path).resolved(),
+                        require_production=True,
+                        ingress_secret="fixture-ingress-secret",
+                    )
+
+                # negative first: malformed nested tts rejects before storage
+                fixture.capability = {"ok": True, "tts": {"ok": True, "ready": ["y"]}}
+                config_path.write_text(config_text(), encoding="utf-8")
+                with self.assertRaises(ProviderFailure) as raised:
+                    construct()
+                self.assertEqual(raised.exception.kind, "tts_capability_unknown")
+
+                # positive: real construction succeeds through the configured chain
+                fixture.capability = dict(_GENERIC_OK_ENVELOPE, tts={"mode": "relay", "reason": "provider 'edge' has no client wire", "provider": "edge", "wire": "server", "ok": True, "ready": True})
+                config_path.write_text(config_text(), encoding="utf-8")
+                service = construct()
+                self.assertIsNotNone(service.tts_chain)
+                self.assertTrue(service.refresh_production_readiness())
+
+                # negative again: refresh flips without retaining stale True
+                fixture.capability = {"ok": True, "tts": {"ok": True, "mode": "disabled"}}
+                self.assertFalse(service.refresh_production_readiness())
+
+                # positive again: recovery works
+                fixture.capability = dict(_GENERIC_OK_ENVELOPE, tts={"mode": "relay", "reason": "provider 'edge' has no client wire", "provider": "edge", "wire": "server", "ok": True, "ready": True})
+                self.assertTrue(service.refresh_production_readiness())
+                self.assertEqual(fixture.posts, 0)
             finally:
                 fixture.close()
 

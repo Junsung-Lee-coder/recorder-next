@@ -1,9 +1,30 @@
-# Recorder Voice1 isolated trial — binding / create / CAS / conditional-rollback packet (B3 successor, STAGED ONLY, NOT APPLIED)
+# Recorder Voice1 isolated trial — binding / create / CAS / conditional-rollback packet (SUCCESSOR-RESOLVED, STAGED ONLY, NOT APPLIED)
 
 product_identity: recorder-next-server-voice-session-chain
-candidate_id: pending B4 freeze (assigned by this successor's builder candidate manifest)
-candidate_sha256: pending B4 freeze (null until the integrated manifest seals)
-source commit: B4 successor commit (child of 607f71846acff0372db186a40a417bc68bb4047f, tree recorded at freeze)
+identity_resolution: candidate-manifest.json verified algorithm (the frozen
+  candidate-manifest.json of the sealed successor generation is the single
+  identity authority; this packet embeds NO candidate archive/commit/tree and
+  no future hash, so it cannot go stale against its own successor)
+candidate_id: read candidate_id from candidate-manifest.json
+candidate_sha256: read candidate_sha256 from candidate-manifest.json
+source commit/tree: read source_commit and source_tree from candidate-manifest.json
+manifest resolution algorithm (the same main authority-loading path the
+  control runner implements; operator re-runs it before any use):
+  1. Root provides the absolute manifest path M and its SHA256 out of band.
+     Open safely, bounded read, hash the exact bytes, reject duplicate JSON
+     keys; require the successor schema, generation, and product identity.
+  2. Read candidate_id, candidate_sha256, source_commit, source_tree from M;
+     verify authorities.* hashes and candidate_incomplete=false; resolve the
+     candidate root and archive from the separate root authorization.
+  3. Hash the archive, reject duplicate/traversing/absolute/unsupported
+     member types; require the normalized relative member set to equal
+     per_file_sha256 exactly and tracked_file_count to match; require the
+     packet and runner member hashes to equal control.packet_sha256 and
+     control.probe_runner_sha256.
+  4. Extract the eight labeled SQL statements with the existing parser; the
+     label set and per-statement SHA256 map must equal the candidate evidence.
+  5. Identity fields in every report are copied from the validated M — never
+     from packet placeholders, directory basenames, or an older receipt.
 target database: /var/lib/recorder-next/recorder-next.sqlite3 (never a Hermes DB)
 binding S (owner-selected default transcript): session_id 20260703_210417_8f66b434
 persisted Discord session key (SEPARATE identity, metadata-verified on the owning card, never edited):
@@ -229,27 +250,38 @@ any unexpected row count or exception invokes ROLLBACK, never partial COMMIT.
 <!-- voice1-sql:r1.delete_session -->
 ```sql
 DELETE FROM sessions
- WHERE session_key IS :session_key AND project_id IS :project_id
-   AND gateway_session_key IS :gateway_session_key AND created_at IS :session_created_at
+ WHERE session_key IS :session_key AND typeof(session_key) = :session_key_type
+   AND project_id IS :project_id AND typeof(project_id) = :project_id_type
+   AND gateway_session_key IS :gateway_session_key AND typeof(gateway_session_key) = :gateway_session_key_type
+   AND created_at IS :session_created_at AND typeof(created_at) = :session_created_at_type
 ```
 
 <!-- voice1-sql:r1.delete_project -->
 ```sql
 DELETE FROM projects
- WHERE stable_project_id IS :stable_project_id AND user_id IS :project_user_id
-   AND project_number IS :project_number AND name IS :name
-   AND aliases_json IS :aliases_json AND description IS :description
-   AND status IS :project_status AND default_session_key IS :default_session_key
-   AND record_version IS :record_version AND created_at IS :project_created_at
-   AND updated_at IS :project_updated_at AND archived_at IS :archived_at
+ WHERE stable_project_id IS :stable_project_id AND typeof(stable_project_id) = :stable_project_id_type
+   AND user_id IS :project_user_id AND typeof(user_id) = :project_user_id_type
+   AND project_number IS :project_number AND typeof(project_number) = :project_number_type
+   AND name IS :name AND typeof(name) = :name_type
+   AND aliases_json IS :aliases_json AND typeof(aliases_json) = :aliases_json_type
+   AND description IS :description AND typeof(description) = :description_type
+   AND status IS :project_status AND typeof(status) = :project_status_type
+   AND default_session_key IS :default_session_key AND typeof(default_session_key) = :default_session_key_type
+   AND record_version IS :record_version AND typeof(record_version) = :record_version_type
+   AND created_at IS :project_created_at AND typeof(created_at) = :project_created_at_type
+   AND updated_at IS :project_updated_at AND typeof(updated_at) = :project_updated_at_type
+   AND archived_at IS :archived_at AND typeof(archived_at) = :archived_at_type
 ```
 
 <!-- voice1-sql:r1.delete_device -->
 ```sql
 DELETE FROM devices
- WHERE user_id IS :device_user_id AND device_id IS :device_id
-   AND kind IS :kind AND status IS :device_status
-   AND created_at IS :device_created_at AND revoked_at IS :revoked_at
+ WHERE user_id IS :device_user_id AND typeof(user_id) = :device_user_id_type
+   AND device_id IS :device_id AND typeof(device_id) = :device_id_type
+   AND kind IS :kind AND typeof(kind) = :kind_type
+   AND status IS :device_status AND typeof(status) = :device_status_type
+   AND created_at IS :device_created_at AND typeof(created_at) = :device_created_at_type
+   AND revoked_at IS :revoked_at AND typeof(revoked_at) = :revoked_at_type
 ```
 
 Permitted committed-prefix rollback states:
@@ -280,9 +312,34 @@ disable only the trial project/principal; report containment separately and do
 NOT claim the absent preimage was restored. Previously accepted work drains and
 terminalizes under its frozen S and normal leases.
 
-## 5. Fixture semantics verification (B4 successor)
+## 5. Verification evidence classes and executable CLI
 
-The successor control module's unittest classes (Voice1ControlPacketSQLTests,
+Three distinct evidence classes exist and can never substitute for each other:
+- FIXTURE: the in-module unittest classes below run against temporary
+  databases and private fixture roots.  These prove statement/custody/rollback
+  semantics only.
+- REAL SUBPROCESS: the executable read-only admission caller run exactly once
+  as a subprocess with the canonical argv against owned loopback/temp data,
+  defaulting to a structured JSON HOLD/exit 2.  A helper call reported as
+  "subprocess execution" is not subprocess evidence.
+- LIVE: later, separately root-authorized trial/live results.  Fixture or
+  subprocess evidence never implies live permission.
+
+Canonical read-only admission invocation (authority paths only; tokens are
+never arguments):
+
+    timeout 120s python3 -B -s <candidate_root>/run/qa_probe_runner.py
+      --read-only-admission
+      --manifest <candidate-manifest.json> --manifest-sha256 <sha256>
+      --authorization <authorization.json> --authorization-sha256 <sha256>
+
+No flags, malformed flags, validation failure, or any failed observation
+prints exactly one JSON HOLD with status_code 2 on stdout and exits 2 with an
+empty stderr; the all-true report exits 0.
+
+## 5.1 Fixture semantics verification
+
+The control module's unittest classes (Voice1ControlPacketSQLTests,
 Voice1SessionAdmissionTests, and AttemptExecutorTests) execute these exact
 labeled SQL bytes against a temporary file fixture built from the COMPLETE
 candidate schema (recorder_next/schema.sql, per the whole-table protected
@@ -299,12 +356,23 @@ projects -> devices) for A1/A2/A3 prefixes; INTENT-only cleanup reported
 no-mutation and an R1_CLEANED prefix reported already_completed; drifted
 updated_at, NULL-to-empty description, dependent turns rows, symlinked and
 tampered/same-byte-different-inode receipts, and foreign contexts all refused
-mutation with rows preserved.  Voice1B4ExecutableClosureTests (integrated
-suite) further prove the 32-name REQUIRED_PREDICATES aggregate HOLD/exit-2
-matrix, the executable main() authority-mismatch HOLD paths, and the exact
-four-key persisted-row shape contract.  These are fixture-executable results
-— NOT a live-DB rehearsal and not a substitute for the executor's own
-frozen-preimage revalidation at the later live gate.
+mutation with rows preserved.  The B6 form adds: BEGIN IMMEDIATE precedes
+every authorizing read (a second connection changing state before the lock is
+caught by the locked re-read, and a second connection is busy while the lock
+is held); cleanup DELETE parameters derive from the tip receipt's
+authenticated typed postimage with typeof() predicates on every field, so
+current-row drift (any of the 22 positions, timestamps, NULL-to-empty,
+INTEGER type/value drift) refuses deletion instead of being adopted; a
+same-connection drift after the first successful DELETE rolls the whole
+transaction back; and the prefix validator compares only the head receipt to
+the current DB — historic INTENT absence is never compared to today's rows.
+Voice1B6ExecutableClosureTests (integrated suite) further prove the
+executable main() HOLD paths, the strict five-option canonical argv grammar,
+the 32-name REQUIRED_PREDICATES aggregate, the distinct omitted/explicit
+profile observations, and the exact four-key persisted-row shape contract.
+These are fixture-executable results — NOT a live-DB rehearsal and not a
+substitute for the executor's own frozen-preimage revalidation at the later
+live gate.
 
 ## 6. Unchanged invariants
 

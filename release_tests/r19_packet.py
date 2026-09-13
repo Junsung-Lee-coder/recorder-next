@@ -6,7 +6,8 @@ import copy
 import hashlib
 import json
 import os
-from pathlib import Path
+import re
+from pathlib import Path, PurePosixPath
 import shutil
 import stat
 import subprocess
@@ -16,9 +17,151 @@ import tempfile
 from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "control"))
-import release_control as control
-import runtime_readback as runtime
+
+# B6 (REV-012): historical release_control/runtime_readback imports are
+# optional and live only behind the operations that need them, so pure
+# projection helpers and their tests import this module without those
+# (non-archived) control files.
+try:
+    sys.path.insert(0, str(ROOT / "control"))
+    import release_control as control  # type: ignore[import-not-found]
+    import runtime_readback as runtime  # type: ignore[import-not-found]
+except ModuleNotFoundError:  # pragma: no cover - archived-candidate import path
+    control = None  # type: ignore[assignment]
+    runtime = None  # type: ignore[assignment]
+
+_HERMES_LAUNCHER_SCRIPT = "/home/rumi/.hermes/hermes-agent/venv/bin/hermes"
+_PYTHON_BASENAME_RE = re.compile(r"python(?:3(?:\.\d+)?)?$")
+_ARGV_MAX_TOKENS = 32
+_ARGV_MAX_TOKEN_LEN = 4096
+_ARGV_MAX_TOTAL = 16 * 1024
+_ARGV_SENSITIVE_FLAGS = frozenset({
+    "api-key", "api_key", "key", "token", "access-token", "access_token",
+    "authorization", "password", "passwd", "secret", "client-secret",
+    "client_secret", "cookie",
+})
+
+
+def _canonical_port(value: int) -> str:
+    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 65535:
+        raise ValueError("port must be an actual int in 1..65535")
+    return str(value)
+
+
+def project_runtime_argv(argv, *, role, executable, config, port):
+    """Fail-closed structural argv projection (B6 REV-012).
+
+    Reconstructs the managed runtime argv entirely from an allowlisted
+    grammar plus trusted runtime identity.  Returns the reconstructed vector
+    byte-for-byte equal to the actual argv when safe; raises ValueError for
+    any argv that cannot be proven safe (unknown/duplicate/reordered/inline
+    flags, credential-bearing or secret-shaped tokens, oversize input), so
+    raw argv is never persisted.
+    """
+    if role not in {"recorder", "hermes"}:
+        raise ValueError("runtime role is invalid")
+    if not isinstance(argv, (list, tuple)) or not argv or len(argv) > _ARGV_MAX_TOKENS:
+        raise ValueError("runtime argv shape is unsafe")
+    exe = str(executable)
+    if not exe or len(exe) > 4096 or _PYTHON_BASENAME_RE.search(PurePosixPath(exe.replace("\\", "/")).name) is None:
+        raise ValueError("runtime executable is not a canonical Python interpreter")
+    canonical_config = str(config)
+    if not canonical_config or len(canonical_config) > 4096:
+        raise ValueError("runtime config path is invalid")
+    port_token = _canonical_port(port)
+
+    tokens = [str(token) for token in argv]
+    if any(len(token) > _ARGV_MAX_TOKEN_LEN for token in tokens):
+        raise ValueError("runtime argv token is oversize")
+    if sum(len(token) + 1 for token in tokens) > _ARGV_MAX_TOTAL:
+        raise ValueError("runtime argv total size is oversize")
+    if any(any(ord(char) < 0x20 for char in token) for token in tokens):
+        raise ValueError("runtime argv contains control characters")
+
+    def reject_token(token: str, index: int) -> None:
+        lowered = token.lower()
+        stripped = lowered.lstrip("-")
+        if stripped in _ARGV_SENSITIVE_FLAGS or lowered in _ARGV_SENSITIVE_FLAGS:
+            raise ValueError("credential-bearing flag cannot enter the projection")
+        if any(marker in lowered for marker in ("token=", "key=", "api_key=", "api-key=", "password=", "secret=", "authorization=", "bearer ")):
+            raise ValueError("credential-shaped value cannot enter the projection")
+        if "://" in token or "@" in token:
+            raise ValueError("URL/userinfo token cannot enter the projection")
+        if token == "--":
+            raise ValueError("end-of-options sentinel is not admitted")
+        if index > 0 and token.startswith("-") and "=" in token:
+            raise ValueError("inline option values are not admitted")
+
+    for index, token in enumerate(tokens):
+        reject_token(token, index)
+
+    rest = tokens[1:] if tokens[0] in {exe, "-B", "-s"} or tokens[0].endswith("python3") or tokens[0].endswith("python") else tokens
+    # Grammar 1: recorder launcher
+    #   <python> [-B] [-s] -m recorder_next --config <config> [--host 127.0.0.1] [--port <port>]
+    cursor = 0
+    if tokens[0] == exe:
+        cursor = 1
+    saw_b = saw_s = False
+    while cursor < len(tokens) and tokens[cursor] in {"-B", "-s"}:
+        if tokens[cursor] == "-B":
+            if saw_b:
+                raise ValueError("duplicate launcher flag")
+            saw_b = True
+        else:
+            if saw_s:
+                raise ValueError("duplicate launcher flag")
+            saw_s = True
+        cursor += 1
+    if cursor < len(tokens) and tokens[cursor] == "-m":
+        cursor += 1
+        if cursor >= len(tokens) or tokens[cursor] != "recorder_next":
+            raise ValueError("unknown module for the recorder launcher")
+        cursor += 1
+        if cursor >= len(tokens) or tokens[cursor] != "--config":
+            raise ValueError("recorder launcher requires --config next")
+        cursor += 1
+        if cursor >= len(tokens) or tokens[cursor] != canonical_config:
+            raise ValueError("config path does not match the trusted runtime identity")
+        cursor += 1
+        # Exact canonical order after --config: [--host 127.0.0.1] [--port N].
+        host_seen = port_seen = False
+        reconstructed = [exe]
+        if saw_b:
+            reconstructed.append("-B")
+        if saw_s:
+            reconstructed.append("-s")
+        reconstructed += ["-m", "recorder_next", "--config", canonical_config]
+        while cursor < len(tokens):
+            flag = tokens[cursor]
+            if flag == "--host" and not host_seen and not port_seen:
+                host_seen = True
+                cursor += 1
+                if cursor >= len(tokens) or tokens[cursor] != "127.0.0.1":
+                    raise ValueError("host must be the loopback literal")
+                reconstructed += ["--host", "127.0.0.1"]
+                cursor += 1
+            elif flag == "--port" and not port_seen:
+                port_seen = True
+                cursor += 1
+                if cursor >= len(tokens) or tokens[cursor] != port_token:
+                    raise ValueError("port does not match the trusted runtime identity")
+                reconstructed += ["--port", port_token]
+                cursor += 1
+            else:
+                raise ValueError(f"unknown or reordered recorder flag: {flag!r}")
+        return reconstructed
+
+    # Grammar 2: hermes gateway/run launcher
+    if tokens[0] == _HERMES_LAUNCHER_SCRIPT:
+        if len(tokens) >= 2 and tokens[1] == "gateway" and len(tokens) == 3 and tokens[2] == "run":
+            return [tokens[0], "gateway", "run"]
+        if (len(tokens) == 8 and tokens[1] == "serve"
+                and tokens[2] == "--isolated" and tokens[3] == "--skip-build"
+                and tokens[4] == "--host" and tokens[5] == "127.0.0.1"
+                and tokens[6] == "--port" and tokens[7] == port_token):
+            return [_HERMES_LAUNCHER_SCRIPT, "serve", "--isolated", "--skip-build", "--host", "127.0.0.1", "--port", port_token]
+        raise ValueError("unknown hermes launcher shape")
+    raise ValueError("runtime argv does not match any admitted launcher grammar")
 
 GENERATION = "recorder-next-live-r19-r23p2-provenance-support-producer-closure-candidate"
 PRODUCT = "recorder-next-server-product-items-1-through-8"
@@ -94,8 +237,13 @@ def observed(role, unit, port, config, credentials, *, profile="default"):
     if pid <= 0:
         raise RuntimeError("mandatory active runtime missing")
     argv = runtime._cmdline(pid)
-    if any("token=" in arg.lower() or "key=" in arg.lower() for arg in argv):
-        raise RuntimeError("unsafe runtime argv cannot enter the packet")
+    argv = project_runtime_argv(
+        argv,
+        role=role,
+        executable=Path(os.path.realpath(f"/proc/{pid}/exe")),
+        config=config,
+        port=port,
+    )
     uid, gid = runtime._uid_gid(pid)
     root = Path(os.path.realpath(f"/proc/{pid}/cwd"))
     exe = Path(os.path.realpath(f"/proc/{pid}/exe"))

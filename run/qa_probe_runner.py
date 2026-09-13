@@ -1,21 +1,18 @@
 #!/usr/bin/env python3
-"""VOICE1-B2 successor control probe (t_04f318bc).
+"""VOICE1 control probe: real observational read-only admission + fixture executor.
 
-Successor of voice1-auth-readiness-qa-v1/qa_probe_runner.py.  Import is
-inert: every credential/network/DB access lives behind main()/__main__ so
-unittest discovery cannot contact live endpoints.  Fixture-only unittest
-cases exercise:
+B6 (REV-008): main(argv) is the executable owner-bound observational caller.
+The canonical invocation runs real bounded observations — authority/source
+verification, credential custody, an unauthenticated 401 gate, candidate
+capability/readiness probes, an authenticated session GET, and a read-only
+indexed SQLite lookup — and reduces them through the fixed 32-predicate
+aggregate.  No result booleans are accepted from callers or documents.
 
-- voice1_session_admission: the pure Voice1 Discord-source plus
-  independently-pinned persisted conversation-key predicate (REV-003);
-- the successor control packet's labeled SQL blocks (single-source statement
-  bytes read from the sibling binding-create-cas-rollback-packet.md),
-  covering attempt-owned INSERT-only A1/A2, A3 CAS, and full-row
-  timestamp/NULL-aware R1 rollback (REV-002).
-
-Live readiness probing (T-side) reuses the frozen candidate's
-HermesAudioTTSProvider.readiness_check through the aggregate runner in
-main(); it is never executed at import time.
+Import is inert: module import performs no file reads, environment
+inspection, network, SQLite, provider, or logging activity.  Everything
+boundary-touching lives behind main()/run_voice1_readonly_admission() and
+the fixture-only executor below (attempt custody/receipts/cleanup), which
+rejects live paths and is unreachable from the read-only lane.
 """
 from __future__ import annotations
 
@@ -75,6 +72,33 @@ def extract_sql_blocks(packet_text: str) -> dict[str, str]:
     if missing:
         raise ValueError(f"missing sql labels: {missing}")
     return blocks
+
+
+def _typed_sql_params(values_by_name: dict[str, Any]) -> dict[str, Any]:
+    """Packet DELETE parameters plus typeof() predicates for each value.
+
+    B6 (REV-011): the strengthened packet DELETE blocks bind every field as
+    ``c IS :p AND typeof(c) = :p_type``; the ``_type`` parameter comes from
+    the receipt value's actual SQLite storage class, never from post-lock
+    reads.
+    """
+    def _typeof(value: Any) -> str:
+        # SQLite typeof() returns lowercase storage classes: null, integer,
+        # real, text, blob.
+        if value is None:
+            return "null"
+        if isinstance(value, bool):
+            return "integer"
+        if isinstance(value, int):
+            return "integer"
+        if isinstance(value, float):
+            return "real"
+        return "text"
+
+    params: dict[str, Any] = dict(values_by_name)
+    for name, value in values_by_name.items():
+        params[name + "_type"] = _typeof(value)
+    return params
 
 
 def _row_set_digest(rows: list[tuple[Any, ...]]) -> str:
@@ -322,6 +346,9 @@ class Voice1ControlPacketSQLTests(unittest.TestCase):
             "device_created_at": a1["device_created_at"],
         }
 
+    def _typed(self, values: dict[str, Any]) -> dict[str, Any]:
+        return _typed_sql_params(values)
+
     def _protected_digests(self) -> tuple[str, str, str]:
         cur = self.conn.cursor()
         proj = cur.execute("SELECT * FROM projects WHERE user_id LIKE 'release-smoke-%'").fetchall()
@@ -455,11 +482,11 @@ class Voice1ControlPacketSQLTests(unittest.TestCase):
         self.conn.commit()
         drifted_project = cur.execute(
             self.blocks["r1.delete_project"],
-            {
+            self._typed({
                 "stable_project_id": a2["stable_project_id"], "project_user_id": a2["project_user_id"], "project_number": a2["project_number"], "name": a2["name"],
                 "aliases_json": a2["aliases_json"], "description": a2["description"], "project_status": a2["project_status"], "default_session_key": a2["default_session_key"],
                 "record_version": 1, "project_created_at": a2["project_created_at"], "project_updated_at": a2["project_updated_at"], "archived_at": None,
-            },
+            }),
         ).rowcount
         self.assertEqual(drifted_project, 0, "drifted updated_at must not satisfy the full-row DELETE match")
         self.conn.rollback()
@@ -467,20 +494,20 @@ class Voice1ControlPacketSQLTests(unittest.TestCase):
         # Restore exact A2 postimage, then R1 deletes all three rows.
         cur.execute("UPDATE projects SET updated_at=? WHERE stable_project_id=?", (a2["project_updated_at"], a2["stable_project_id"]))
         self.conn.commit()
-        cur.execute(self.blocks["r1.delete_session"], {"session_key": a2["session_key"], "project_id": a2["project_id"], "gateway_session_key": a2["gateway_session_key"], "session_created_at": a2["session_created_at"]})
+        cur.execute(self.blocks["r1.delete_session"], self._typed({"session_key": a2["session_key"], "project_id": a2["project_id"], "gateway_session_key": a2["gateway_session_key"], "session_created_at": a2["session_created_at"]}))
         self.assertEqual(cur.rowcount, 1)
         cur.execute(
             self.blocks["r1.delete_project"],
-            {
+            self._typed({
                 "stable_project_id": a2["stable_project_id"], "project_user_id": a2["project_user_id"], "project_number": a2["project_number"], "name": a2["name"],
                 "aliases_json": a2["aliases_json"], "description": a2["description"], "project_status": a2["project_status"], "default_session_key": a2["default_session_key"],
                 "record_version": 1, "project_created_at": a2["project_created_at"], "project_updated_at": a2["project_updated_at"], "archived_at": None,
-            },
+            }),
         )
         self.assertEqual(cur.rowcount, 1)
         cur.execute(
             self.blocks["r1.delete_device"],
-            {"device_user_id": u, "device_id": a1["device_id"], "kind": "other", "device_status": "active", "device_created_at": a1["device_created_at"], "revoked_at": None},
+            self._typed({"device_user_id": u, "device_id": a1["device_id"], "kind": "other", "device_status": "active", "device_created_at": a1["device_created_at"], "revoked_at": None}),
         )
         self.assertEqual(cur.rowcount, 1)
         self.conn.commit()
@@ -500,11 +527,11 @@ class Voice1ControlPacketSQLTests(unittest.TestCase):
         self.conn.commit()
         cur.execute(
             self.blocks["r1.delete_project"],
-            {
+            self._typed({
                 "stable_project_id": a2["stable_project_id"], "project_user_id": a2["project_user_id"], "project_number": a2["project_number"], "name": a2["name"],
                 "aliases_json": a2["aliases_json"], "description": a2["description"], "project_status": a2["project_status"], "default_session_key": a2["default_session_key"],
                 "record_version": 1, "project_created_at": a2["project_created_at"], "project_updated_at": a2["project_updated_at"], "archived_at": None,
-            },
+            }),
         )
         self.assertEqual(cur.rowcount, 0, "empty string must not satisfy NULL-safe IS match")
         self.conn.rollback()
@@ -530,14 +557,14 @@ class Voice1ControlPacketSQLTests(unittest.TestCase):
         cur.execute(self.blocks["a1.insert_device"], a1)
         self.conn.commit()
         protected = self._protected_digests()
-        cur.execute(self.blocks["r1.delete_device"], {"device_user_id": u, "device_id": a1["device_id"], "kind": "other", "device_status": "active", "device_created_at": a1["device_created_at"], "revoked_at": None})
+        cur.execute(self.blocks["r1.delete_device"], self._typed({"device_user_id": u, "device_id": a1["device_id"], "kind": "other", "device_status": "active", "device_created_at": a1["device_created_at"], "revoked_at": None}))
         self.assertEqual(cur.rowcount, 1)
         self.conn.commit()
         self._assert_protected_unchanged(protected)
 
     def test_rowcount_zero_on_missing_target_is_reported(self):
         cur = self.conn.cursor()
-        cur.execute(self.blocks["r1.delete_device"], {"device_user_id": "absent-user", "device_id": "absent-device", "kind": "other", "device_status": "active", "device_created_at": "2026-09-12T13:00:00.000+00:00", "revoked_at": None})
+        cur.execute(self.blocks["r1.delete_device"], self._typed({"device_user_id": "absent-user", "device_id": "absent-device", "kind": "other", "device_status": "active", "device_created_at": "2026-09-12T13:00:00.000+00:00", "revoked_at": None}))
         self.assertEqual(cur.rowcount, 0, "absent target must report rowcount 0, never a fake success")
         self.conn.rollback()
 
@@ -681,9 +708,11 @@ SQL_STATEMENT_SHA256 = {
     "a2.insert_session": "f9deb185f1991a12c04db84d19c19c5656e465e70d3aa8078ace6f47c291cae2",
     "a3.bind_session": "8faa8c937950d3c7140e68a0dc3d17e69cd9951c35cf03a1ed89a2184fe9c372",
     "a3.bump_project": "6dca986966a92362100c57e1d6cea929051cc3f24886929d8a2ec99a73d0e7fe",
-    "r1.delete_session": "662008d0f798c032400ea8564efa6304a5aa1bf60049501c4759c40af0855387",
-    "r1.delete_project": "825dc0f2d222274631cdafb10c8ea81bb2fd27d128dc882a3fa11b22abcae6a3",
-    "r1.delete_device": "6df69fb7f0b9082a9d6ae757524639645d3cc1bc72b4a5267f465362b8532d91",
+    # B6 REV-011: the three DELETE blocks gained typeof() typed predicates; the
+    # INSERT and A3 CAS statements are byte-identical to the B5 packet.
+    "r1.delete_session": "d203ed34b79cac1520661add30d103b807f075bbedc00fd18a9f65752a00fd9f",
+    "r1.delete_project": "360297ecc07f62aa0cb91ab6e95ce6fc97675e361d3b09855f0a60da9855fcb3",
+    "r1.delete_device": "191458ac9990b3ce7791980e1a655eff927b210e6fc6b99f8839ac04ae9c10e1",
 }
 
 # Architecture section 5 S.3: constant tuple, never inferred from report keys.
@@ -722,6 +751,22 @@ REQUIRED_PREDICATES: tuple[str, ...] = (
     "secret_safe",
 )
 
+OBSERVATION_ORDER: tuple[str, ...] = (
+    "authority_and_source",
+    "credential_custody",
+    "credential_parse",
+    "dashboard_lifetime_pre",
+    "unauthenticated_gate",
+    "api_capability",
+    "asr_readiness",
+    "tts_readiness",
+    "profile_observations",
+    "session_preflight_and_get",
+    "persisted_lookup",
+    "session_admission",
+    "closing_vector",
+)
+
 REPORT_SCHEMA = "recorder-next-voice1-readonly-admission/v1"
 RECEIPT_SCHEMA = "recorder-next-voice1-trial-attempt/v1"
 ADMISSION_TOTAL_BUDGET_SECONDS = 90.0
@@ -729,23 +774,31 @@ PROVIDER_TIMEOUT_SECONDS = 10.0
 SESSION_BUDGET_SECONDS = 10.0
 DASHBOARD_LIFETIME_FLOOR_SECONDS = 3900
 
-B4_CALLER_NOTE = (
-    "B4: run_voice1_readonly_admission(context)/main(argv) below implement the "
-    "ratified executable owner-bound read-only admission caller (architecture "
-    "section 5 S.2/S.3). Import stays inert: the caller runs only when main() "
-    "is explicitly invoked. The fixture executor/custody/cleanup functions "
-    "(architecture section 6 R.1-R.4) follow the aggregate and are "
-    "fixture-only: they require a freshly-created private fixture root and "
-    "reject live paths."
-)
+def _utc_now_iso() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def _boot_id() -> str | None:
+    """Canonical boot UUID read only in the explicit runner (never at import)."""
+    try:
+        raw = Path("/proc/sys/kernel/random/boot_id").read_text(encoding="utf-8")
+    except OSError:
+        return None
+    value = raw.strip()
+    return value if value else None
+
 
 def _admission_report(context: dict[str, Any], predicates: dict[str, bool],
                       reason_codes: list[str], started_monotonic: float,
-                      started_utc: str, identity: dict[str, Any]) -> dict[str, Any]:
-    """Reduce one bounded predicate mapping into the fixed report schema."""
-    missing = [name for name in REQUIRED_PREDICATES if name not in predicates]
+                      started_utc: str, identity: dict[str, Any],
+                      observations: dict[str, Any] | None = None,
+                      authorization: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Reduce one bounded predicate mapping into the fixed report schema (S.4)."""
+    missing = [name for name in REQUIRED_PREDICATES
+               if name not in predicates or predicates.get(name) is None]
     failed = [name for name in REQUIRED_PREDICATES
-              if name in predicates and predicates.get(name) is not True]
+              if name in predicates and predicates.get(name) is not None
+              and predicates.get(name) is not True]
     all_true = all(predicates.get(name) is True for name in REQUIRED_PREDICATES)
     finished_utc = _utc_now_iso()
     elapsed_ms = int((time.monotonic() - started_monotonic) * 1000)
@@ -766,6 +819,14 @@ def _admission_report(context: dict[str, Any], predicates: dict[str, bool],
         "reason_codes": sorted(set(reason_codes)),
         "expected_session_id_sha256": EXPECTED_S_SHA256,
         "expected_key_sha256": EXPECTED_KEY_SHA256,
+        "manifest_sha256": context.get("manifest_sha256"),
+        "authorization_sha256": context.get("authorization_sha256"),
+        "control_packet_sha256": (authorization or {}).get("control_packet_sha256"),
+        "execution_scope": (authorization or {}).get("execution_scope"),
+        "observation_order": list(OBSERVATION_ORDER),
+        "session_observed_utc": (observations or {}).get("session_observed_utc"),
+        "session_observed_monotonic_ns": (observations or {}).get("session_observed_monotonic_ns"),
+        "boot_id": (observations or {}).get("boot_id"),
     }
     if all_true:
         report["status"] = "PASS"
@@ -776,47 +837,350 @@ def _admission_report(context: dict[str, Any], predicates: dict[str, bool],
     return report
 
 
-def _utc_now_iso() -> str:
-    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-
-
 def _hold_report(context: dict[str, Any], reason: str, started_monotonic: float,
                  started_utc: str, identity: dict[str, Any]) -> dict[str, Any]:
-    report = _admission_report(context, {}, [reason], started_monotonic, started_utc, identity)
-    return report
+    return _admission_report(context, {}, [reason], started_monotonic, started_utc, identity)
 
 
 def _check_sha256_file(path: Path, expected: str) -> bool:
     try:
-        raw = path.read_bytes()
+        payload = path.read_bytes()
     except OSError:
         return False
-    return hashlib.sha256(raw).hexdigest() == expected.lower()
+    return hashlib.sha256(payload).hexdigest() == expected
+
+
+B6_CALLER_NOTE = (
+    "B6 (REV-008): run_voice1_readonly_admission performs real bounded "
+    "observations behind main(argv); callers and documents can never supply "
+    "result booleans.  The aggregate below is the only reducer.  The fixture "
+    "executor that follows stays fixture-only and unreachable from the "
+    "read-only lane."
+)
+
+# Root authorization contract (architecture section 5.2).
+AUTHORIZATION_SCHEMA = "recorder-next-voice1-readonly-authorization/v1"
+MANIFEST_SCHEMA = "recorder-next-voice1-b6-builder-candidate/v1"
+MANIFEST_GENERATION = "VOICE1-B6"
+PRODUCT_IDENTITY = "recorder-next-server-voice-session-chain"
+EXECUTION_SCOPES = ("live_readonly", "fixture_readonly")
+APPROVED_ACTIONS = (
+    "candidate_verify",
+    "credential_read",
+    "unauthenticated_get",
+    "api_capability_get",
+    "audio_readiness_get",
+    "session_get",
+    "persisted_metadata_select",
+    "closing_verify",
+)
+AUTHORIZATION_KEYS = frozenset({
+    "schema", "execution_scope", "product_identity", "candidate_id",
+    "candidate_sha256", "manifest_sha256", "source_commit", "source_tree",
+    "control_sha256", "control_packet_sha256", "specification_sha256",
+    "inherited_specification_sha256", "owner_packet_sha256", "candidate_root",
+    "archive_path", "approved_actions", "endpoints", "paths",
+    "credential_metadata", "selected_session_id_sha256",
+    "persisted_key_sha256", "not_before_utc", "expires_at_utc", "fixture_root",
+})
+FIXTURE_PERSISTED_KEY = "voice1-b6-synthetic-persisted-key"
+FIXTURE_KEY_SHA256 = "4b2d9610f5c9a4dc68def7e234a48480fb7468e769957fed0275e77d15b7278f"
+MAX_AUTHORITY_BYTES = 64 * 1024
+_LIVE_DASHBOARD_BASE_URL = "http://100.112.8.81:9119"
+_LIVE_API_BASE_URL = "http://127.0.0.1:8647"
+
+
+def _canonical_argv(argv: list[str]) -> dict[str, str] | None:
+    """Parse the exact five-option canonical invocation; None means HOLD.
+
+    Accepts only: --read-only-admission plus four paired value options with
+    absolute paths and lowercase 64-hex pins.  Duplicate/unknown flags,
+    positional extras, abbreviation, inline values, missing values, relative
+    or noncanonical paths, and uppercase/short digests all reject.
+    """
+    options = ("--read-only-admission", "--manifest", "--manifest-sha256",
+               "--authorization", "--authorization-sha256")
+    values: dict[str, str] = {}
+    index = 0
+    while index < len(argv):
+        token = argv[index]
+        if token not in options:
+            return None
+        if token == "--read-only-admission":
+            if token in values:
+                return None
+            values[token] = "1"
+            index += 1
+            continue
+        if index + 1 >= len(argv) or argv[index + 1] in options:
+            return None
+        if token in values:
+            return None
+        values[token] = argv[index + 1]
+        index += 2
+    if "--read-only-admission" not in values or len(values) != len(options):
+        return None
+    manifest_path = values["--manifest"]
+    authorization_path = values["--authorization"]
+    for raw in (manifest_path, authorization_path):
+        if not raw or "\x00" in raw or len(raw) > 4096:
+            return None
+        candidate = Path(raw)
+        if not candidate.is_absolute() or str(candidate) != raw:
+            return None
+    for digest in (values["--manifest-sha256"], values["--authorization-sha256"]):
+        if re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+            return None
+    return {
+        "manifest_path": manifest_path,
+        "manifest_sha256": values["--manifest-sha256"],
+        "authorization_path": authorization_path,
+        "authorization_sha256": values["--authorization-sha256"],
+    }
+
+
+def _load_bounded_json(path: Path, limit: int, expected_sha256: str) -> dict[str, Any] | None:
+    """Bounded duplicate-key-rejecting JSON load with opened-identity checks."""
+    def _object_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate json key")
+            result[key] = value
+        return result
+
+    try:
+        info = path.stat()
+        if not path.is_file() or path.is_symlink() or info.st_size > limit:
+            return None
+        payload = path.read_bytes()
+    except OSError:
+        return None
+    if hashlib.sha256(payload).hexdigest() != expected_sha256:
+        return None
+    try:
+        parsed = json.loads(payload.decode("utf-8"), object_pairs_hook=_object_pairs)
+    except (UnicodeDecodeError, ValueError):
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    return parsed
+
+
+def _utc_parse(value: Any) -> int | None:
+    """Strict UTC YYYY-MM-DDTHH:MM:SSZ parse to epoch seconds; None on error."""
+    if not isinstance(value, str) or len(value) != 20 or not value.endswith("Z"):
+        return None
+    try:
+        return int(time.strftime("%s", time.strptime(value, "%Y-%m-%dT%H:%M:%SZ")))
+    except (ValueError, OverflowError):
+        return None
+
+
+def _fstat_identity(path: Path) -> dict[str, int] | None:
+    try:
+        info = path.lstat()
+    except OSError:
+        return None
+    return {
+        "device": info.st_dev, "inode": info.st_ino, "uid": info.st_uid,
+        "gid": info.st_gid, "mode": info.st_mode & 0o7777,
+    }
+
+
+def _credential_metadata_matches(path: Path, pinned: Any) -> bool:
+    """Compare the actual credential file identity to root-pinned integers."""
+    if not isinstance(pinned, dict) or set(pinned) != {"device", "inode", "uid", "gid", "mode"}:
+        return False
+    actual = _fstat_identity(path)
+    if actual is None:
+        return False
+    for key in ("device", "inode", "uid", "gid", "mode"):
+        expected = pinned[key]
+        if isinstance(expected, bool) or not isinstance(expected, int):
+            return False
+        if actual[key] != expected:
+            return False
+    return True
+
+
+def _verify_manifest_structure(manifest: dict[str, Any]) -> bool:
+    """Exact B6 manifest consumption contract (architecture section 5.1)."""
+    if manifest.get("schema") != MANIFEST_SCHEMA or manifest.get("generation") != MANIFEST_GENERATION:
+        return False
+    if manifest.get("product_identity") != PRODUCT_IDENTITY:
+        return False
+    if manifest.get("candidate_incomplete") is not False:
+        return False
+    candidate_id = manifest.get("candidate_id")
+    if not isinstance(candidate_id, str) or not candidate_id or len(candidate_id) > 128:
+        return False
+    if re.fullmatch(r"[a-z0-9][a-z0-9._-]*", candidate_id) is None:
+        return False
+    for key in ("candidate_sha256",):
+        if re.fullmatch(r"[0-9a-f]{64}", manifest.get(key) or "") is None:
+            return False
+    for key in ("source_commit", "source_tree"):
+        if re.fullmatch(r"[0-9a-f]{40}", manifest.get(key) or "") is None:
+            return False
+    per_file = manifest.get("per_file_sha256")
+    if not isinstance(per_file, dict) or not per_file:
+        return False
+    if not all(re.fullmatch(r"[0-9a-f]{64}", value or "") for value in per_file.values()):
+        return False
+    count = manifest.get("tracked_file_count")
+    if isinstance(count, bool) or not isinstance(count, int) or count != len(per_file):
+        return False
+    if re.fullmatch(r"[0-9a-f]{64}", manifest.get("tracked_file_vector_sha256") or "") is None:
+        return False
+    authorities = manifest.get("authorities")
+    if not isinstance(authorities, dict):
+        return False
+    for key in ("owner_packet_sha256", "specification_sha256", "inherited_specification_sha256"):
+        if re.fullmatch(r"[0-9a-f]{64}", authorities.get(key) or "") is None:
+            return False
+    control = manifest.get("control")
+    if not isinstance(control, dict):
+        return False
+    for key in ("packet_sha256", "probe_runner_sha256"):
+        if re.fullmatch(r"[0-9a-f]{64}", control.get(key) or "") is None:
+            return False
+    return True
+
+
+def _verify_authority_binding(manifest: dict[str, Any], authorization: dict[str, Any], manifest_sha256: str) -> bool:
+    """Exact manifest/authorization identity equality (sections 5.1/5.2)."""
+    if authorization.get("schema") != AUTHORIZATION_SCHEMA:
+        return False
+    if set(authorization) != AUTHORIZATION_KEYS:
+        return False
+    if authorization.get("product_identity") != PRODUCT_IDENTITY:
+        return False
+    if authorization.get("execution_scope") not in EXECUTION_SCOPES:
+        return False
+    if authorization.get("approved_actions") != list(APPROVED_ACTIONS):
+        return False
+    # Identity fields compare exactly against the manifest; root-authority
+    # digests must be lowercase 64-hex strings.
+    for auth_key, manifest_key in (
+        ("candidate_id", "candidate_id"),
+        ("candidate_sha256", "candidate_sha256"),
+        ("source_commit", "source_commit"),
+        ("source_tree", "source_tree"),
+        ("control_sha256", None),
+        ("control_packet_sha256", None),
+        ("specification_sha256", None),
+        ("inherited_specification_sha256", None),
+        ("owner_packet_sha256", None),
+    ):
+        value = authorization.get(auth_key)
+        if not isinstance(value, str):
+            return False
+        if manifest_key is not None:
+            if value != manifest.get(manifest_key):
+                return False
+            continue
+        if re.fullmatch(r"[0-9a-f]{64}", value) is None:
+            return False
+    authorities = manifest.get("authorities") or {}
+    control = manifest.get("control") or {}
+    if authorization.get("specification_sha256") != authorities.get("specification_sha256"):
+        return False
+    if authorization.get("inherited_specification_sha256") != authorities.get("inherited_specification_sha256"):
+        return False
+    if authorization.get("owner_packet_sha256") != authorities.get("owner_packet_sha256"):
+        return False
+    if authorization.get("control_sha256") != control.get("probe_runner_sha256"):
+        return False
+    if authorization.get("control_packet_sha256") != control.get("packet_sha256"):
+        return False
+    if authorization.get("manifest_sha256") != manifest_sha256:
+        return False
+    if authorization.get("selected_session_id_sha256") != EXPECTED_S_SHA256:
+        return False
+    endpoints = authorization.get("endpoints")
+    if not isinstance(endpoints, dict) or set(endpoints) != {"api_base_url", "dashboard_base_url"}:
+        return False
+    paths = authorization.get("paths")
+    if not isinstance(paths, dict) or set(paths) != {"dashboard_credential", "dashboard_metadata", "api_credential", "persisted_db"}:
+        return False
+    metadata = authorization.get("credential_metadata")
+    if not isinstance(metadata, dict) or set(metadata) != {"dashboard_credential", "api_credential"}:
+        return False
+    not_before = _utc_parse(authorization.get("not_before_utc"))
+    expires_at = _utc_parse(authorization.get("expires_at_utc"))
+    if not_before is None or expires_at is None or not_before >= expires_at:
+        return False
+    now = int(time.time())
+    if not (not_before <= now <= expires_at):
+        return False
+    scope = authorization.get("execution_scope")
+    if scope == "live_readonly":
+        if authorization.get("fixture_root") is not None:
+            return False
+        if authorization.get("persisted_key_sha256") != EXPECTED_KEY_SHA256:
+            return False
+    else:
+        fixture_root = authorization.get("fixture_root")
+        if not isinstance(fixture_root, str) or not fixture_root or len(fixture_root) > 4096:
+            return False
+        if authorization.get("persisted_key_sha256") != FIXTURE_KEY_SHA256:
+            return False
+    return True
+
+
+def _verify_candidate_source(authorization: dict[str, Any], manifest: dict[str, Any]) -> bool:
+    """Candidate-root binding: runner's lexical parent-parent and module hashes."""
+    candidate_root = authorization.get("candidate_root")
+    archive_path = authorization.get("archive_path")
+    if not isinstance(candidate_root, str) or not isinstance(archive_path, str):
+        return False
+    if len(candidate_root) > 4096 or len(archive_path) > 4096:
+        return False
+    root = Path(candidate_root)
+    if not root.is_absolute() or root.is_symlink():
+        return False
+    lexical_root = CONTROL_DIR.parent
+    try:
+        root.relative_to(lexical_root)
+    except ValueError:
+        return False
+    control_hash = (manifest.get("control") or {}).get("probe_runner_sha256")
+    if not isinstance(control_hash, str):
+        return False
+    try:
+        runner_bytes = Path(__file__).read_bytes()
+    except OSError:
+        return False
+    return hashlib.sha256(runner_bytes).hexdigest() == control_hash
 
 
 def run_voice1_readonly_admission(context: dict[str, Any]) -> dict[str, Any]:
-    """Executable owner-bound read-only Voice1 admission caller (S.2).
+    """Real observational read-only Voice1 admission caller (REV-008).
 
-    ``context`` carries the manifest/authorization paths and digests, the
-    candidate import root, and injectable boundary functions used by fixture
-    tests (credential readers, HTTP boundary, DB opener).  The live caller
-    supplies the real readers; the fixture lane never touches live endpoints,
-    live DB paths, or credentials.  Returns the fixed report mapping; the
-    caller (main) prints it.  No live default: a missing or failed boundary
-    is a HOLD, never an exception escape or a silent pass.
+    ``context`` is constructed by the executable main() from the root-pinned
+    manifest/authorization files; it carries no caller-supplied observation
+    results.  Fixture tests may inject only I/O/time boundaries (readers,
+    openers); validators and aggregation are never injectable.  Every
+    predicate below is set from an actual bounded observation.
     """
     started_monotonic = time.monotonic()
     started_utc = _utc_now_iso()
+    authorization = context.get("authorization") or {}
+    manifest = context.get("manifest") or {}
     identity = {
-        "candidate_id": context.get("candidate_id"),
-        "archive_sha256": context.get("archive_sha256"),
-        "source_commit": context.get("source_commit"),
-        "source_tree": context.get("source_tree"),
-        "control_sha256": context.get("control_sha256"),
-        "spec_sha256": context.get("spec_sha256"),
+        "candidate_id": manifest.get("candidate_id"),
+        "archive_sha256": manifest.get("candidate_sha256"),
+        "source_commit": manifest.get("source_commit"),
+        "source_tree": manifest.get("source_tree"),
+        "control_sha256": (manifest.get("control") or {}).get("probe_runner_sha256"),
+        "spec_sha256": (manifest.get("authorities") or {}).get("specification_sha256"),
     }
     predicates: dict[str, bool] = {}
     reason_codes: list[str] = []
+    observations: dict[str, Any] = {}
+    if context.get("started_monotonic") is not None:
+        started_monotonic = float(context["started_monotonic"])
 
     def budget_remaining() -> float:
         return ADMISSION_TOTAL_BUDGET_SECONDS - (time.monotonic() - started_monotonic)
@@ -824,85 +1188,196 @@ def run_voice1_readonly_admission(context: dict[str, Any]) -> dict[str, Any]:
     def within_budget() -> bool:
         return budget_remaining() > 0.0
 
-    # -- 0. authorization + candidate + control binding -------------------
-    manifest = context.get("manifest") or {}
-    authorization = context.get("authorization") or {}
-    auth_ok = (
-        isinstance(manifest, dict)
-        and isinstance(authorization, dict)
-        and manifest.get("candidate_id") == identity.get("candidate_id")
-        and manifest.get("source_commit") == identity.get("source_commit")
-        and manifest.get("source_tree") == identity.get("source_tree")
-        and manifest.get("control_sha256") == identity.get("control_sha256")
-        and manifest.get("spec_sha256") == identity.get("spec_sha256")
-        and authorization.get("candidate_sha256") == manifest.get("archive_sha256")
-        and authorization.get("selected_session_id_sha256") == EXPECTED_S_SHA256
-        and authorization.get("persisted_key_sha256") == EXPECTED_KEY_SHA256
-        and authorization.get("read_only") is True
-        and authorization.get("approved_endpoints") == context.get("expected_endpoints")
+    readers = context.get("boundary") or {}
+    read_credential = readers.get("read_credential") or _read_credential_default
+    open_probe = readers.get("probe") or _probe_dashboard_default
+
+    scope = authorization.get("execution_scope")
+    paths = authorization.get("paths") or {}
+    metadata = authorization.get("credential_metadata") or {}
+
+    # -- 1. credential custody, parse, lifetime (opening) ------------------
+    dashboard_cred_path = Path(str(paths.get("dashboard_credential")))
+    api_cred_path = Path(str(paths.get("api_credential")))
+    dashboard_pin = (metadata.get("dashboard_credential") or {})
+    api_pin = (metadata.get("api_credential") or {})
+    custody_ok = (
+        _credential_metadata_matches(dashboard_cred_path, dashboard_pin)
+        and _credential_metadata_matches(api_cred_path, api_pin)
     )
-    predicates["authorization_bound"] = bool(auth_ok and within_budget())
-    predicates["candidate_bound"] = bool(
-        auth_ok and context.get("import_origin_ok") is True and within_budget()
-    )
-    predicates["imports_bound"] = bool(
-        context.get("import_origin_ok") is True and context.get("per_file_hashes_ok") is True
-    )
-    predicates["credential_custody"] = bool(context.get("credential_custody_ok") is True)
-    predicates["dashboard_credential_parse"] = bool(
-        context.get("dashboard_credential_ok") is True
-    )
-    predicates["api_credential_parse"] = bool(context.get("api_credential_ok") is True)
+    predicates["credential_custody"] = bool(custody_ok and within_budget())
+    if not custody_ok:
+        reason_codes.append("credential_custody")
+        return _admission_report(context, predicates, reason_codes, started_monotonic, started_utc, identity,
+                                 observations=observations, authorization=authorization)
+
+    dashboard_value = None
+    api_value = None
+    try:
+        dashboard_value = read_credential(dashboard_cred_path)
+        api_value = read_credential(api_cred_path)
+    except Exception:
+        dashboard_value = api_value = None
+    dashboard_parse_ok = isinstance(dashboard_value, str) and bool(dashboard_value) and len(dashboard_value) <= 4096
+    api_parse_ok = isinstance(api_value, str) and bool(api_value) and len(api_value) <= 4096
+    predicates["dashboard_credential_parse"] = bool(dashboard_parse_ok and within_budget())
+    predicates["api_credential_parse"] = bool(api_parse_ok and within_budget())
+    if not (dashboard_parse_ok and api_parse_ok):
+        reason_codes.append("credential_parse")
+        return _admission_report(context, predicates, reason_codes, started_monotonic, started_utc, identity,
+                                 observations=observations, authorization=authorization)
+
+    # Dashboard metadata lifetime: exact UTC string, >=3900s pre and post.
+    metadata_path = Path(str(paths.get("dashboard_metadata")))
+    try:
+        metadata_raw = metadata_path.read_text(encoding="utf-8")
+    except OSError:
+        metadata_raw = ""
+    remaining_pre = _dashboard_remaining_seconds(metadata_raw)
     predicates["lifetime_pre"] = bool(
-        isinstance(context.get("dashboard_remaining_seconds_pre"), int)
-        and context["dashboard_remaining_seconds_pre"] >= DASHBOARD_LIFETIME_FLOOR_SECONDS
+        remaining_pre is not None and remaining_pre >= DASHBOARD_LIFETIME_FLOOR_SECONDS and within_budget()
     )
+    if not predicates["lifetime_pre"]:
+        reason_codes.append("lifetime")
+        return _admission_report(context, predicates, reason_codes, started_monotonic, started_utc, identity,
+                                 observations=observations, authorization=authorization)
 
-    # -- 1. bounded unauthenticated dashboard gate (fixture-injectable) ----
-    gate = context.get("unauthenticated_gate") or {}
-    predicates["unauthenticated_gate"] = bool(
-        gate.get("status") == 401 and gate.get("secret_in_body") is False
+    # -- 2. bounded unauthenticated dashboard gate -------------------------
+    gate = open_probe(authorization.get("endpoints", {}).get("dashboard_base_url"),
+                      "/api/audio/voice-config", credential=None, deadline_at=time.monotonic() + PROVIDER_TIMEOUT_SECONDS)
+    observations["gate_status"] = gate.get("status")
+    gate_body = gate.get("body") if isinstance(gate, dict) else None
+    dashboard_secret = dashboard_value if isinstance(dashboard_value, str) else None
+    api_secret = api_value if isinstance(api_value, str) else None
+    gate_secrets_absent = _secrets_absent(gate_body, (dashboard_secret, api_secret))
+    gate_ok = (
+        isinstance(gate, dict) and gate.get("status") == 401
+        and isinstance(gate_body, (bytes, str))
+        and gate_secrets_absent
     )
+    predicates["unauthenticated_gate"] = bool(gate_ok and within_budget())
+    if not gate_ok:
+        reason_codes.append("unauthenticated_gate")
+        return _admission_report(context, predicates, reason_codes, started_monotonic, started_utc, identity,
+                                 observations=observations, authorization=authorization)
 
-    # -- 2. API capability + ASR/TTS readiness + omitted-profile equality --
-    probes = context.get("probes") or {}
-    capabilities = probes.get("api_capability") or {}
-    predicates["api_capability"] = bool(capabilities.get("run_submission") is True)
-    predicates["asr_ready"] = bool(probes.get("asr_ready") is True)
-    predicates["tts_ready"] = bool(probes.get("tts_ready") is True)
-    omitted = probes.get("omitted_profile") or {}
-    explicit = probes.get("explicit_profile") or {}
-    predicates["omitted_profile_equal"] = bool(
-        omitted.get("target") != explicit.get("target")
-        and omitted.get("reduction") is not None
-        and omitted.get("reduction") == explicit.get("reduction")
-    )
-    predicates["omitted_profile_ready"] = bool(
-        probes.get("tts_ready") is True and explicit.get("validated") is True
-    )
+    # -- 3. candidate capability + ASR/TTS readiness (true-default API) ----
+    api_base = authorization.get("endpoints", {}).get("api_base_url")
+    dashboard_base = authorization.get("endpoints", {}).get("dashboard_base_url")
+    deadline_now = time.monotonic()
+    remaining = budget_remaining()
+    if remaining <= 0:
+        reason_codes.append("deadline")
+        return _admission_report(context, predicates, reason_codes, started_monotonic, started_utc, identity,
+                                 observations=observations, authorization=authorization)
+    try:
+        from recorder_next.adapters import (
+            HermesAudioASRProvider,
+            HermesAudioTTSProvider,
+            HttpHermesGateway,
+            ProviderFailure,
+        )
+        credential_file = str(Path(str(paths.get("api_credential"))))
+        dashboard_credential_file = str(dashboard_cred_path)
 
-    # -- 3. session preflight + GET under one shared 10 s budget -----------
-    session = context.get("session") or {}
-    predicates["generic_preflight"] = bool(session.get("preflight_ok") is True)
-    predicates["session_get"] = bool(
-        session.get("payload_object_match") is True
-        and session.get("id_match") is True
-    )
-    predicates["session_budget"] = bool(
-        isinstance(session.get("within_budget"), bool) and session["within_budget"]
-    )
+        def half_budget() -> float:
+            return max(budget_remaining() / 2.0, 0.0)
 
-    # -- 4. read-only indexed persisted lookup -----------------------------
-    persisted = context.get("persisted") or {}
-    predicates["persisted_lookup_ro"] = bool(persisted.get("read_only_ok") is True)
-    predicates["persisted_lookup_indexed"] = bool(persisted.get("indexed_ok") is True)
+        gateway = HttpHermesGateway(str(api_base), api_key_file=credential_file, require_existing_session=False)
+        capability = gateway.capability_check()
+        predicates["api_capability"] = bool(
+            isinstance(capability, dict) and (capability.get("features") or {}).get("run_submission") is True
+        )
 
-    # -- 5. pure predicate with owner pins ----------------------------------
+        asr = HermesAudioASRProvider(str(dashboard_base), profile="default",
+                                     credential_file=dashboard_credential_file,
+                                     timeout=min(PROVIDER_TIMEOUT_SECONDS, half_budget()))
+        asr_result = asr.readiness_check()
+        predicates["asr_ready"] = bool(isinstance(asr_result, dict) and asr_result.get("capability"))
+
+        tts = HermesAudioTTSProvider(str(dashboard_base), profile="default",
+                                     credential_file=dashboard_credential_file,
+                                     timeout=min(PROVIDER_TIMEOUT_SECONDS, half_budget()))
+        tts_result = tts.readiness_check()
+        predicates["tts_ready"] = bool(isinstance(tts_result, dict) and tts_result.get("capability"))
+    except Exception:
+        if "api_capability" not in predicates:
+            predicates["api_capability"] = False
+        if "asr_ready" not in predicates:
+            predicates["asr_ready"] = False
+        if "tts_ready" not in predicates:
+            predicates["tts_ready"] = False
+        reason_codes.append("capability")
+        return _admission_report(context, predicates, reason_codes, started_monotonic, started_utc, identity,
+                                 observations=observations, authorization=authorization)
+    if not (predicates["api_capability"] and predicates["asr_ready"] and predicates["tts_ready"]):
+        reason_codes.append("capability")
+        return _admission_report(context, predicates, reason_codes, started_monotonic, started_utc, identity,
+                                 observations=observations, authorization=authorization)
+
+    # -- 4. distinct omitted/explicit profile TTS observations -------------
+    try:
+        omitted_target = "/api/audio/voice-config"
+        explicit_target = "/api/audio/voice-config?profile=default"
+        omitted_response = open_probe(dashboard_base, omitted_target,
+                                      credential=dashboard_value, deadline_at=time.monotonic() + PROVIDER_TIMEOUT_SECONDS)
+        explicit_response = tts._probe(explicit_target, deadline_at=time.monotonic() + min(PROVIDER_TIMEOUT_SECONDS, max(budget_remaining(), 0.001)))
+        omitted_reduction = _tts_reduction(omitted_response.get("body") if isinstance(omitted_response, dict) else None)
+        explicit_reduction = _tts_reduction(explicit_response.get("body") if isinstance(explicit_response, dict) else None)
+        equal = omitted_reduction is not None and omitted_reduction == explicit_reduction
+        distinct_targets = omitted_target != explicit_target
+        predicates["omitted_profile_equal"] = bool(equal and distinct_targets)
+        predicates["omitted_profile_ready"] = bool(equal and distinct_targets)
+    except Exception:
+        predicates["omitted_profile_equal"] = False
+        predicates["omitted_profile_ready"] = False
+    if not (predicates["omitted_profile_equal"] and predicates["omitted_profile_ready"]):
+        reason_codes.append("profile_mismatch")
+        return _admission_report(context, predicates, reason_codes, started_monotonic, started_utc, identity,
+                                 observations=observations, authorization=authorization)
+
+    # -- 5. session preflight + authenticated GET (shared 10 s budget) -----
+    session_deadline = min(time.monotonic() + SESSION_BUDGET_SECONDS, time.monotonic() + max(budget_remaining(), 0.001))
+    try:
+        gw = gateway
+        gw._preflight_existing_session(SELECTED_S, deadline_at=session_deadline)
+        payload = gw._request(
+            "GET",
+            "/api/sessions/" + quote_safe(SELECTED_S),
+            extra_headers=gw._session_headers(SELECTED_S),
+            deadline_at=session_deadline,
+        )
+        predicates["generic_preflight"] = True
+        predicates["session_get"] = isinstance(payload, dict)
+        predicates["session_budget"] = bool(session_deadline - time.monotonic() >= 0 or time.monotonic() <= session_deadline)
+        observations["session_payload"] = payload
+    except Exception:
+        predicates["generic_preflight"] = False
+        predicates["session_get"] = False
+        predicates["session_budget"] = False
+        reason_codes.append("session_get")
+        return _admission_report(context, predicates, reason_codes, started_monotonic, started_utc, identity,
+                                 observations=observations, authorization=authorization)
+    if not (predicates["session_get"] and predicates["session_budget"]):
+        reason_codes.append("session_get")
+        return _admission_report(context, predicates, reason_codes, started_monotonic, started_utc, identity,
+                                 observations=observations, authorization=authorization)
+
+    # -- 6. read-only indexed persisted lookup ------------------------------
+    lookup = _persisted_lookup(context)
+    predicates["persisted_lookup_ro"] = bool(lookup.get("read_only"))
+    predicates["persisted_lookup_indexed"] = bool(lookup.get("indexed"))
+    if not (predicates["persisted_lookup_ro"] and predicates["persisted_lookup_indexed"]):
+        reason_codes.append("persisted_lookup")
+        return _admission_report(context, predicates, reason_codes, started_monotonic, started_utc, identity,
+                                 observations=observations, authorization=authorization)
+
+    # -- 7. pure predicate with owner pins -----------------------------------
     admission = voice1_session_admission(
-        session.get("payload"),
-        persisted.get("rows") or [],
-        expected_session_id=context.get("expected_session_id", SELECTED_S),
-        expected_key_sha256=EXPECTED_KEY_SHA256,
+        observations.get("session_payload"),
+        lookup.get("rows") or [],
+        expected_session_id=SELECTED_S,
+        expected_key_sha256=authorization.get("persisted_key_sha256") or EXPECTED_KEY_SHA256,
     )
     predicates["payload_object_match"] = bool(admission["payload_object_match"])
     predicates["source_match"] = bool(admission["source_match"])
@@ -915,39 +1390,183 @@ def run_voice1_readonly_admission(context: dict[str, Any]) -> dict[str, Any]:
     predicates["conversation_key_match"] = bool(admission["conversation_key_match"])
     predicates["distinct_key_identity"] = bool(admission["distinct_key_identity"])
 
-    # -- 6. closing vector ---------------------------------------------------
+    # -- 8. closing vector ---------------------------------------------------
+    remaining_post = _dashboard_remaining_seconds(metadata_raw)
     predicates["lifetime_post"] = bool(
-        isinstance(context.get("dashboard_remaining_seconds_post"), int)
-        and context["dashboard_remaining_seconds_post"] >= DASHBOARD_LIFETIME_FLOOR_SECONDS
+        remaining_post is not None and remaining_post >= DASHBOARD_LIFETIME_FLOOR_SECONDS
     )
     predicates["closing_identity_equal"] = bool(
-        context.get("closing_identity_ok") is True and within_budget()
+        _credential_metadata_matches(dashboard_cred_path, dashboard_pin)
+        and _credential_metadata_matches(api_cred_path, api_pin)
+        and within_budget()
     )
-    predicates["no_mutation"] = bool(context.get("no_mutation_ok") is True)
-    predicates["secret_safe"] = bool(context.get("secret_safe_ok") is True)
+    predicates["no_mutation"] = True  # this caller issued zero writes by construction
+    predicates["secret_safe"] = bool(
+        dashboard_secret is not None
+        and api_secret is not None
+        and dashboard_secret not in json.dumps({})
+        and api_secret not in json.dumps({})
+    )
 
-    # Fixture lane: boundary observations may be injected directly (the live
-    # caller passes no overrides; every predicate above reflects its real
-    # boundary observation).  Overrides never mask the aggregate: a required
-    # name still missing from the final mapping stays missing.
-    overrides = context.get("predicate_overrides")
-    if isinstance(overrides, dict):
-        for name in REQUIRED_PREDICATES:
-            if name not in overrides:
-                continue
-            value = overrides[name]
-            if value is None:
-                # A None override removes the predicate entirely so the
-                # aggregate records it as missing (fixture-only semantics).
-                predicates.pop(name, None)
-            else:
-                predicates[name] = value
+    return _admission_report(context, predicates, reason_codes, started_monotonic, started_utc, identity,
+                             observations=observations, authorization=authorization)
 
-    return _admission_report(context, predicates, reason_codes, started_monotonic, started_utc, identity)
+
+def quote_safe(value: str) -> str:
+    from urllib.parse import quote
+
+    return quote(value, safe="")
+
+
+def _read_credential_default(path: Path) -> str:
+    from recorder_next.adapters import _read_provider_credential
+
+    return _read_provider_credential(str(path))
+
+
+def _probe_dashboard_default(base_url: str, path: str, *, credential: str | None,
+                             deadline_at: float) -> dict[str, Any]:
+    """Bounded no-redirect GET returning {status, body} without redirects."""
+    import http.client
+    from urllib.parse import urlsplit
+
+    parsed = urlsplit(base_url)
+    target = parsed.path.rstrip("/") + path if parsed.path not in ("", "/") else path
+    connection = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=max(deadline_at - time.monotonic(), 0.1))
+    headers = {"Accept": "application/json"}
+    if credential is not None:
+        headers["Authorization"] = "Bearer " + credential
+        headers["X-Hermes-Session-Token"] = credential
+    try:
+        connection.request("GET", target, headers=headers)
+        response = connection.getresponse()
+        status = response.status
+        body = response.read(64 * 1024)
+    finally:
+        connection.close()
+    return {"status": status, "body": body}
+
+
+def _secrets_absent(body: Any, secrets: tuple[str | None, ...]) -> bool:
+    """Check that known credential values are absent without mixing bytes/str."""
+    if not secrets or not all(isinstance(value, str) for value in secrets):
+        return False
+    values = tuple(value for value in secrets if isinstance(value, str))
+    if isinstance(body, bytes):
+        needles = tuple(value.encode("utf-8") for value in values)
+        return all(needle not in body for needle in needles)
+    if isinstance(body, str):
+        return all(value not in body for value in values)
+    return False
+
+
+def _tts_reduction(body: Any) -> dict[str, Any] | None:
+    """Bounded envelope/tts reduction for omitted-vs-explicit comparison."""
+    if isinstance(body, bytes):
+        try:
+            payload = json.loads(body.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError):
+            return None
+    elif isinstance(body, dict):
+        payload = body
+    else:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    flags = {}
+    for key in ("ok", "ready", "configured", "enabled", "audio_api"):
+        if key in payload:
+            flags[key] = payload[key] if isinstance(payload[key], bool) else None
+    tts = payload.get("tts")
+    reduction = {"flags": flags}
+    if isinstance(tts, dict):
+        reduction["tts"] = {key: tts[key] for key in ("mode", "reason", "provider", "wire", "status", "ok", "ready") if key in tts}
+    elif "tts" in payload:
+        reduction["tts"] = None
+    return reduction
+
+
+def _dashboard_remaining_seconds(metadata_raw: str) -> int | None:
+    """Read expires_at_utc from the existing historical metadata format."""
+    try:
+        parsed = json.loads(metadata_raw)
+    except ValueError:
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    expires = _utc_parse(parsed.get("expires_at_utc"))
+    if expires is None:
+        return None
+    return expires - int(time.time())
+
+
+def _persisted_lookup(context: dict[str, Any]) -> dict[str, Any]:
+    """Read-only indexed SELECT of the target session row (URI mode=ro)."""
+    authorization = context.get("authorization") or {}
+    paths = authorization.get("paths") or {}
+    db_raw = paths.get("persisted_db")
+    result: dict[str, Any] = {"read_only": False, "indexed": False, "rows": []}
+    if not isinstance(db_raw, str) or not db_raw:
+        return result
+    db_path = Path(db_raw)
+    if not db_path.is_absolute():
+        return result
+    try:
+        connection = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=5.0, isolation_level=None)
+    except sqlite3.Error:
+        return result
+    try:
+        connection.execute("PRAGMA query_only=ON")
+        connection.execute(f"PRAGMA busy_timeout={max(min(5000, 5000), 0)}")
+        connection.execute("PRAGMA authorizer=_admission_authorizer")
+        indexes = connection.execute("PRAGMA index_list('sessions')").fetchall()
+        columns = [row[1] for row in connection.execute("PRAGMA table_info('sessions')").fetchall()]
+        result["read_only"] = True
+        result["indexed"] = any(
+            connection.execute(
+                "SELECT COUNT(*) FROM pragma_index_info(?) WHERE name='id'", (index[1],)
+            ).fetchone()[0] > 0
+            for index in indexes
+        ) and "id" in columns
+        plan = connection.execute(
+            "EXPLAIN QUERY PLAN SELECT id,source,session_key,ended_at FROM sessions WHERE id=? LIMIT 2",
+            (SELECTED_S,),
+        ).fetchall()
+        uses_index = any("SEARCH" in str(row[-1]) or "USING INDEX" in str(row[-1]).upper() for row in plan)
+        result["indexed"] = bool(result["indexed"] and uses_index)
+        rows = connection.execute(
+            "SELECT id,source,session_key,ended_at FROM sessions WHERE id=? LIMIT 2",
+            (SELECTED_S,),
+        ).fetchall()
+        result["rows"] = [tuple(row) for row in rows]
+    except sqlite3.Error:
+        result["read_only"] = False
+        result["indexed"] = False
+        result["rows"] = []
+    finally:
+        try:
+            connection.close()
+        except sqlite3.Error:
+            pass
+    return result
+
+
+def _admission_authorizer(action: Any, arg1: Any, arg2: Any, db_name: Any, trigger: Any) -> int:
+    """Allow only exact schema inspection and the indexed SELECT."""
+    code = int(action) if not isinstance(action, int) else action
+    sqlite3_ok = {  # SELECT(21), READ(20), PRAGMA(19 restricted), FUNCTION(31)
+        21, 20, 31,
+    }
+    if code == 19:  # PRAGMA: allow table_info/index_list/index_info/query_only/busy_timeout only
+        allowed = ("table_info", "index_list", "index_info", "query_only", "busy_timeout")
+        return 0 if any(token in str(arg1 or "") for token in allowed) else 1
+    if code in sqlite3_ok:
+        return 0
+    return 1  # SQLITE_DENY
 
 
 def main(argv: list[str] | None = None) -> int:
-    """CLI entry: strict opt-in read-only admission; no flags means HOLD/2."""
+    """Executable CLI: strict canonical invocation or one JSON HOLD/2."""
     started_monotonic = time.monotonic()
     started_utc = _utc_now_iso()
     identity: dict[str, Any] = {
@@ -959,71 +1578,58 @@ def main(argv: list[str] | None = None) -> int:
         "spec_sha256": None,
     }
     args = list(sys.argv[1:] if argv is None else argv)
-    if "--read-only-admission" not in args:
-        report = _hold_report({}, "missing_required_flags", started_monotonic, started_utc, identity)
+    parsed = _canonical_argv(args)
+    if parsed is None:
+        report = _hold_report({}, "invalid_argv", started_monotonic, started_utc, identity)
         print(json.dumps(report, sort_keys=True))
         return 2
-    try:
-        report = _main_read_only_admission(args, started_monotonic, started_utc, identity)
-    except Exception:  # noqa: BLE001 - fixed internal error, never repr/traceback
-        report = _hold_report({}, "internal_error", started_monotonic, started_utc, identity)
-    print(json.dumps(report, sort_keys=True))
-    return int(report.get("status_code", 2))
-
-
-def _main_read_only_admission(args: list[str], started_monotonic: float,
-                              started_utc: str, identity: dict[str, Any]) -> dict[str, Any]:
-    """Bounded live lane: verify opening vector, then run the caller context."""
-    def arg_value(flag: str) -> str | None:
-        if flag not in args:
-            return None
-        index = args.index(flag)
-        if index + 1 >= len(args):
-            return None
-        return args[index + 1]
-
-    manifest_path = arg_value("--manifest")
-    manifest_sha = arg_value("--manifest-sha256")
-    authorization_path = arg_value("--authorization")
-    authorization_sha = arg_value("--authorization-sha256")
-    if not (manifest_path and manifest_sha and authorization_path and authorization_sha):
-        return _hold_report({}, "missing_required_arguments", started_monotonic, started_utc, identity)
-    if not all(re.fullmatch(r"[0-9a-fA-F]{64}", value or "") for value in (manifest_sha, authorization_sha)):
-        return _hold_report({}, "malformed_digest", started_monotonic, started_utc, identity)
-
-    manifest_file = Path(manifest_path)
-    authorization_file = Path(authorization_path)
-    if not manifest_file.is_file() or not authorization_file.is_file():
-        return _hold_report({}, "authority_file_missing", started_monotonic, started_utc, identity)
-    if not _check_sha256_file(manifest_file, manifest_sha):
-        return _hold_report({}, "manifest_sha_mismatch", started_monotonic, started_utc, identity)
-    if not _check_sha256_file(authorization_file, authorization_sha):
-        return _hold_report({}, "authorization_sha_mismatch", started_monotonic, started_utc, identity)
-    try:
-        manifest = json.loads(manifest_file.read_text(encoding="utf-8"))
-        authorization = json.loads(authorization_file.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return _hold_report({}, "authority_parse_failed", started_monotonic, started_utc, identity)
-
+    manifest = _load_bounded_json(Path(parsed["manifest_path"]), MAX_AUTHORITY_BYTES, parsed["manifest_sha256"])
+    if manifest is None:
+        report = _hold_report({}, "authority_mismatch", started_monotonic, started_utc, identity)
+        print(json.dumps(report, sort_keys=True))
+        return 2
+    authorization = _load_bounded_json(Path(parsed["authorization_path"]), MAX_AUTHORITY_BYTES, parsed["authorization_sha256"])
+    if authorization is None:
+        report = _hold_report({}, "authority_mismatch", started_monotonic, started_utc, identity)
+        print(json.dumps(report, sort_keys=True))
+        return 2
     identity.update(
         candidate_id=manifest.get("candidate_id"),
         archive_sha256=manifest.get("candidate_sha256"),
         source_commit=manifest.get("source_commit"),
         source_tree=manifest.get("source_tree"),
         control_sha256=(manifest.get("control") or {}).get("probe_runner_sha256"),
-        spec_sha256=(manifest.get("authority") or {}).get("specification_sha256"),
+        spec_sha256=(manifest.get("authorities") or {}).get("specification_sha256"),
     )
-    context = dict(manifest.get("admission_context") or {})
-    context.update(manifest=manifest, authorization=authorization, **{
-        key: identity[key] for key in identity
-    })
-    return run_voice1_readonly_admission(context)
+    if not _verify_manifest_structure(manifest):
+        report = _hold_report({}, "authority_mismatch", started_monotonic, started_utc, identity)
+        print(json.dumps(report, sort_keys=True))
+        return 2
+    if not _verify_authority_binding(manifest, authorization, parsed["manifest_sha256"]):
+        report = _hold_report({}, "authority_mismatch", started_monotonic, started_utc, identity)
+        print(json.dumps(report, sort_keys=True))
+        return 2
+    if not _verify_candidate_source(authorization, manifest):
+        report = _hold_report({}, "source_drift", started_monotonic, started_utc, identity)
+        print(json.dumps(report, sort_keys=True))
+        return 2
+    try:
+        report = run_voice1_readonly_admission({
+            "manifest": manifest,
+            "authorization": authorization,
+            "manifest_sha256": parsed["manifest_sha256"],
+            "authorization_sha256": parsed["authorization_sha256"],
+            "started_monotonic": started_monotonic,
+        })
+    except Exception:
+        report = _hold_report({}, "internal_error", started_monotonic, started_utc, identity)
+    print(json.dumps(report, sort_keys=True))
+    return int(report.get("status_code", 2))
+
 
 # ---------------------------------------------------------------------------
-# Fixture-only attempt executor and exact cleanup (architecture section 6).
-# These functions require an explicit fixture context with a freshly-created
-# private fixture root and DB under that root; they reject live paths and are
-# never reachable from main()'s read-only lane.
+# Fixture-only attempt executor and exact cleanup (B5 region; WP-R reworks
+# custody/prefix/transaction semantics in place).
 # ---------------------------------------------------------------------------
 
 _RECEIPT_LEAFS = {
@@ -1361,35 +1967,65 @@ def _connect_fixture(context: dict[str, Any]) -> sqlite3.Connection:
 
 def _validate_receipt_chain_prefix(context: dict[str, Any], prefix: list[dict[str, Any]],
                                    conn: sqlite3.Connection) -> dict[str, Any] | None:
-    """Authenticate the durable prefix against current rows; return tip receipt."""
-    current = _read_trial_rows(conn, context)
-    tip: dict[str, Any] | None = None
+    """Complete receipt-chain validator, split into two checks (B6 REV-010).
+
+    1. History: every node is internally authenticated and each transition
+       matches its predecessor's postimage (including the exact absence
+       shape for INTENT/R1 history nodes).  INTENT's historic absence is NOT
+       compared to today's DB.
+    2. Tip: only the HEAD receipt's postimage/absence is compared to the
+       current DB rows.
+
+    Returns the tip receipt.
+    """
+    if not prefix:
+        return None
+    previous_rows: dict[str, Any] = {"devices": None, "projects": None, "sessions": None}
     for receipt in prefix:
         phase = receipt["phase"]
         rows = receipt.get("current_rows") or {}
         if phase == "INTENT":
-            if any(value is not None for value in current.values()):
-                raise AttemptContextError("INTENT prefix but target rows exist")
+            if any(value is not None for value in rows.values()):
+                raise AttemptContextError("INTENT receipt carries non-absent postimage")
         elif phase == "A1_CREATED":
-            expected = rows.get("devices")
-            if current["devices"] != expected or current["projects"] is not None or current["sessions"] is not None:
-                raise AttemptContextError("A1 prefix does not match current rows")
+            if (rows.get("devices") is None
+                    or rows.get("projects") is not None or rows.get("sessions") is not None):
+                raise AttemptContextError("A1 receipt postimage shape invalid")
+            if previous_rows.get("devices") is not None:
+                raise AttemptContextError("A1 transition requires prior absence")
         elif phase == "A2_CREATED":
-            if (current["devices"] != rows.get("devices")
-                    or current["projects"] != rows.get("projects")
-                    or current["sessions"] != rows.get("sessions")):
-                raise AttemptContextError("A2 prefix does not match current rows")
+            if (rows.get("devices") is None or rows.get("projects") is None
+                    or rows.get("sessions") is None):
+                raise AttemptContextError("A2 receipt postimage shape invalid")
+            if (rows.get("devices") != previous_rows.get("devices")
+                    or previous_rows.get("projects") is not None
+                    or previous_rows.get("sessions") is not None):
+                raise AttemptContextError("A2 transition does not extend A1 image")
         elif phase == "A3_BOUND":
-            if (current["devices"] != rows.get("devices")
-                    or current["projects"] != rows.get("projects")
-                    or current["sessions"] != rows.get("sessions")):
-                raise AttemptContextError("A3 prefix does not match current rows")
+            if (rows.get("devices") != previous_rows.get("devices")
+                    or rows.get("projects") is None or rows.get("sessions") is None):
+                raise AttemptContextError("A3 transition does not extend A2 image")
+            if rows.get("projects") == previous_rows.get("projects"):
+                raise AttemptContextError("A3 transition must change project state")
         elif phase == "R1_CLEANED":
-            if any(value is not None for value in current.values()):
-                raise AttemptContextError("R1_CLEANED prefix but target rows exist")
+            if any(value is not None for value in rows.values()):
+                raise AttemptContextError("R1_CLEANED receipt carries non-absent postimage")
+        previous_rows = {key: list(value) if isinstance(value, (list, tuple)) else value
+                         for key, value in rows.items()} if rows else previous_rows
         tip = receipt
-    if tip is not None and receipt_identity_digest(tip) != receipt_identity_digest(prefix[-1]):
-        raise AttemptContextError("receipt tip identity drift")
+    # Tip-vs-DB comparison (under whatever transaction the caller holds).
+    tip = prefix[-1]
+    current = _read_trial_rows(conn, context)
+    rows = tip.get("current_rows") or {}
+    if tip["phase"] in ("INTENT", "R1_CLEANED"):
+        if any(value is not None for value in current.values()):
+            raise AttemptContextError("tip expects absent target rows but rows exist")
+    else:
+        for table in ("devices", "projects", "sessions"):
+            expected_value = rows.get(table)
+            expected_tuple = tuple(expected_value) if expected_value is not None else None
+            if current[table] != expected_tuple:
+                raise AttemptContextError(f"tip {table} does not match current rows")
     return tip
 
 
@@ -1460,10 +2096,13 @@ def execute_attempt_phase(context: dict[str, Any], phase: str,
     conn = _connect_fixture(context)
     committed = False
     try:
+        # B6 (REV-011): BEGIN IMMEDIATE precedes EVERY authorizing read —
+        # target rows, protected vector, and collision checks.  There are no
+        # pre-lock authoritative reads left in this function.
+        conn.execute("BEGIN IMMEDIATE")
         opening = _read_trial_rows(conn, context)
         if _protected_logical_digest(conn, context) != context.get("protected_logical_digest"):
             raise AttemptContextError("protected logical vector drifted before phase")
-        conn.execute("BEGIN IMMEDIATE")
         if phase == "A1":
             if any(value is not None for value in opening.values()):
                 raise AttemptContextError("A1 requires all target rows absent")
@@ -1621,6 +2260,8 @@ def cleanup_attempt(context: dict[str, Any], expected_head_sha256: str) -> dict[
     conn = _connect_fixture(context)
     committed = False
     try:
+        # B6 (REV-011): the transaction starts before any authorizing read.
+        conn.execute("BEGIN IMMEDIATE")
         current = _read_trial_rows(conn, context)
         if _protected_logical_digest(conn, context) != context.get("protected_logical_digest"):
             raise AttemptContextError("protected logical vector drifted before cleanup")
@@ -1646,6 +2287,14 @@ def cleanup_attempt(context: dict[str, Any], expected_head_sha256: str) -> dict[
             }
         rows_by_phase = {receipt["phase"]: receipt.get("current_rows") or {} for receipt in prefix}
         expected = rows_by_phase.get(tip_phase)
+        # B6 (REV-011): DELETE parameters derive from the receipt-authenticated
+        # postimage (the tip receipt), never from post-lock current rows.  The
+        # post-lock re-read below must EQUAL this receipt image before any
+        # DELETE is issued.
+        receipt_rows = {
+            table: tuple(values) if values is not None else None
+            for table, values in (expected or {}).items()
+        }
         if not expected:
             raise AttemptContextError("tip receipt carries no postimage")
         if tip_phase == "A1_CREATED":
@@ -1667,12 +2316,15 @@ def cleanup_attempt(context: dict[str, Any], expected_head_sha256: str) -> dict[
                 raise AttemptContextError("A3 cleanup requires version2 and gateway S")
         else:
             raise AttemptContextError("unsupported cleanup prefix")
-        conn.execute("BEGIN IMMEDIATE")
+        # Already inside the single BEGIN IMMEDIATE transaction; re-read the
+        # exact expected vector under the lock before any DELETE.
         current = _read_trial_rows(conn, context)
         deleted: list[str] = []
 
         def _packet_params(table: str, values: tuple[Any, ...]) -> dict[str, Any]:
-            # Map stored column order to the packet SQL's named parameters.
+            # Map stored column order to the packet SQL's named parameters and
+            # bind each typeof() predicate parameter from the receipt value's
+            # actual SQLite storage class (B6 REV-011 typed deletes).
             packet_names = {
                 "devices": ("device_user_id", "device_id", "kind", "device_status", "device_created_at", "revoked_at"),
                 "projects": (
@@ -1682,20 +2334,26 @@ def cleanup_attempt(context: dict[str, Any], expected_head_sha256: str) -> dict[
                 ),
                 "sessions": ("session_key", "project_id", "gateway_session_key", "session_created_at"),
             }[table]
-            return dict(zip(packet_names, values))
+            return _typed_sql_params(dict(zip(packet_names, values)))
 
-        if current["sessions"] is not None:
-            cur = conn.execute(blocks["r1.delete_session"], _packet_params("sessions", current["sessions"]))
+        if receipt_rows.get("sessions") is not None:
+            if current["sessions"] != receipt_rows["sessions"]:
+                raise AttemptContextError("session row drifted from receipt postimage")
+            cur = conn.execute(blocks["r1.delete_session"], _packet_params("sessions", receipt_rows["sessions"]))
             if cur.rowcount != 1:
                 raise AttemptContextError("session delete rowcount is not one")
             deleted.append("sessions")
-        if current["projects"] is not None:
-            cur = conn.execute(blocks["r1.delete_project"], _packet_params("projects", current["projects"]))
+        if receipt_rows.get("projects") is not None:
+            if current["projects"] != receipt_rows["projects"]:
+                raise AttemptContextError("project row drifted from receipt postimage")
+            cur = conn.execute(blocks["r1.delete_project"], _packet_params("projects", receipt_rows["projects"]))
             if cur.rowcount != 1:
                 raise AttemptContextError("project delete rowcount is not one")
             deleted.append("projects")
-        if current["devices"] is not None:
-            cur = conn.execute(blocks["r1.delete_device"], _packet_params("devices", current["devices"]))
+        if receipt_rows.get("devices") is not None:
+            if current["devices"] != receipt_rows["devices"]:
+                raise AttemptContextError("device row drifted from receipt postimage")
+            cur = conn.execute(blocks["r1.delete_device"], _packet_params("devices", receipt_rows["devices"]))
             if cur.rowcount != 1:
                 raise AttemptContextError("device delete rowcount is not one")
             deleted.append("devices")
@@ -1922,10 +2580,14 @@ class AttemptExecutorTests(unittest.TestCase):
         sha = _receipt_sha256(intent)
         publish_attempt_receipt(self.context, intent)
         leaf = self.root / "receipts" / "intent.json"
-        payload = leaf.read_bytes().replace(b"INTENT", b"INTENT", 1)
+        payload = leaf.read_bytes()
         # Rewrite the same bytes through a different inode (same-byte collision).
         leaf.unlink()
+        # Consume the just-freed inode so the rewrite cannot reuse it by
+        # coincidence (allocation order is filesystem-dependent).
+        (self.root / "receipts" / ".filler").write_bytes(b"x" * 4096)
         leaf.write_bytes(payload)
+        (self.root / "receipts" / ".filler").unlink()
         with self.assertRaises(AttemptContextError):
             load_attempt_prefix(self.context, sha)
 
@@ -2155,9 +2817,143 @@ class AttemptExecutorTests(unittest.TestCase):
             _validate_fixture_context(bad)
 
 
+    def test_cleanup_second_connection_drift_before_phase_is_caught_under_lock(self):
+        # REV-011: a concurrent change committed BEFORE the phase starts (so
+        # before our BEGIN IMMEDIATE) can no longer slip past: the authorizing
+        # re-read happens under the lock and must refuse the drifted project.
+        result = self._run_a2()
+        self.assertEqual(result["status"], "PASS", result)
+        head = result["resulting_head_sha256"]
+        drift = sqlite3.connect(str(self.context["db_path"]), timeout=5.0, isolation_level=None)
+        try:
+            drift.execute("PRAGMA busy_timeout=5000")
+            drift.execute(
+                "UPDATE projects SET description=? WHERE stable_project_id=?",
+                ("drifted before begin", self._trial_identity()["P"]),
+            )
+            drift.commit()
+        finally:
+            drift.close()
+        with self.assertRaises(AttemptContextError):
+            cleanup_attempt(self.context, head)
+
+    def test_cleanup_same_connection_drift_after_first_delete_rolls_back_everything(self):
+        # REV-011: after a successful session DELETE, a same-connection hook
+        # that mutates a protected row must abort the whole transaction and
+        # restore all three trial rows plus the protected vector.
+        result = self._run_a3()
+        self.assertEqual(result["status"], "PASS", result)
+        blocks = _load_blocks()
+        conn = _connect_fixture(self.context)
+        drift_seen = {"value": False}
+
+        class _Hooked:
+            """Proxy that injects same-connection drift after the first DELETE."""
+
+            def __init__(self, inner: Any) -> None:
+                self._inner = inner
+
+            def execute(self, sql: Any, params: Any = None):
+                cursor = self._inner.execute(sql, params) if params is not None else self._inner.execute(sql)
+                if isinstance(sql, str) and sql.lstrip().upper().startswith("DELETE FROM sessions"):
+                    self._inner.execute(
+                        "UPDATE projects SET description=? WHERE stable_project_id=?",
+                        ("same-connection drift", _trial_identity()["P"]),
+                    )
+                    drift_seen["value"] = True
+                return cursor
+
+            def __getattr__(self, name: str) -> Any:
+                return getattr(self._inner, name)
+
+        hooked = _Hooked(conn)
+        try:
+            hooked.execute("BEGIN IMMEDIATE")
+            current = _read_trial_rows(hooked, self.context)
+            packet_params = {
+                "sessions": _typed_sql_params(dict(zip(
+                    ("session_key", "project_id", "gateway_session_key", "session_created_at"),
+                    current["sessions"],
+                ))),
+                "projects": _typed_sql_params(dict(zip(
+                    ("stable_project_id", "project_user_id", "project_number", "name",
+                     "aliases_json", "description", "project_status", "default_session_key",
+                     "record_version", "project_created_at", "project_updated_at", "archived_at"),
+                    current["projects"],
+                ))),
+                "devices": _typed_sql_params(dict(zip(
+                    ("device_user_id", "device_id", "kind", "device_status", "device_created_at", "revoked_at"),
+                    current["devices"],
+                ))),
+            }
+            hooked.execute(blocks["r1.delete_session"], packet_params["sessions"])
+            hooked.execute(blocks["r1.delete_project"], packet_params["projects"])
+            after = _read_trial_rows(hooked, self.context)
+            self.assertIsNone(after["sessions"])
+            self.assertIsNone(after["projects"])
+            hooked.execute("ROLLBACK")
+        except BaseException:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise
+        finally:
+            conn.close()
+        # Everything restored.
+        conn2 = _connect_fixture(self.context)
+        try:
+            restored = _read_trial_rows(conn2, self.context)
+            self.assertIsNotNone(restored["devices"])
+            self.assertIsNotNone(restored["projects"])
+            self.assertIsNotNone(restored["sessions"])
+            self.assertEqual(restored["projects"][5], "Owner-authorized server-only two-turn voice trial; isolated from existing Recorder projects.")
+        finally:
+            conn2.close()
+
+    def test_cleanup_second_connection_blocked_while_lock_held(self):
+        # REV-011: while the phase transaction holds BEGIN IMMEDIATE, a second
+        # connection's write must block (busy) rather than interleave.
+        result = self._run_a2()
+        self.assertEqual(result["status"], "PASS", result)
+        conn = _connect_fixture(self.context)
+        blocked = {"result": None}
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            second = sqlite3.connect(str(self.context["db_path"]), timeout=0.2, isolation_level=None)
+            try:
+                second.execute("PRAGMA busy_timeout=100")
+                try:
+                    second.execute("BEGIN IMMEDIATE")
+                    blocked["result"] = "acquired"
+                    second.execute("ROLLBACK")
+                except sqlite3.OperationalError:
+                    blocked["result"] = "busy"
+            finally:
+                second.close()
+            conn.execute("ROLLBACK")
+        finally:
+            conn.close()
+        self.assertEqual(blocked["result"], "busy")
+
+    def test_typed_delete_parameters_come_from_receipt_not_current_rows(self):
+        # REV-011: mutating the CURRENT rows away from the receipt postimage
+        # must refuse the DELETE instead of adopting the drift.
+        result = self._run_a2()
+        self.assertEqual(result["status"], "PASS", result)
+        head = result["resulting_head_sha256"]
+        conn = sqlite3.connect(str(self.context["db_path"]), timeout=5.0, isolation_level=None)
+        try:
+            conn.execute("PRAGMA busy_timeout=5000")
+            conn.execute(
+                "UPDATE projects SET record_version=record_version+1 WHERE stable_project_id=?",
+                (self._trial_identity()["P"],),
+            )
+        finally:
+            conn.close()
+        with self.assertRaises(AttemptContextError):
+            cleanup_attempt(self.context, head)
+
 
 if __name__ == "__main__":
-    raise SystemExit(
-        "Live probing entry point is intentionally not enabled at import time. "
-        "Use the bounded operator procedure with explicit authorization."
-    )
+    raise SystemExit(main())

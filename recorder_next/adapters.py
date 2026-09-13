@@ -1582,6 +1582,199 @@ _TTS_MAX_SEMANTIC_LENGTH = 256
 _TTS_RESOLUTION_ERROR_PREFIXES = ("resolution error", "resolution-error", "openai resolution failed")
 _TTS_FIXED_NEGATIVES = frozenset({"resolution error", "tts disabled", "no credentials", "no deepinfra tts model"})
 _TTS_UNSUPPORTED_REASON = "unsupported-reason"
+_TTS_NORMATIVE_FLAGS = ("ok", "ready", "configured", "enabled")
+_TTS_NORMATIVE_STRINGS = ("mode", "reason", "provider", "wire", "status")
+_GENERIC_TTS_ENDPOINT_CONTRACT = "http-tts-json/v1"
+_GENERIC_RELAY_PROVIDERS = frozenset({"edge", "minimax", "xai", "mistral", "gemini", "neutts", "kittentts", "piper"})
+
+
+def _provider_kind_for_tts(provider: Any) -> str:
+    """Explicit provider-kind selector: 'hermes' or generic 'http'.
+
+    The kind is chosen by the concrete class, never inferred from
+    success-looking response fields, so a permissive generic endpoint can
+    never reclassify itself into the stricter Hermes grammar (or vice versa).
+    """
+    return "hermes" if getattr(provider, "name", None) == "hermes" else "http"
+
+
+def _validate_envelope_semantics(envelope: Mapping[str, Any], *, provider_kind: str) -> None:
+    """Fail closed on any present normative envelope semantic.
+
+    Both envelopes (health and capability) are validated for type/presence
+    before any success branch: a present flag must be an actual bool, a
+    present normative string must be a bounded nonempty-after-trim string
+    (reason may be empty), and a present ``tts`` value must be a mapping.
+    Absent keys stay absent; present wrong-type/null/overlong values were
+    already projected to None invalid markers by the sanitizer and reject
+    here even when another field expresses a positive or a negative.
+    """
+    for flag in _TTS_NORMATIVE_FLAGS:
+        if flag in envelope and not isinstance(envelope.get(flag), bool):
+            raise ProviderFailure("tts_capability_unknown", retryable=False)
+    for key in _TTS_NORMATIVE_STRINGS:
+        if key not in envelope:
+            continue
+        value = envelope.get(key)
+        if key == "reason":
+            if value is not None and not (isinstance(value, str) and len(value) <= _TTS_MAX_SEMANTIC_LENGTH):
+                raise ProviderFailure("tts_capability_unknown", retryable=False)
+        elif not isinstance(value, str) or not value.strip() or len(value) > _TTS_MAX_SEMANTIC_LENGTH:
+            raise ProviderFailure("tts_capability_unknown", retryable=False)
+    if "tts" in envelope and not isinstance(envelope.get("tts"), Mapping):
+        raise ProviderFailure("tts_capability_unknown", retryable=False)
+    if provider_kind == "hermes" and "audio_api" in envelope and not isinstance(envelope.get("audio_api"), bool):
+        raise ProviderFailure("tts_capability_unknown", retryable=False)
+
+
+def _relay_mode_rules(tts: Mapping[str, Any], *, supported_reasons: frozenset[str] | None = None, supported_providers: frozenset[str] | None = None) -> None:
+    """Shared Hermes/generic relay-mode terminal rules.
+
+    Both grammars apply the same bounded wire/provider/reason rules.  The
+    Hermes allowlists (positive supported reasons / no-client-wire provider
+    names) pass only when the caller supplies them; the generic grammar has
+    no provider-specific positive relay reasons, so a generic relay that is
+    not explicitly disabled or a recognized unavailable reason rejects as
+    unknown.
+    """
+    if "wire" in tts:
+        wire = tts.get("wire")
+        if not isinstance(wire, str) or not wire.strip() or len(wire) > _TTS_MAX_SEMANTIC_LENGTH or wire.strip().lower() != "server":
+            raise ProviderFailure("tts_capability_unknown", retryable=False)
+    if "provider" in tts:
+        provider_value = tts.get("provider")
+        if not isinstance(provider_value, str) or not provider_value.strip() or len(provider_value) > _TTS_MAX_SEMANTIC_LENGTH:
+            raise ProviderFailure("tts_capability_unknown", retryable=False)
+    if "reason" not in tts:
+        raise ProviderFailure("tts_capability_unknown", retryable=False)
+    reason = tts.get("reason")
+    if not isinstance(reason, str) or len(reason) > _TTS_MAX_SEMANTIC_LENGTH:
+        raise ProviderFailure("tts_capability_unknown", retryable=False)
+    lowered = reason.strip().lower()
+    if lowered == "resolution error" or lowered.startswith("openai resolution failed"):
+        raise ProviderFailure("tts_unavailable", retryable=True)
+    if lowered == "tts disabled":
+        raise ProviderFailure("tts_disabled", retryable=False)
+    if lowered in {"no credentials", "no deepinfra tts model"}:
+        raise ProviderFailure("tts_unavailable", retryable=True)
+    if supported_reasons is not None and lowered in supported_reasons:
+        return
+    if supported_providers is not None:
+        match = re.fullmatch(r"provider '([a-z0-9_-]{1,64})' has no client wire", lowered)
+        if match is not None and match.group(1) in supported_providers:
+            return
+    raise ProviderFailure("tts_capability_unknown", retryable=False)
+
+
+def _direct_mode_rules(tts: Mapping[str, Any], allowed_wires: Mapping[str, frozenset[str]]) -> None:
+    """Shared Hermes/generic direct-mode terminal rules (same wires)."""
+    provider_value = tts.get("provider")
+    wire = tts.get("wire")
+    if not isinstance(provider_value, str) or not provider_value.strip() or len(provider_value) > _TTS_MAX_SEMANTIC_LENGTH:
+        raise ProviderFailure("tts_capability_unknown", retryable=False)
+    if not isinstance(wire, str) or not wire.strip() or len(wire) > _TTS_MAX_SEMANTIC_LENGTH:
+        raise ProviderFailure("tts_capability_unknown", retryable=False)
+    normalized_provider = provider_value.strip().lower()
+    normalized_wire = wire.strip().lower()
+    if normalized_wire not in allowed_wires or normalized_provider not in allowed_wires[normalized_wire]:
+        raise ProviderFailure("tts_capability_unknown", retryable=False)
+    reason = tts.get("reason")
+    if "reason" in tts and reason is None:
+        raise ProviderFailure("tts_capability_unknown", retryable=False)
+    if reason is not None:
+        if not isinstance(reason, str) or len(reason) > _TTS_MAX_SEMANTIC_LENGTH:
+            raise ProviderFailure("tts_capability_unknown", retryable=False)
+        if not reason.strip():
+            return
+        lowered = reason.strip().lower()
+        if lowered == "resolution error" or lowered.startswith("openai resolution failed"):
+            raise ProviderFailure("tts_unavailable", retryable=True)
+        if lowered == "tts disabled":
+            raise ProviderFailure("tts_disabled", retryable=False)
+        if lowered in {"no credentials", "no deepinfra tts model"}:
+            raise ProviderFailure("tts_unavailable", retryable=True)
+        raise ProviderFailure("tts_capability_unknown", retryable=False)
+
+
+def _validate_generic_tts_semantics(tts: Mapping[str, Any], allowed_wires: Mapping[str, frozenset[str]]) -> None:
+    """Complete generic HTTP/Edge nested-TTS grammar (B6 section 4).
+
+    Present semantics already passed the common type/length checks.  If a
+    mode is present, the same supported relay/direct mode rules as Hermes
+    apply.  If mode is absent, at least one nested ok/ready must be True,
+    reason must be absent or empty, and wire must be absent (no wire/mode
+    contract exists); bounded provider and positive status stay descriptive.
+    A mapping with no usable positive rejects.
+    """
+    for flag in ("configured", "enabled", "ready", "ok"):
+        value = tts.get(flag)
+        if flag in tts and value is False:
+            raise ProviderFailure("tts_disabled", retryable=False)
+        if flag in tts and value is not True:
+            # Present-invalid (None marker from a wrong-typed raw value, an
+            # integer, a string, a list) rejects; only an actual True passes.
+            raise ProviderFailure("tts_capability_unknown", retryable=False)
+    for key in ("mode", "reason", "provider", "wire", "status"):
+        if key not in tts:
+            continue
+        value = tts.get(key)
+        if key == "reason":
+            # reason is validated in the mode/absent branches below.
+            continue
+        if not isinstance(value, str) or not value.strip() or len(value) > _TTS_MAX_SEMANTIC_LENGTH:
+            # Present-invalid (None marker from a wrong-typed raw value),
+            # empty/whitespace, or overlong strings reject before any
+            # positive branch can accept the mapping.
+            raise ProviderFailure("tts_capability_unknown", retryable=False)
+    if "status" in tts:
+        status = tts.get("status")
+        if not isinstance(status, str) or not status.strip() or len(status) > _TTS_MAX_SEMANTIC_LENGTH:
+            raise ProviderFailure("tts_capability_unknown", retryable=False)
+        if status.strip().lower() not in {"ok", "ready", "available"}:
+            raise ProviderFailure("tts_capability_unknown", retryable=False)
+    if "mode" in tts:
+        mode = tts.get("mode")
+        if not isinstance(mode, str) or not mode.strip() or len(mode) > _TTS_MAX_SEMANTIC_LENGTH:
+            raise ProviderFailure("tts_capability_unknown", retryable=False)
+        normalized_mode = mode.strip().lower()
+        if normalized_mode in {"disabled", "off", "none"}:
+            raise ProviderFailure("tts_disabled", retryable=False)
+        if normalized_mode == "relay":
+            _relay_mode_rules(tts, supported_providers=_GENERIC_RELAY_PROVIDERS)
+            return
+        if normalized_mode == "direct":
+            _direct_mode_rules(tts, allowed_wires)
+            return
+        raise ProviderFailure("tts_capability_unknown", retryable=False)
+    for flag in ("ok", "ready"):
+        if flag in tts and tts.get(flag) is not True:
+            # Present-invalid (None marker from a wrong-typed raw value) and
+            # explicit False both reject; absent stays valid.
+            raise ProviderFailure("tts_capability_unknown" if tts.get(flag) is not False else "tts_disabled", retryable=False)
+    if tts.get("ok") is not True and tts.get("ready") is not True:
+        raise ProviderFailure("tts_capability_unknown", retryable=False)
+    if "reason" in tts:
+        reason = tts.get("reason")
+        if reason is None or (isinstance(reason, str) and reason.strip()):
+            raise ProviderFailure("tts_capability_unknown", retryable=False)
+        if not isinstance(reason, str):
+            raise ProviderFailure("tts_capability_unknown", retryable=False)
+    if "wire" in tts:
+        raise ProviderFailure("tts_capability_unknown", retryable=False)
+
+
+def _validate_generic_envelope_positive(envelope: Mapping[str, Any]) -> None:
+    """Generic envelope positive: ok or ready present and exactly True.
+
+    configured/enabled alone, an empty mapping, or an arbitrary status string
+    is not a positive.  All other present normative flags must be True.
+    """
+    positive = envelope.get("ok") is True or envelope.get("ready") is True
+    if not positive:
+        raise ProviderFailure("tts_capability_unknown", retryable=False)
+    for flag in ("configured", "enabled"):
+        if flag in envelope and envelope.get(flag) is not True:
+            raise ProviderFailure("tts_capability_unknown", retryable=False)
 
 
 def _tts_invalid(value: Any = None) -> Any:
@@ -2434,6 +2627,54 @@ class HttpTTSProvider(_HTTPProvider):
             },
         )
 
+    def readiness_check(
+        self,
+        *,
+        timeout_seconds: float | None = None,
+        deadline_at: float | None = None,
+    ) -> dict[str, Any]:
+        """Provider-appropriate strict readiness for generic HTTP TTS.
+
+        Two bounded authenticated GETs (health, capability) share one
+        monotonic deadline; both envelopes and any nested tts are validated
+        through the same strict grammar used for explicit-profile validation.
+        No synthesis request is issued.  Edge inherits this unchanged.
+        """
+        started = time.monotonic()
+        if deadline_at is None:
+            deadline = started + self.timeout
+        else:
+            deadline = deadline_at
+        if timeout_seconds is not None:
+            deadline = min(deadline, started + float(timeout_seconds))
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise ProviderFailure("timeout", retryable=True)
+        health = self.health_check(timeout_seconds=remaining, deadline_at=deadline)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise ProviderFailure("timeout", retryable=True)
+        capability = self.capability_check(timeout_seconds=remaining, deadline_at=deadline)
+        if not isinstance(health, Mapping) or not isinstance(capability, Mapping):
+            raise ProviderFailure("tts_capability_unknown", retryable=False)
+        allowed_wires = {
+            "openai-speech": frozenset({"openai", "deepinfra"}),
+            "elevenlabs-tts": frozenset({"elevenlabs"}),
+        }
+        _validate_envelope_semantics(health, provider_kind="http")
+        _validate_envelope_semantics(capability, provider_kind="http")
+        _validate_generic_envelope_positive(health)
+        _validate_generic_envelope_positive(capability)
+        nested = capability.get("tts")
+        if nested is not None:
+            # A present nested tts must be a mapping (checked again here so a
+            # raw None marker rejects) and satisfies the complete generic
+            # grammar; a wholly absent tts is valid for a generic endpoint.
+            if not isinstance(nested, Mapping):
+                raise ProviderFailure("tts_capability_unknown", retryable=False)
+            _validate_generic_tts_semantics(nested, allowed_wires)
+        return {"health": dict(health), "capability": dict(capability), "endpoint_contract": _GENERIC_TTS_ENDPOINT_CONTRACT}
+
 
 class EdgeTTSProvider(HttpTTSProvider):
     """Named Edge-compatible Korean TTS adapter.
@@ -2740,19 +2981,31 @@ class HermesAudioTTSProvider(_HTTPProvider):
             return
         raise ProviderFailure("tts_capability_unknown", retryable=False)
 
-    def readiness_check(self) -> dict[str, Any]:
+    def readiness_check(
+        self,
+        *,
+        timeout_seconds: float | None = None,
+        deadline_at: float | None = None,
+    ) -> dict[str, Any]:
         """Verify the authenticated endpoint advertises a supported TTS surface.
 
         Success means the bounded authenticated health and voice-config GETs
         advertise a usable TTS relay/configuration.  It is not proof of
         synthesis, downstream provider credentials, or session continuity:
-        no synthesize request is issued here.
+        no synthesize request is issued here.  Hermes positives stay exactly
+        the B3 contract; every present normative semantic in both envelopes
+        additionally passes the shared type/presence validator so a malformed
+        field rejects even when another field looks positive.
         """
         health = self.health_check()
         capability = self.capability_check()
-        if not isinstance(health, Mapping) or not self._envelope_flags_satisfied(health):
+        if not isinstance(health, Mapping) or not isinstance(capability, Mapping):
             raise ProviderFailure("tts_capability_unknown", retryable=False)
-        if not isinstance(capability, Mapping) or not self._envelope_flags_satisfied(capability):
+        _validate_envelope_semantics(health, provider_kind="hermes")
+        _validate_envelope_semantics(capability, provider_kind="hermes")
+        if not self._envelope_flags_satisfied(health):
+            raise ProviderFailure("tts_capability_unknown", retryable=False)
+        if not self._envelope_flags_satisfied(capability):
             raise ProviderFailure("tts_capability_unknown", retryable=False)
         self._validate_tts_capability(capability)
         return {"health": dict(health), "capability": dict(capability), "endpoint_contract": self.endpoint_contract}
