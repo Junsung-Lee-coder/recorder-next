@@ -13,6 +13,14 @@ inspection, network, SQLite, provider, or logging activity.  Everything
 boundary-touching lives behind main()/run_voice1_readonly_admission() and
 the fixture-only executor below (attempt custody/receipts/cleanup), which
 rejects live paths and is unreachable from the read-only lane.
+
+Script-form execution (VOICE1-B6-E1): when this file is executed as a
+script (or imported as a top-level module), the candidate root — this
+file's lexical parent-parent — is bound at the front of sys.path before
+any recorder_next import, so the canonical argv subprocess imports the
+candidate package from the verified candidate root.  Path binding is
+standard interpreter import mechanics; every schema read stays lazy
+(behind functions), so import performs no file I/O.
 """
 from __future__ import annotations
 
@@ -20,7 +28,9 @@ import hashlib
 import json
 import os
 import re
+import signal
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import time
@@ -28,6 +38,17 @@ import unittest
 import uuid
 from pathlib import Path
 from typing import Any
+
+# VOICE1-B6-E1 (S-CLI): script-form execution must import the candidate
+# package from the candidate root.  When run as a script, sys.path[0] is
+# this run/ directory and the sibling recorder_next package would be
+# unreachable; bind the lexical parent-parent before any recorder_next
+# import.  This is pure interpreter path binding: no file reads, no
+# environment inspection, no imports of project modules at this point.
+if __package__ in (None, ""):
+    _SCRIPT_CANDIDATE_ROOT = str(Path(__file__).resolve().parent.parent)
+    if _SCRIPT_CANDIDATE_ROOT not in sys.path:
+        sys.path.insert(0, _SCRIPT_CANDIDATE_ROOT)
 
 CONTROL_DIR = Path(__file__).resolve().parent
 PACKET_PATH = CONTROL_DIR / "binding-create-cas-rollback-packet.md"
@@ -1649,13 +1670,28 @@ _DB_FIELDS = {
     ),
     "sessions": ("session_key", "project_id", "gateway_session_key", "created_at"),
 }
-_PROTECTED_TABLES = tuple(sorted({
-    match.group(1)
-    for match in re.finditer(
-        r"CREATE TABLE IF NOT EXISTS ([a-z_]+)\s*\(",
-        (CONTROL_DIR.parent / "recorder_next" / "schema.sql").read_text(encoding="utf-8"),
+def _schema_source_text() -> str:
+    """Lazy candidate schema.sql read (VOICE1-B6-E1).
+
+    Import must stay inert, so the candidate schema text is read only when
+    a caller actually needs it.  Reads exactly the lexical candidate file;
+    no environment inspection, logging, or caching across calls.
+    """
+    return (CONTROL_DIR.parent / "recorder_next" / "schema.sql").read_text(
+        encoding="utf-8"
     )
-}))
+
+
+def _protected_tables() -> tuple[str, ...]:
+    """User tables declared by the candidate schema, sorted (lazy)."""
+    return tuple(sorted({
+        match.group(1)
+        for match in re.finditer(
+            r"CREATE TABLE IF NOT EXISTS ([a-z_]+)\s*\(",
+            _schema_source_text(),
+        )
+    }))
+
 
 _SCHEMA_FINGERPRINT = (
     "devices(user_id,device_id,kind,status,created_at,revoked_at);"
@@ -1894,7 +1930,7 @@ def _protected_logical_digest(conn: sqlite3.Connection, context: dict[str, Any] 
     # Every user table from the candidate schema participates in the whole-
     # table comparison (R.4: mandatory even where a direct-reference query
     # also passes; no table is silently skipped).
-    for table in _PROTECTED_TABLES:
+    for table in _protected_tables():
         columns = [info[1] for info in conn.execute(f"PRAGMA table_info({table})").fetchall()]
         if not columns:
             raise AttemptContextError(f"protected table {table} missing from schema")
@@ -2955,5 +2991,325 @@ class AttemptExecutorTests(unittest.TestCase):
             cleanup_attempt(self.context, head)
 
 
+# ---------------------------------------------------------------------------
+# Architecture R-GAP signal fixtures (VOICE1-B6-E1): interruption and hard
+# kill inside the commit-receipt gap must preserve committed rows and leave
+# a fresh process with an authentic uncertain prefix.  No receipt is ever
+# synthesized; a fresh-process re-entry classifies the state from real rows,
+# real custody, and the preserved out-of-band head pin.
+# ---------------------------------------------------------------------------
+
+_GAP_CHILD_MODES = ("signal", "hard-kill")
+_GAP_PROTECTED_ROOTS = ("/var/lib/recorder-next", "/home/rumi/.hermes", "/etc/recorder-next")
+
+
+def _signal_fixture_bootstrap(mode: str, fixture_root: str) -> None:
+    """Fixture-only fresh-process child: take the A1 commit and stop mid-gap.
+
+    The child prepares its own private fixture (candidate schema,
+    release-smoke seed, published INTENT receipt), records the out-of-band
+    INTENT head pin, and installs a marker-based gap around the A1 receipt
+    publication.  Readiness is signalled at the exact moment the DB commit
+    has been taken and no A1 receipt leaf exists.  ``signal`` mode then
+    delivers the named OS signal to itself: default SIGINT disposition
+    raises KeyboardInterrupt inside the executor, whose conservative
+    BaseException path classifies the attempt COMMIT_UNCERTAIN; default
+    SIGTERM disposition terminates the process.  ``hard-kill`` mode blocks
+    until the parent SIGKILLs it inside the gap.  Exit codes preserve
+    interruption semantics: 70 with a recorded executor HOLD result for the
+    conservative path, death by signal otherwise; 7 would mean the
+    interruption was swallowed into success; 3 means fixture refusal.
+    """
+    import unittest.mock
+
+    if mode not in _GAP_CHILD_MODES:
+        raise SystemExit(3)
+    root = Path(fixture_root)
+    if not root or not root.is_absolute():
+        raise SystemExit(3)
+    resolved = root.resolve()
+    for live in _GAP_PROTECTED_ROOTS:
+        try:
+            resolved.relative_to(Path(live))
+        except ValueError:
+            continue
+        raise SystemExit(3)
+    (root / "receipts").mkdir(parents=True, exist_ok=True)
+    os.chmod(root / "receipts", 0o700)
+    db_path = root / "recorder-next.sqlite3"
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("PRAGMA foreign_keys=ON")
+    _fixture_schema(conn)
+    _seed_release_smoke(conn)
+    conn.commit()
+    conn.close()
+    context = _signal_fixture_context(root, db_path)
+    context["phase_params"] = {"A1": _signal_fixture_a1_params(context)}
+    intent = _base_receipt(context, "INTENT", None)
+    intent["current_rows"] = {"devices": None, "projects": None, "sessions": None}
+    intent["explicit_absent"] = ["devices", "projects", "sessions"]
+    publish_attempt_receipt(context, intent)
+    # Out-of-band head pin: hash of the exact published INTENT bytes (same
+    # rule as the executor tests).  The fresh-process re-entry in the
+    # parent binds this pin; nothing derives it from the post-interruption
+    # state.
+    head = _receipt_sha256(intent)
+    (root / "gap.head").write_text(head, encoding="utf-8")
+
+    signal_name = os.environ.get("VOICE1_SIGNAL_NAME", "SIGINT")
+    committed = root / "gap.committed"
+    ready = root / "gap.ready"
+
+    def gap_publish(publish_context: dict[str, Any], receipt: dict[str, Any]) -> dict[str, Any]:
+        # The A1 COMMIT has been taken and fully validated; the receipt leaf
+        # does not exist.  This is the commit-receipt gap.
+        committed.write_bytes(b"1")
+        ready.write_bytes(b"1")
+        if mode == "signal":
+            os.kill(os.getpid(), signal.SIGINT if signal_name == "SIGINT" else signal.SIGTERM)
+        deadline = time.monotonic() + 30.0
+        while time.monotonic() < deadline:
+            time.sleep(0.01)  # hard-kill mode blocks here until SIGKILL
+        os._exit(6)
+
+    try:
+        with unittest.mock.patch.object(sys.modules[__name__], "publish_attempt_receipt", gap_publish):
+            result = execute_attempt_phase(context, "A1", head)
+    except BaseException:
+        # Any escape other than the executor's conservative classification
+        # still means interruption; preserve its semantics.
+        raise SystemExit(70)
+    outcome = {
+        "status": result.get("status"),
+        "state": result.get("state"),
+        "creation_outcome": result.get("creation_outcome"),
+        "reason_codes": result.get("reason_codes"),
+    }
+    (root / "gap.result.json").write_text(json.dumps(outcome, sort_keys=True), encoding="utf-8")
+    if outcome["status"] == "PASS":
+        # Interruption must never be swallowed into success.
+        raise SystemExit(7)
+    raise SystemExit(70)
+
+
+def _signal_fixture_context(root: Path, db_path: Path) -> dict[str, Any]:
+    blocks = _load_blocks()
+    for name in SQL_BLOCK_NAMES:
+        if hashlib.sha256(blocks[name].encode("utf-8")).hexdigest() != SQL_STATEMENT_SHA256[name]:
+            raise SystemExit(3)
+    control_packet_sha256 = hashlib.sha256(PACKET_PATH.read_bytes()).hexdigest()
+    identity = {
+        "U": "voice1-trial-owner-7333f832a973d428",
+        "D": "voice1-server-trial-7333f832a973d428",
+        "N": "VOICE1-TRIAL-7333f832a973d428",
+        "I": "recorder-next:voice1:isolated-trial:7333f832a973d428",
+        "P": "b961f648-3f79-5f92-9ed7-aeceb087fa02",
+        "L": "project:b961f648-3f79-5f92-9ed7-aeceb087fa02:default",
+        "S": SELECTED_S,
+    }
+    context: dict[str, Any] = {
+        "fixture_root": root,
+        "db_path": db_path,
+        "attempt_id": str(uuid.uuid4()),
+        "candidate_id": "fixture-candidate",
+        "archive_sha256": "0" * 64,
+        "source_commit": "f" * 40,
+        "source_tree": "e" * 64,
+        "control_packet_sha256": control_packet_sha256,
+        "spec_sha256": "d" * 64,
+        "owner_authorization_sha256": "c" * 64,
+        "trial_identity": identity,
+        "phase_params": {},
+        "admission_report": None,
+    }
+    conn = _connect_fixture(context)
+    try:
+        context["protected_logical_digest"] = _protected_logical_digest(conn, context)
+    finally:
+        conn.close()
+    return context
+
+
+def _signal_fixture_a1_params(context: dict[str, Any]) -> dict[str, Any]:
+    identity = context["trial_identity"]
+    return {
+        "device_user_id": identity["U"],
+        "device_id": identity["D"],
+        "kind": "other",
+        "device_status": "active",
+        "device_created_at": "2026-09-12T13:00:00.000+00:00",
+        "revoked_at": None,
+    }
+
+
+def _signal_child_argv(mode: str, signal_name: str, root: Path) -> tuple[list[str], dict[str, str]]:
+    """Exact fresh-process argv/env for the signal-gap child."""
+    argv = [
+        sys.executable, "-B", "-s", str(Path(__file__).resolve()),
+        "--voice1-gap-child", mode,
+    ]
+    env = dict(os.environ)
+    env["VOICE1_SIGNAL_NAME"] = signal_name
+    env["VOICE1_GAP_ROOT"] = str(root)
+    return argv, env
+
+
+class Voice1CommitReceiptGapSignalTests(unittest.TestCase):
+    """R-GAP: SIGINT/SIGTERM and hard kill inside the commit-receipt gap.
+
+    Each fixture runs a real fresh interpreter process to the exact
+    commit-taken/receipt-absent boundary, delivers the named interruption,
+    and then proves from real rows, real custody, and the preserved
+    out-of-band head pin that the state is genuinely uncertain and that a
+    fresh-process re-entry refuses to touch it: the authenticated prefix
+    still loads against the pin, but re-running A1 collides with the real
+    committed rows and is refused without synthesizing anything.
+    """
+
+    def _run_gap_child(self, mode: str, signal_name: str) -> tuple["subprocess.Popen[bytes]", Path]:
+        tmp = tempfile.TemporaryDirectory(prefix="voice1-gap-")
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name) / "attempt-root"
+        argv, env = _signal_child_argv(mode, signal_name, root)
+        process = subprocess.Popen(
+            argv,
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        self.addCleanup(self._reap, process)
+        deadline = time.monotonic() + 30.0
+        while time.monotonic() < deadline:
+            if (root / "gap.ready").exists():
+                break
+            if process.poll() is not None:
+                self.fail(f"gap child exited early with {process.returncode}")
+            time.sleep(0.01)
+        else:
+            self.fail("gap child never reached the commit-receipt boundary")
+        self.assertTrue((root / "gap.committed").exists())
+        return process, root
+
+    @staticmethod
+    def _reap(process: "subprocess.Popen[bytes]") -> None:
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+
+    def _assert_uncertain_after_gap(self, root: Path, signal_name: str) -> None:
+        """Fresh-process classification after the interruption."""
+        db_path = root / "recorder-next.sqlite3"
+        context: dict[str, Any] = {
+            "fixture_root": root,
+            "db_path": db_path,
+            "attempt_id": "reentry-probe",
+            "candidate_id": "fixture-candidate",
+            "archive_sha256": "0" * 64,
+            "source_commit": "f" * 40,
+            "source_tree": "e" * 64,
+            "control_packet_sha256": hashlib.sha256(PACKET_PATH.read_bytes()).hexdigest(),
+            "spec_sha256": "d" * 64,
+            "owner_authorization_sha256": "c" * 64,
+            "trial_identity": {
+                "U": "voice1-trial-owner-7333f832a973d428",
+                "D": "voice1-server-trial-7333f832a973d428",
+                "N": "VOICE1-TRIAL-7333f832a973d428",
+                "I": "recorder-next:voice1:isolated-trial:7333f832a973d428",
+                "P": "b961f648-3f79-5f92-9ed7-aeceb087fa02",
+                "L": "project:b961f648-3f79-5f92-9ed7-aeceb087fa02:default",
+                "S": SELECTED_S,
+            },
+            "phase_params": {},
+            "admission_report": None,
+        }
+        expected = _signal_fixture_a1_params(context)
+        # 1. committed rows preserved: the exact A1 device row exists.
+        conn = sqlite3.connect(str(db_path))
+        try:
+            rows = conn.execute(
+                "SELECT user_id,device_id,kind,status,created_at,revoked_at FROM devices WHERE device_id=?",
+                (expected["device_id"],),
+            ).fetchall()
+        finally:
+            conn.close()
+        self.assertEqual(
+            rows,
+            [(
+                expected["device_user_id"], expected["device_id"], expected["kind"],
+                expected["device_status"], expected["device_created_at"], expected["revoked_at"],
+            )],
+            f"{signal_name}: the committed A1 device row must be preserved",
+        )
+        # 2. nothing was synthesized: no A1 receipt leaf and no custody entry.
+        self.assertFalse((root / "receipts" / "a1.created.json").exists(),
+                         f"{signal_name}: no A1 receipt may exist inside the gap")
+        self.assertFalse((root / "receipts" / "custody" / "a1.created.json.custody").exists(),
+                         f"{signal_name}: no A1 custody entry may exist inside the gap")
+        # 3. the preserved out-of-band pin still authenticates the INTENT
+        # prefix from this fresh process.
+        probe = dict(context)
+        conn = _connect_fixture(probe)
+        try:
+            probe["protected_logical_digest"] = _protected_logical_digest(conn, probe)
+        finally:
+            conn.close()
+        pin = (root / "gap.head").read_text(encoding="utf-8")
+        prefix = load_attempt_prefix(probe, pin)
+        self.assertEqual([receipt["phase"] for receipt in prefix], ["INTENT"],
+                         f"{signal_name}: fresh re-entry must authenticate the INTENT prefix")
+        # 4. re-running A1 collides with the real committed rows and is
+        # refused; nothing is retried, adopted, or synthesized.
+        with self.assertRaises(AttemptContextError) as caught:
+            execute_attempt_phase(probe, "A1", pin)
+        self.assertEqual(str(caught.exception), "A1 requires all target rows absent",
+                         f"{signal_name}: refusal must come from the real committed rows")
+        # 5. the refusal changed nothing.
+        self.assertFalse((root / "receipts" / "a1.created.json").exists(),
+                         f"{signal_name}: refused re-entry must not publish anything")
+
+    def test_sigint_in_commit_receipt_gap_is_classified_commit_uncertain(self):
+        process, root = self._run_gap_child("signal", "SIGINT")
+        process.wait(timeout=15)
+        # KeyboardInterrupt escapes publication through the executor's
+        # conservative BaseException path; exit semantics stay nonzero.
+        self.assertEqual(process.returncode, 70,
+                         "SIGINT must not exit 0; conservative classification expected")
+        outcome = json.loads((root / "gap.result.json").read_text(encoding="utf-8"))
+        self.assertEqual(outcome["status"], "HOLD")
+        self.assertEqual(outcome["state"], "COMMIT_UNCERTAIN")
+        self.assertEqual(outcome["creation_outcome"], "commit_uncertain")
+        self._assert_uncertain_after_gap(root, "SIGINT")
+
+    def test_sigterm_in_commit_receipt_gap_preserves_uncertain_rows(self):
+        process, root = self._run_gap_child("signal", "SIGTERM")
+        process.wait(timeout=15)
+        # Default SIGTERM disposition terminates the process mid-gap.
+        self.assertEqual(process.returncode, -signal.SIGTERM,
+                         "SIGTERM must terminate the child inside the gap")
+        self.assertFalse((root / "gap.result.json").exists())
+        self._assert_uncertain_after_gap(root, "SIGTERM")
+
+    def test_hard_kill_in_commit_receipt_gap_preserves_uncertain_rows(self):
+        process, root = self._run_gap_child("hard-kill", "SIGKILL")
+        process.kill()
+        process.wait(timeout=15)
+        self.assertEqual(process.returncode, -signal.SIGKILL)
+        self.assertFalse((root / "gap.result.json").exists())
+        self._assert_uncertain_after_gap(root, "SIGKILL")
+
+
 if __name__ == "__main__":
+    _gap_args = sys.argv[1:]
+    if len(_gap_args) == 2 and _gap_args[0] == "--voice1-gap-child":
+        # Fixture-only signal-gap child mode (R-GAP evidence); it is not an
+        # admission invocation and never touches live paths or credentials.
+        _signal_fixture_bootstrap(_gap_args[1], os.environ.get("VOICE1_GAP_ROOT", ""))
+        raise SystemExit(5)  # bootstrap only ever exits via SystemExit
     raise SystemExit(main())
