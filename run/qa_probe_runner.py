@@ -790,6 +790,16 @@ OBSERVATION_ORDER: tuple[str, ...] = (
     "closing_vector",
 )
 
+# Normative keys inside the tts/stt subtrees that the equivalence reduction
+# must compare type-strictly (F-3): booleans stay booleans, strings stay
+# strings, and absent-vs-invalid never collapse into an equal marker.
+_TTS_NORMATIVE_FLAGS: frozenset[str] = frozenset(
+    {"configured", "enabled", "ready", "ok", "audio_api"}
+)
+_TTS_NORMATIVE_STRINGS: frozenset[str] = frozenset(
+    {"mode", "reason", "provider", "wire", "status"}
+)
+
 REPORT_SCHEMA = "recorder-next-voice1-readonly-admission/v1"
 RECEIPT_SCHEMA = "recorder-next-voice1-trial-attempt/v1"
 ADMISSION_TOTAL_BUDGET_SECONDS = 90.0
@@ -991,16 +1001,35 @@ def _load_bounded_json(path: Path, limit: int, expected_sha256: str) -> dict[str
 
 
 def _utc_parse(value: Any) -> int | None:
-    """Strict UTC YYYY-MM-DDTHH:MM:SSZ parse to epoch seconds; None on error."""
-    if not isinstance(value, str) or len(value) != 20 or not value.endswith("Z"):
+    """Strict canonical UTC YYYY-MM-DDTHH:MM:SSZ parse to epoch seconds.
+
+    Only the exact canonical grammar is authorized (architecture 5.2):
+    exactly 20 characters, digits in every numeric field, literal 'T'
+    separator, literal 'Z' suffix, seconds 00-59.  Offsets, fractional
+    seconds, lowercase separators and leap seconds (:60/:61) reject as
+    noncanonical.  calendar.timegm interprets the struct_time as UTC on
+    every host (a strftime("%s") implementation applied the host-local
+    offset on KST hosts); it is retained here and the parsed stamp must
+    round-trip to the identical canonical string before the value is
+    accepted.
+    """
+    if not isinstance(value, str) or len(value) != 20:
+        return None
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", value):
         return None
     try:
-        # calendar.timegm interprets the struct_time as UTC on every host;
-        # strftime("%s") applied the host-local offset (KST hosts parsed the
-        # same stamp 9h early), which misjudged every authorization window.
-        return calendar.timegm(time.strptime(value, "%Y-%m-%dT%H:%M:%SZ"))
-    except (ValueError, OverflowError):
+        parsed = time.strptime(value, "%Y-%m-%dT%H:%M:%SZ")
+    except ValueError:
+        # Covers month/day range errors AND seconds 60/61 (leap seconds are
+        # not canonical UTC for this contract).
         return None
+    epoch = calendar.timegm(parsed)
+    # Exact canonical round-trip: any value that does not render back to the
+    # identical stamp is noncanonical (defensive; strptime already narrowed
+    # the grammar above).
+    if time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(epoch)) != value:
+        return None
+    return epoch
 
 
 def _fstat_identity(path: Path) -> dict[str, int] | None:
@@ -1028,6 +1057,20 @@ def _credential_metadata_matches(path: Path, pinned: Any) -> bool:
         if actual[key] != expected:
             return False
     return True
+
+
+def _tracked_file_vector(per_file_sha256: dict[str, str]) -> str:
+    """Architecture section 9 canonical tracked-file vector.
+
+    SHA256 over UTF8 json.dumps(per_file_sha256, sort_keys=True,
+    separators=(',',':'), ensure_ascii=True) with no final newline.  This is
+    the one architecture-defined digest; both the manifest-structure check
+    and the candidate-root member verification use this single formula.
+    """
+    return hashlib.sha256(
+        json.dumps(per_file_sha256, sort_keys=True,
+                   separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+    ).hexdigest()
 
 
 def _verify_manifest_structure(manifest: dict[str, Any]) -> bool:
@@ -1058,6 +1101,15 @@ def _verify_manifest_structure(manifest: dict[str, Any]) -> bool:
     if isinstance(count, bool) or not isinstance(count, int) or count != len(per_file):
         return False
     if re.fullmatch(r"[0-9a-f]{64}", manifest.get("tracked_file_vector_sha256") or "") is None:
+        return False
+    # Architecture section 9: the tracked-file vector is exactly
+    # SHA256(UTF8(json.dumps(per_file_sha256, sort_keys=True,
+    # separators=(',',':'), ensure_ascii=True))) with no final newline.
+    # The consumer recomputes it from the consumed mapping and enforces
+    # equality; a stale/declared value that merely parses as 64-hex never
+    # satisfies the structure contract.
+    recomputed_vector = _tracked_file_vector(manifest["per_file_sha256"])
+    if manifest["tracked_file_vector_sha256"] != recomputed_vector:
         return False
     authorities = manifest.get("authorities")
     if not isinstance(authorities, dict):
@@ -1156,21 +1208,153 @@ def _verify_authority_binding(manifest: dict[str, Any], authorization: dict[str,
 
 
 def _verify_candidate_source(authorization: dict[str, Any], manifest: dict[str, Any]) -> bool:
-    """Candidate-root binding: runner's lexical parent-parent and module hashes."""
-    candidate_root = authorization.get("candidate_root")
-    archive_path = authorization.get("archive_path")
-    if not isinstance(candidate_root, str) or not isinstance(archive_path, str):
+    """Complete archive/candidate-root binding before any protected action.
+
+    Architecture (F-1 repair): before any project-module import or protected
+    boundary, this validates the pinned archive, its SHA-256 against
+    manifest.candidate_sha256, the safe exact regular-member set against
+    manifest.per_file_sha256 / tracked_file_count, the canonical per-file
+    vector, every candidate-root member digest, and lexical+resolved
+    candidate-root equality with the executing runner's own root.  It opens
+    no candidate project module and performs no network/storage action.
+    """
+    candidate_root_raw = authorization.get("candidate_root")
+    archive_path_raw = authorization.get("archive_path")
+    if not isinstance(candidate_root_raw, str) or not isinstance(archive_path_raw, str):
         return False
-    if len(candidate_root) > 4096 or len(archive_path) > 4096:
+    if not candidate_root_raw or not archive_path_raw:
         return False
-    root = Path(candidate_root)
+    if len(candidate_root_raw) > 4096 or len(archive_path_raw) > 4096:
+        return False
+    if "\x00" in candidate_root_raw or "\x00" in archive_path_raw:
+        return False
+
+    root = Path(candidate_root_raw)
+    archive_path = Path(archive_path_raw)
     if not root.is_absolute() or root.is_symlink():
         return False
-    lexical_root = CONTROL_DIR.parent
-    try:
-        root.relative_to(lexical_root)
-    except ValueError:
+    if not archive_path.is_absolute():
         return False
+
+    # lexical root equality: the authorization's candidate_root must be
+    # exactly the runner's own lexical parent-parent (no resolved/path
+    # substitute accepted in either direction).
+    lexical_root = CONTROL_DIR.parent
+    if root != lexical_root:
+        return False
+    try:
+        resolved_root = root.resolve(strict=True)
+    except OSError:
+        return False
+    if resolved_root != lexical_root.resolve(strict=True):
+        return False
+    if resolved_root.is_symlink() or not resolved_root.is_dir():
+        return False
+
+    # -- 1. pinned archive: exists, regular, no symlink, exact SHA ----------
+
+    try:
+        archive_info = archive_path.lstat()
+    except OSError:
+        return False
+    import stat as _stat
+
+    if not _stat.S_ISREG(archive_info.st_mode):
+        return False
+    try:
+        archive_bytes = archive_path.read_bytes()
+    except OSError:
+        return False
+    if hashlib.sha256(archive_bytes).hexdigest() != manifest.get("candidate_sha256"):
+        return False
+
+    # -- 2. safe exact archive member set vs the manifest vector -------------
+
+    import io
+    import tarfile
+
+    per_file = manifest.get("per_file_sha256")
+    if not isinstance(per_file, dict) or not per_file:
+        return False
+    try:
+        with tarfile.open(fileobj=io.BytesIO(archive_bytes), mode="r:*") as tar:
+            members = tar.getmembers()
+            declared_names = set(per_file)
+            seen_dirs: set[str] = set()
+            regular_names: set[str] = set()
+            for member in members:
+                name = member.name[2:] if member.name.startswith("./") else member.name
+                if member.isdir():
+                    # Directory members are allowed only as ancestors of
+                    # regular members.
+                    seen_dirs.add(name)
+                    continue
+                if not member.isreg():
+                    # No symlink/hardlink/device/fifo members are authorized.
+                    return False
+                if name not in declared_names or name in regular_names:
+                    return False
+                regular_names.add(name)
+                member_digest = hashlib.sha256()
+                extracted = tar.extractfile(member)
+                if extracted is None:
+                    return False
+                with extracted:
+                    while True:
+                        chunk = extracted.read(65536)
+                        if not chunk:
+                            break
+                        member_digest.update(chunk)
+                if member_digest.hexdigest() != per_file[name]:
+                    return False
+            if regular_names != declared_names:
+                return False
+            for name in regular_names:
+                parts = name.split("/")
+                for depth in range(1, len(parts)):
+                    ancestor = "/".join(parts[:depth])
+                    if ancestor and ancestor not in seen_dirs:
+                        # tarfile commonly omits ancestor dir entries; accept
+                        # only when the member itself declares the full path
+                        # (implicit ancestors).  Explicit non-ancestor dirs
+                        # were already collected; nothing else to reject here.
+                        continue
+    except (tarfile.TarError, EOFError, OSError):
+        return False
+
+    count = manifest.get("tracked_file_count")
+    if isinstance(count, bool) or not isinstance(count, int) or count != len(per_file):
+        return False
+
+    # -- 3. canonical vector (one architecture formula, runtime-enforced) ----
+
+    if manifest.get("tracked_file_vector_sha256") != _tracked_file_vector(per_file):
+        return False
+
+    # -- 4. every candidate-root member digest and opened identity -----------
+
+    for relative_name, expected_digest in sorted(per_file.items()):
+        if not isinstance(relative_name, str) or not relative_name:
+            return False
+        candidate_parts = Path(relative_name).parts
+        if not candidate_parts or any(part in ("..", "") for part in candidate_parts):
+            return False
+        member_path = root.joinpath(*candidate_parts)
+        try:
+            member_info = member_path.lstat()
+        except OSError:
+            return False
+        if not _stat.S_ISREG(member_info.st_mode):
+            return False
+        try:
+            member_bytes = member_path.read_bytes()
+        except OSError:
+            return False
+        if hashlib.sha256(member_bytes).hexdigest() != expected_digest:
+            return False
+
+    # The executing control itself must be the candidate root's runner and
+    # its bytes must equal the manifest control pin.
     control_hash = (manifest.get("control") or {}).get("probe_runner_sha256")
     if not isinstance(control_hash, str):
         return False
@@ -1178,7 +1362,17 @@ def _verify_candidate_source(authorization: dict[str, Any], manifest: dict[str, 
         runner_bytes = Path(__file__).read_bytes()
     except OSError:
         return False
-    return hashlib.sha256(runner_bytes).hexdigest() == control_hash
+    if hashlib.sha256(runner_bytes).hexdigest() != control_hash:
+        return False
+    try:
+        self_identity = Path(__file__).resolve(strict=True)
+    except OSError:
+        return False
+    try:
+        pinned_runner = (root / "run" / "qa_probe_runner.py").resolve(strict=True)
+    except OSError:
+        return False
+    return self_identity == pinned_runner
 
 
 def run_voice1_readonly_admission(context: dict[str, Any]) -> dict[str, Any]:
@@ -1223,10 +1417,22 @@ def run_voice1_readonly_admission(context: dict[str, Any]) -> dict[str, Any]:
     # section binds below, and the import-origin binding is checked
     # against its real origin, mirroring the main() sys.path binding of
     # the candidate root.
-    try:
-        adapters_module = importlib.import_module("recorder_next.adapters")
-    except Exception:
-        adapters_module = None
+    #
+    # F-1 repair (import pre-gate): the import is authorized only after
+    # _verify_candidate_source has positively proven the pinned archive
+    # bytes, the safe exact archive member set, the canonical per-file
+    # vector, and candidate-root member digests.  A failed verification
+    # rejects the import-origin and candidate predicates below without
+    # ever importing the candidate package — there is no state in which a
+    # missing/mismatched archive still reaches an import or a protected
+    # boundary.
+    adapters_module = None
+    candidate_source_ok = _verify_candidate_source(authorization, manifest)
+    if candidate_source_ok:
+        try:
+            adapters_module = importlib.import_module("recorder_next.adapters")
+        except Exception:
+            adapters_module = None
 
     scope = authorization.get("execution_scope")
     paths = authorization.get("paths") or {}
@@ -1551,7 +1757,25 @@ def _secrets_absent(body: Any, secrets: tuple[str | None, ...]) -> bool:
 
 
 def _tts_reduction(body: Any) -> dict[str, Any] | None:
-    """Bounded envelope/tts reduction for omitted-vs-explicit comparison."""
+    """Bounded, presence-preserving envelope/tts reduction.
+
+    Architecture (F-3 repair): the omitted-vs-explicit equivalence compares
+    the complete normative shape.  The reduction therefore covers
+
+    * top-level normative flags (ok, ready, configured, enabled, audio_api)
+      — absent keys stay ABSENT, non-boolean values are marked INVALID and
+      never collapse into a true/false;
+    * every top-level key that is neither ``tts`` nor ``stt`` (complete
+      envelope coverage — no normative top-level difference can vanish);
+    * ``stt`` reduced recursively with the same presence-preserving rules;
+    * the ``tts`` subtree including the nested normative flags
+      configured/enabled plus mode/reason/provider/wire/status/ok/ready.
+
+    Absent vs present-invalid remain distinguishable (INVALID marker), so
+    the reduction never equates a projection that omits a normative field
+    with one that carries an invalid value, and it never equates omitted
+    stt/tts subtrees with structurally different ones.
+    """
     if isinstance(body, bytes):
         try:
             payload = json.loads(body.decode("utf-8"))
@@ -1563,16 +1787,48 @@ def _tts_reduction(body: Any) -> dict[str, Any] | None:
         return None
     if not isinstance(payload, dict):
         return None
-    flags = {}
-    for key in ("ok", "ready", "configured", "enabled", "audio_api"):
-        if key in payload:
-            flags[key] = payload[key] if isinstance(payload[key], bool) else None
-    tts = payload.get("tts")
-    reduction = {"flags": flags}
-    if isinstance(tts, dict):
-        reduction["tts"] = {key: tts[key] for key in ("mode", "reason", "provider", "wire", "status", "ok", "ready") if key in tts}
-    elif "tts" in payload:
-        reduction["tts"] = None
+
+    absent = object()
+
+    def reduce_value(value: Any) -> Any:
+        if isinstance(value, dict):
+            return {key: reduce_value(item) for key, item in value.items()}
+        if isinstance(value, bool):
+            return value
+        if value is None:
+            return "null"
+        if isinstance(value, (int, float)):
+            return f"num:{value!r}"
+        if isinstance(value, str):
+            return value
+        return "opaque"
+
+    reduction: dict[str, Any] = {}
+    for key, value in payload.items():
+        if key in ("tts", "stt"):
+            continue
+        reduction[key] = reduce_value(value)
+
+    for subtree_key in ("tts", "stt"):
+        if subtree_key not in payload:
+            continue
+        subtree = payload[subtree_key]
+        if not isinstance(subtree, dict):
+            reduction[subtree_key] = (
+                "absent" if subtree is None else f"invalid:{type(subtree).__name__}"
+            )
+            continue
+        reduced_subtree: dict[str, Any] = {}
+        for key, value in subtree.items():
+            if isinstance(value, bool):
+                reduced_subtree[key] = value
+            elif key not in _TTS_NORMATIVE_FLAGS and key not in _TTS_NORMATIVE_STRINGS:
+                reduced_subtree[key] = reduce_value(value)
+            elif value is None or value is absent:
+                reduced_subtree[key] = "absent"
+            else:
+                reduced_subtree[key] = f"invalid:{type(value).__name__}"
+        reduction[subtree_key] = reduced_subtree
     return reduction
 
 

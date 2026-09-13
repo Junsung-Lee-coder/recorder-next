@@ -1269,22 +1269,48 @@ class Voice1B6ExecutableClosureTests(unittest.TestCase):
     def _sobs_authority(self, tmp: Path, endpoints: dict[str, str], paths: dict[str, str],
                         metadata: dict[str, Any]) -> dict[str, Any]:
         """Final-shaped fixture_readonly authority bound to this worktree."""
-        runner_sha = hashlib.sha256((tmp.parent / "run" / "qa_probe_runner.py").read_bytes() if False else Path(self.control.__file__).read_bytes()).hexdigest()
+        runner_path = Path(self.control.__file__ or "run/qa_probe_runner.py")
+        runner_sha = hashlib.sha256(runner_path.read_bytes()).hexdigest()
+        candidate_root = runner_path.resolve().parents[1]
+        # Exact candidate-root member pins: the executable caller now
+        # verifies the pinned archive bytes, safe archive member set,
+        # canonical vector, and every candidate-root member digest before
+        # any import, so this fixture binds the REAL worktree digests and
+        # a REAL harmless archive whose bytes hash to candidate_sha256.
+        real_adapters_sha = hashlib.sha256(
+            (candidate_root / "recorder_next" / "adapters.py").read_bytes()
+        ).hexdigest()
+        import io as _io
+        import tarfile as _tarfile
+
+        per_file = {"recorder_next/adapters.py": real_adapters_sha}
+        archive_buf = _io.BytesIO()
+        with _tarfile.open(fileobj=archive_buf, mode="w") as tar:
+            member_bytes = (candidate_root / "recorder_next" / "adapters.py").read_bytes()
+            info = _tarfile.TarInfo(name="./recorder_next/adapters.py")
+            info.size = len(member_bytes)
+            tar.addfile(info, _io.BytesIO(member_bytes))
+        archive_bytes = archive_buf.getvalue()
+        archive_path = tmp / "fixture-candidate.tar"
+        archive_path.write_bytes(archive_bytes)
         manifest = {
             "schema": "recorder-next-voice1-b6-builder-candidate/v1",
             "generation": "VOICE1-B6",
             "product_identity": "recorder-next-server-voice-session-chain",
             "candidate_id": "fixture-candidate",
-            "candidate_sha256": "0" * 64,
+            "candidate_sha256": hashlib.sha256(archive_bytes).hexdigest(),
             "source_commit": "a" * 40,
             "source_tree": "b" * 40,
             "candidate_incomplete": False,
             "authorities": {"owner_packet_sha256": "1" * 64,
                             "specification_sha256": "2" * 64,
                             "inherited_specification_sha256": "3" * 64},
-            "per_file_sha256": {"recorder_next/adapters.py": "4" * 64},
+            "per_file_sha256": per_file,
             "tracked_file_count": 1,
-            "tracked_file_vector_sha256": "5" * 64,
+            "tracked_file_vector_sha256": hashlib.sha256(
+                json.dumps(per_file, sort_keys=True,
+                           separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+            ).hexdigest(),
             "control": {"packet_sha256": "6" * 64, "probe_runner_sha256": runner_sha},
         }
         mp = tmp / "candidate-manifest.json"
@@ -1294,7 +1320,7 @@ class Voice1B6ExecutableClosureTests(unittest.TestCase):
             "execution_scope": "fixture_readonly",
             "product_identity": "recorder-next-server-voice-session-chain",
             "candidate_id": "fixture-candidate",
-            "candidate_sha256": "0" * 64,
+            "candidate_sha256": hashlib.sha256(archive_bytes).hexdigest(),
             "manifest_sha256": hashlib.sha256(mp.read_bytes()).hexdigest(),
             "source_commit": "a" * 40,
             "source_tree": "b" * 40,
@@ -1304,7 +1330,7 @@ class Voice1B6ExecutableClosureTests(unittest.TestCase):
             "inherited_specification_sha256": "3" * 64,
             "owner_packet_sha256": "1" * 64,
             "candidate_root": str(Path(self.control.__file__).resolve().parents[1]),
-            "archive_path": str(tmp / "archive.tar"),
+            "archive_path": str(tmp / "fixture-candidate.tar"),
             "approved_actions": ["candidate_verify", "credential_read", "unauthenticated_get",
                                  "api_capability_get", "audio_readiness_get", "session_get",
                                  "persisted_metadata_select", "closing_verify"],
