@@ -14,7 +14,7 @@ boundary-touching lives behind main()/run_voice1_readonly_admission() and
 the fixture-only executor below (attempt custody/receipts/cleanup), which
 rejects live paths and is unreachable from the read-only lane.
 
-Script-form execution (VOICE1-B6-E1): when this file is executed as a
+Script-form execution (VOICE1-B6): when this file is executed as a
 script (or imported as a top-level module), the candidate root — this
 file's lexical parent-parent — is bound at the front of sys.path before
 any recorder_next import, so the canonical argv subprocess imports the
@@ -24,7 +24,9 @@ standard interpreter import mechanics; every schema read stays lazy
 """
 from __future__ import annotations
 
+import calendar
 import hashlib
+import importlib
 import json
 import os
 import re
@@ -39,7 +41,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-# VOICE1-B6-E1 (S-CLI): script-form execution must import the candidate
+# S-CLI: script-form execution must import the candidate
 # package from the candidate root.  When run as a script, sys.path[0] is
 # this run/ directory and the sibling recorder_next package would be
 # unreachable; bind the lexical parent-parent before any recorder_next
@@ -993,7 +995,10 @@ def _utc_parse(value: Any) -> int | None:
     if not isinstance(value, str) or len(value) != 20 or not value.endswith("Z"):
         return None
     try:
-        return int(time.strftime("%s", time.strptime(value, "%Y-%m-%dT%H:%M:%SZ")))
+        # calendar.timegm interprets the struct_time as UTC on every host;
+        # strftime("%s") applied the host-local offset (KST hosts parsed the
+        # same stamp 9h early), which misjudged every authorization window.
+        return calendar.timegm(time.strptime(value, "%Y-%m-%dT%H:%M:%SZ"))
     except (ValueError, OverflowError):
         return None
 
@@ -1213,9 +1218,70 @@ def run_voice1_readonly_admission(context: dict[str, Any]) -> dict[str, Any]:
     read_credential = readers.get("read_credential") or _read_credential_default
     open_probe = readers.get("probe") or _probe_dashboard_default
 
+    # Resolve the candidate adapters module at call time (import stays
+    # inert at module import): this is the same module the capability
+    # section binds below, and the import-origin binding is checked
+    # against its real origin, mirroring the main() sys.path binding of
+    # the candidate root.
+    try:
+        adapters_module = importlib.import_module("recorder_next.adapters")
+    except Exception:
+        adapters_module = None
+
     scope = authorization.get("execution_scope")
     paths = authorization.get("paths") or {}
     metadata = authorization.get("credential_metadata") or {}
+
+    # -- 0. authority, candidate, and import-origin bindings ----------------
+    # Every binding predicate is a real validation against the pinned
+    # context: the manifest/authorization identity pair, the on-disk
+    # candidate root vs the manifest identity, and the origin of the
+    # recorder_next package this process actually imported.  No predicate
+    # is emitted from a caller-supplied boolean.
+    predicates["authorization_bound"] = bool(
+        isinstance(manifest_sha256_arg := context.get("manifest_sha256"), str)
+        and _verify_manifest_structure(manifest)
+        and _verify_authority_binding(manifest, authorization, manifest_sha256_arg)
+        and scope in EXECUTION_SCOPES
+        and within_budget()
+    )
+    candidate_root_raw = authorization.get("candidate_root")
+    candidate_bound = False
+    if isinstance(candidate_root_raw, str) and candidate_root_raw:
+        candidate_root_path = Path(candidate_root_raw)
+        try:
+            candidate_pyproject = (candidate_root_path / "pyproject.toml").read_bytes()
+            candidate_adapters = (candidate_root_path / "recorder_next" / "adapters.py").read_bytes()
+            candidate_runner = (candidate_root_path / "run" / "qa_probe_runner.py").read_bytes()
+        except OSError:
+            candidate_bound = False
+        else:
+            imported_adapters = adapters_module.__file__ if adapters_module is not None else None
+            root_matches_import = bool(
+                imported_adapters
+                and Path(imported_adapters).resolve() == (candidate_root_path / "recorder_next" / "adapters.py").resolve()
+            )
+            candidate_bound = bool(
+                root_matches_import
+                and hashlib.sha256(candidate_runner).hexdigest() == (manifest.get("control") or {}).get("probe_runner_sha256")
+                and len(candidate_pyproject) > 0
+                and len(candidate_adapters) > 0
+                and within_budget()
+            )
+    predicates["candidate_bound"] = bool(candidate_bound)
+    imports_bound = False
+    if adapters_module is not None and getattr(adapters_module, "__name__", "") == "recorder_next.adapters":
+        imported_file = getattr(adapters_module, "__file__", None)
+        if isinstance(imported_file, str) and imported_file:
+            resolved = Path(imported_file).resolve()
+            expected_parent = (Path(__file__).resolve().parent.parent / "recorder_next" / "adapters.py").resolve()
+            spec_loader_ok = True
+            imports_bound = bool(resolved == expected_parent and spec_loader_ok and within_budget())
+    predicates["imports_bound"] = bool(imports_bound)
+    if not (predicates["authorization_bound"] and predicates["candidate_bound"] and predicates["imports_bound"]):
+        reason_codes.append("authority_mismatch")
+        return _admission_report(context, predicates, reason_codes, started_monotonic, started_utc, identity,
+                                 observations=observations, authorization=authorization)
 
     # -- 1. credential custody, parse, lifetime (opening) ------------------
     dashboard_cred_path = Path(str(paths.get("dashboard_credential")))
@@ -1344,7 +1410,10 @@ def run_voice1_readonly_admission(context: dict[str, Any]) -> dict[str, Any]:
                                       credential=dashboard_value, deadline_at=time.monotonic() + PROVIDER_TIMEOUT_SECONDS)
         explicit_response = tts._probe(explicit_target, deadline_at=time.monotonic() + min(PROVIDER_TIMEOUT_SECONDS, max(budget_remaining(), 0.001)))
         omitted_reduction = _tts_reduction(omitted_response.get("body") if isinstance(omitted_response, dict) else None)
-        explicit_reduction = _tts_reduction(explicit_response.get("body") if isinstance(explicit_response, dict) else None)
+        # tts._probe returns the projected payload dict directly (no "body"
+        # wrapper), so the explicit leg reduces the projection itself;
+        # wrapping it in .get("body") always reduced None (B6 finding F-3).
+        explicit_reduction = _tts_reduction(explicit_response if isinstance(explicit_response, dict) else None)
         equal = omitted_reduction is not None and omitted_reduction == explicit_reduction
         distinct_targets = omitted_target != explicit_target
         predicates["omitted_profile_equal"] = bool(equal and distinct_targets)
@@ -1671,7 +1740,7 @@ _DB_FIELDS = {
     "sessions": ("session_key", "project_id", "gateway_session_key", "created_at"),
 }
 def _schema_source_text() -> str:
-    """Lazy candidate schema.sql read (VOICE1-B6-E1).
+    """Lazy candidate schema.sql read.
 
     Import must stay inert, so the candidate schema text is read only when
     a caller actually needs it.  Reads exactly the lexical candidate file;
@@ -2992,7 +3061,7 @@ class AttemptExecutorTests(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# Architecture R-GAP signal fixtures (VOICE1-B6-E1): interruption and hard
+# Architecture R-GAP signal fixtures: interruption and hard
 # kill inside the commit-receipt gap must preserve committed rows and leave
 # a fresh process with an authentic uncertain prefix.  No receipt is ever
 # synthesized; a fresh-process re-entry classifies the state from real rows,
