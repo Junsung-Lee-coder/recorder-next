@@ -1293,6 +1293,9 @@ class Voice1B6ExecutableClosureTests(unittest.TestCase):
         archive_bytes = archive_buf.getvalue()
         archive_path = tmp / "fixture-candidate.tar"
         archive_path.write_bytes(archive_bytes)
+        fixture_root = tmp / "fixture-root"
+        fixture_root.mkdir(exist_ok=True)
+        fixture_root.chmod(0o700)
         manifest = {
             "schema": "recorder-next-voice1-b6-builder-candidate/v1",
             "generation": "VOICE1-B6",
@@ -1302,9 +1305,9 @@ class Voice1B6ExecutableClosureTests(unittest.TestCase):
             "source_commit": "a" * 40,
             "source_tree": "b" * 40,
             "candidate_incomplete": False,
-            "authorities": {"owner_packet_sha256": "1" * 64,
-                            "specification_sha256": "2" * 64,
-                            "inherited_specification_sha256": "3" * 64},
+            "authorities": {"owner_packet_sha256": self.control.RATIFIED_OWNER_PACKET_SHA256,
+                            "specification_sha256": self.control.RATIFIED_ADDENDUM_SHA256,
+                            "inherited_specification_sha256": self.control.RATIFIED_INHERITED_SPEC_SHA256},
             "per_file_sha256": per_file,
             "tracked_file_count": 1,
             "tracked_file_vector_sha256": hashlib.sha256(
@@ -1326,9 +1329,9 @@ class Voice1B6ExecutableClosureTests(unittest.TestCase):
             "source_tree": "b" * 40,
             "control_sha256": runner_sha,
             "control_packet_sha256": "6" * 64,
-            "specification_sha256": "2" * 64,
-            "inherited_specification_sha256": "3" * 64,
-            "owner_packet_sha256": "1" * 64,
+            "specification_sha256": self.control.RATIFIED_ADDENDUM_SHA256,
+            "inherited_specification_sha256": self.control.RATIFIED_INHERITED_SPEC_SHA256,
+            "owner_packet_sha256": self.control.RATIFIED_OWNER_PACKET_SHA256,
             "candidate_root": str(Path(self.control.__file__).resolve().parents[1]),
             "archive_path": str(tmp / "fixture-candidate.tar"),
             "approved_actions": ["candidate_verify", "credential_read", "unauthenticated_get",
@@ -1346,6 +1349,7 @@ class Voice1B6ExecutableClosureTests(unittest.TestCase):
         ap = tmp / "authorization.json"
         ap.write_text(json.dumps(authorization), encoding="utf-8")
         return {"manifest": manifest, "authorization": authorization,
+                "manifest_path": str(mp), "authorization_path": str(ap),
                 "manifest_sha256": hashlib.sha256(mp.read_bytes()).hexdigest(),
                 "authorization_sha256": hashlib.sha256(ap.read_bytes()).hexdigest()}
 
@@ -1358,13 +1362,16 @@ class Voice1B6ExecutableClosureTests(unittest.TestCase):
         control = self.control
 
         def authority(tmp: Path, **overrides: Any) -> dict[str, Any]:
-            endpoints = overrides.pop("endpoints", {"api_base_url": "http://127.0.0.1:1",
-                                                    "dashboard_base_url": "http://127.0.0.1:2"})
+            endpoints = overrides.pop("endpoints", {"api_base_url": "http://127.0.0.1:41001",
+                                                    "dashboard_base_url": "http://127.0.0.1:41002"})
+            fixture_root = tmp / "fixture-root"
+            fixture_root.mkdir(exist_ok=True)
+            fixture_root.chmod(0o700)
             paths = overrides.pop("paths", {
-                "dashboard_credential": str(tmp / "dash.env"),
-                "dashboard_metadata": str(tmp / "dash.meta.json"),
-                "api_credential": str(tmp / "api.env"),
-                "persisted_db": str(tmp / "db.sqlite3"),
+                "dashboard_credential": str(fixture_root / "dash.env"),
+                "dashboard_metadata": str(fixture_root / "dash.meta.json"),
+                "api_credential": str(fixture_root / "api.env"),
+                "persisted_db": str(fixture_root / "db.sqlite3"),
             })
             metadata = overrides.pop("credential_metadata", {
                 "dashboard_credential": {"device": 0, "inode": 0, "uid": 0, "gid": 0, "mode": 0},
@@ -1385,19 +1392,22 @@ class Voice1B6ExecutableClosureTests(unittest.TestCase):
         # Metadata lifetime below the 3900s floor.
         with tempfile.TemporaryDirectory() as raw:
             tmp = Path(raw)
-            dash = tmp / "dash.env"
+            fixture_root = tmp / "fixture-root"
+            fixture_root.mkdir(exist_ok=True)
+            fixture_root.chmod(0o700)
+            dash = fixture_root / "dash.env"
             dash.write_text("API_SERVER_KEY=x\n", encoding="ascii")
             dash.chmod(0o600)
             info = dash.stat()
             pin = {"device": info.st_dev, "inode": info.st_ino, "uid": info.st_uid,
                    "gid": info.st_gid, "mode": info.st_mode & 0o7777}
-            api = tmp / "api.env"
+            api = fixture_root / "api.env"
             api.write_text("API_SERVER_KEY=y\n", encoding="ascii")
             api.chmod(0o600)
             api_info = api.stat()
             api_pin = {"device": api_info.st_dev, "inode": api_info.st_ino, "uid": api_info.st_uid,
                        "gid": api_info.st_gid, "mode": api_info.st_mode & 0o7777}
-            meta_path = tmp / "dash.meta.json"
+            meta_path = fixture_root / "dash.meta.json"
             short = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 1200))
             meta_path.write_text(json.dumps({"expires_at_utc": short}), encoding="utf-8")
             context = authority(
@@ -1480,6 +1490,190 @@ class Voice1B6ExecutableClosureTests(unittest.TestCase):
         self.assertTrue(check('{"status": "unauthorized"}', ("dash", "api")))
         self.assertFalse(check(b'{"token": "dash"}', ("dash", "api")))
         self.assertFalse(check(b"unauthorized", (None, "api")))
+
+
+class Voice1B6E4FindingRegressionTests(unittest.TestCase):
+    """Focused RED tests for the six E4 review findings."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        control_dir = Path(__file__).resolve().parents[1] / "run"
+        if str(control_dir) not in sys.path:
+            sys.path.insert(0, str(control_dir))
+        import qa_probe_runner as control
+
+        cls.control = control
+
+    def _manifest(self) -> dict[str, Any]:
+        runner = Path(self.control.__file__ or "run/qa_probe_runner.py")
+        adapters = runner.parents[1] / "recorder_next" / "adapters.py"
+        per_file = {"recorder_next/adapters.py": hashlib.sha256(adapters.read_bytes()).hexdigest()}
+        vector = hashlib.sha256(
+            json.dumps(per_file, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+        ).hexdigest()
+        return {
+            "schema": "recorder-next-voice1-b6-builder-candidate/v1",
+            "generation": "VOICE1-B6",
+            "product_identity": "recorder-next-server-voice-session-chain",
+            "candidate_id": "fixture-candidate",
+            "candidate_sha256": "0" * 64,
+            "source_commit": "a" * 40,
+            "source_tree": "b" * 40,
+            "candidate_incomplete": False,
+            "authorities": {
+                "owner_packet_sha256": "6735b40c2eeeb716fb307d73cb603c940b24a78cab9cb29ddf6b696b1e99a3ec",
+                "specification_sha256": "758fcf9642ea21e7017b70e0851a88f3c11d7c0ee727e16516b923e8f8f1085e",
+                "inherited_specification_sha256": "ce1c23271239d330e7125ded8ecb6b32d0a3bee8c5d2a07118693c3065df3de1",
+            },
+            "per_file_sha256": per_file,
+            "tracked_file_count": 1,
+            "tracked_file_vector_sha256": vector,
+            "control": {
+                "packet_sha256": "6" * 64,
+                "probe_runner_sha256": hashlib.sha256(runner.read_bytes()).hexdigest(),
+            },
+        }
+
+    def _authorization(self, root: Path, manifest: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "schema": "recorder-next-voice1-readonly-authorization/v1",
+            "execution_scope": "fixture_readonly",
+            "product_identity": "recorder-next-server-voice-session-chain",
+            "candidate_id": manifest["candidate_id"],
+            "candidate_sha256": manifest["candidate_sha256"],
+            "manifest_sha256": hashlib.sha256(b"manifest").hexdigest(),
+            "source_commit": manifest["source_commit"],
+            "source_tree": manifest["source_tree"],
+            "control_sha256": manifest["control"]["probe_runner_sha256"],
+            "control_packet_sha256": manifest["control"]["packet_sha256"],
+            "specification_sha256": manifest["authorities"]["specification_sha256"],
+            "inherited_specification_sha256": manifest["authorities"]["inherited_specification_sha256"],
+            "owner_packet_sha256": manifest["authorities"]["owner_packet_sha256"],
+            "candidate_root": str(Path(self.control.__file__ or "run/qa_probe_runner.py").resolve().parents[1]),
+            "archive_path": str(root / "candidate.tar"),
+            "approved_actions": list(self.control.APPROVED_ACTIONS),
+            "endpoints": {"api_base_url": "http://127.0.0.1:41001", "dashboard_base_url": "http://127.0.0.1:41002"},
+            "paths": {
+                "dashboard_credential": str(root / "dashboard.env"),
+                "dashboard_metadata": str(root / "dashboard.meta.json"),
+                "api_credential": str(root / "api.env"),
+                "persisted_db": str(root / "state.db"),
+            },
+            "credential_metadata": {
+                "dashboard_credential": {"device": 1, "inode": 2, "uid": 3, "gid": 4, "mode": 0o600},
+                "api_credential": {"device": 1, "inode": 5, "uid": 3, "gid": 4, "mode": 0o600},
+            },
+            "selected_session_id_sha256": self.control.EXPECTED_S_SHA256,
+            "persisted_key_sha256": self.control.FIXTURE_KEY_SHA256,
+            "not_before_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 60)),
+            "expires_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 3600)),
+            "fixture_root": str(root),
+        }
+
+    def test_malformed_manifest_scalar_is_structured_hold_without_stderr(self):
+        manifest = self._manifest()
+        manifest["candidate_sha256"] = 1
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            mp = root / "manifest.json"
+            ap = root / "authorization.json"
+            mp.write_text(json.dumps(manifest), encoding="utf-8")
+            ap.write_text("{}", encoding="utf-8")
+            argv = [
+                "--read-only-admission", "--manifest", str(mp),
+                "--manifest-sha256", hashlib.sha256(mp.read_bytes()).hexdigest(),
+                "--authorization", str(ap),
+                "--authorization-sha256", hashlib.sha256(ap.read_bytes()).hexdigest(),
+            ]
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                exit_code = self.control.main(argv)
+        report = json.loads(stdout.getvalue())
+        self.assertEqual(exit_code, 2)
+        self.assertEqual(report["status"], "HOLD")
+        self.assertEqual(report["status_code"], 2)
+        self.assertEqual(stderr.getvalue(), "")
+
+    def test_authority_binding_enforces_scope_specific_paths_and_endpoints(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            root.chmod(0o700)
+            manifest = self._manifest()
+            authorization = self._authorization(root, manifest)
+            manifest_sha = authorization["manifest_sha256"]
+            self.assertTrue(self.control._verify_authority_binding(manifest, authorization, manifest_sha))
+            for field, value in (
+                ("endpoints", {"api_base_url": "http://example.com:443", "dashboard_base_url": "http://127.0.0.1:41002"}),
+                ("paths", {**authorization["paths"], "persisted_db": "/etc/passwd"}),
+                ("fixture_root", "/tmp/not-the-private-root"),
+            ):
+                mutated = dict(authorization)
+                mutated[field] = value
+                self.assertFalse(self.control._verify_authority_binding(manifest, mutated, manifest_sha))
+
+    def test_import_is_inert_without_path_resolve(self):
+        source_path = Path(self.control.__file__ or "run/qa_probe_runner.py")
+        module_name = f"_b6_e4_import_{uuid.uuid4().hex}"
+        spec = importlib.util.spec_from_file_location(module_name, source_path)
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        with patch.object(Path, "resolve", side_effect=AssertionError("import-time resolve")):
+            spec.loader.exec_module(module)
+
+    def test_canonical_argv_rejects_reordered_options_and_guard_has_one_action(self):
+        digest = "a" * 64
+        canonical = [
+            "--read-only-admission", "--manifest", "/tmp/m.json", "--manifest-sha256", digest,
+            "--authorization", "/tmp/a.json", "--authorization-sha256", digest,
+        ]
+        reordered = [
+            "--read-only-admission", "--manifest-sha256", digest, "--manifest", "/tmp/m.json",
+            "--authorization-sha256", digest, "--authorization", "/tmp/a.json",
+        ]
+        self.assertIsNotNone(self.control._canonical_argv(canonical))
+        self.assertIsNone(self.control._canonical_argv(reordered))
+        source = Path(self.control.__file__ or "run/qa_probe_runner.py").read_text(encoding="utf-8")
+        guard = source.split('if __name__ == "__main__":', 1)[1]
+        self.assertNotIn("voice1-gap-child", guard)
+        self.assertNotIn("_gap_args", guard)
+        self.assertEqual(guard.strip(), "raise SystemExit(main())")
+
+    def test_profile_validator_rejects_non2xx_and_identical_invalid_projections(self):
+        valid = {
+            "ok": True, "ready": True, "configured": True, "enabled": True, "audio_api": True,
+            "stt": {"mode": "relay", "provider": "hermes-stt"},
+            "tts": {"mode": "relay", "reason": "command/plugin provider", "wire": "server",
+                    "provider": "edge", "configured": True, "enabled": True, "ready": True,
+                    "ok": True, "status": "ok"},
+        }
+        explicit = self.control._tts_reduction(valid)
+        self.assertTrue(self.control._profile_observations_ready(
+            {"status": 200, "body": json.dumps(valid).encode("utf-8")},
+            {"status": 200, "projection": explicit},
+        ))
+        self.assertFalse(self.control._profile_observations_ready(
+            {"status": 500, "body": json.dumps(valid).encode("utf-8")},
+            {"status": 200, "projection": explicit},
+        ))
+        invalid = self.control._tts_reduction({"ok": True, "tts": {"configured": "invalid:str"}})
+        self.assertFalse(self.control._profile_observations_ready(
+            {"status": 200, "body": json.dumps({"ok": True, "tts": {"configured": "invalid:str"}}).encode("utf-8")},
+            {"status": 200, "projection": invalid},
+        ))
+
+    def test_report_projects_scope_specific_persisted_key_digest(self):
+        predicates = {name: True for name in self.control.REQUIRED_PREDICATES}
+        fixture = self.control._admission_report(
+            {}, predicates, [], 0.0, "2026-09-13T00:00:00Z", {}, observations={},
+            authorization={"execution_scope": "fixture_readonly", "persisted_key_sha256": self.control.FIXTURE_KEY_SHA256},
+        )
+        live = self.control._admission_report(
+            {}, predicates, [], 0.0, "2026-09-13T00:00:00Z", {}, observations={},
+            authorization={"execution_scope": "live_readonly", "persisted_key_sha256": self.control.EXPECTED_KEY_SHA256},
+        )
+        self.assertEqual(fixture["persisted_key_sha256"], self.control.FIXTURE_KEY_SHA256)
+        self.assertEqual(live["persisted_key_sha256"], self.control.EXPECTED_KEY_SHA256)
 
 
 class R19ArgvProjectionTests(unittest.TestCase):

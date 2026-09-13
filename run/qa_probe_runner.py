@@ -32,6 +32,7 @@ import os
 import re
 import signal
 import sqlite3
+import stat
 import subprocess
 import sys
 import tempfile
@@ -47,12 +48,15 @@ from typing import Any
 # unreachable; bind the lexical parent-parent before any recorder_next
 # import.  This is pure interpreter path binding: no file reads, no
 # environment inspection, no imports of project modules at this point.
+# os.path.abspath is lexical binding only; resolve/stat/read remain deferred
+# until an explicit candidate-validation boundary.
+_LEXICAL_FILE = os.path.abspath(__file__)
 if __package__ in (None, ""):
-    _SCRIPT_CANDIDATE_ROOT = str(Path(__file__).resolve().parent.parent)
+    _SCRIPT_CANDIDATE_ROOT = os.path.dirname(os.path.dirname(_LEXICAL_FILE))
     if _SCRIPT_CANDIDATE_ROOT not in sys.path:
         sys.path.insert(0, _SCRIPT_CANDIDATE_ROOT)
 
-CONTROL_DIR = Path(__file__).resolve().parent
+CONTROL_DIR = Path(os.path.dirname(_LEXICAL_FILE))
 PACKET_PATH = CONTROL_DIR / "binding-create-cas-rollback-packet.md"
 
 # Owner-pinned identity (from the ratified owner authority; digests only).
@@ -852,6 +856,7 @@ def _admission_report(context: dict[str, Any], predicates: dict[str, bool],
         "reason_codes": sorted(set(reason_codes)),
         "expected_session_id_sha256": EXPECTED_S_SHA256,
         "expected_key_sha256": EXPECTED_KEY_SHA256,
+        "persisted_key_sha256": (authorization or {}).get("persisted_key_sha256"),
         "manifest_sha256": context.get("manifest_sha256"),
         "authorization_sha256": context.get("authorization_sha256"),
         "control_packet_sha256": (authorization or {}).get("control_packet_sha256"),
@@ -896,6 +901,28 @@ AUTHORIZATION_SCHEMA = "recorder-next-voice1-readonly-authorization/v1"
 MANIFEST_SCHEMA = "recorder-next-voice1-b6-builder-candidate/v1"
 MANIFEST_GENERATION = "VOICE1-B6"
 PRODUCT_IDENTITY = "recorder-next-server-voice-session-chain"
+RATIFIED_OWNER_PACKET_SHA256 = "6735b40c2eeeb716fb307d73cb603c940b24a78cab9cb29ddf6b696b1e99a3ec"
+RATIFIED_ADDENDUM_SHA256 = "758fcf9642ea21e7017b70e0851a88f3c11d7c0ee727e16516b923e8f8f1085e"
+RATIFIED_INHERITED_SPEC_SHA256 = "ce1c23271239d330e7125ded8ecb6b32d0a3bee8c5d2a07118693c3065df3de1"
+RATIFIED_AUTHORITY_DIGESTS = {
+    "owner_packet_sha256": RATIFIED_OWNER_PACKET_SHA256,
+    "specification_sha256": RATIFIED_ADDENDUM_SHA256,
+    "inherited_specification_sha256": RATIFIED_INHERITED_SPEC_SHA256,
+}
+RATIFIED_AUTHORITY_PATHS = {
+    "owner_packet_sha256": Path(
+        "/home/rumi/Projects/recorder-next/.release-artifacts/"
+        "orchestration/t_16ca403e-voice1-b3-owner-acceptance-packet-v1.json"
+    ),
+    "specification_sha256": Path(
+        "/home/rumi/Projects/recorder-next/.release-artifacts/"
+        "voice1-b6-architecture-v1/architecture-addendum.md"
+    ),
+    "inherited_specification_sha256": Path(
+        "/home/rumi/Projects/recorder-next/.release-artifacts/"
+        "voice1-b3-architecture-v1/architecture-specification.md"
+    ),
+}
 EXECUTION_SCOPES = ("live_readonly", "fixture_readonly")
 APPROVED_ACTIONS = (
     "candidate_verify",
@@ -921,55 +948,56 @@ FIXTURE_KEY_SHA256 = "4b2d9610f5c9a4dc68def7e234a48480fb7468e769957fed0275e77d15
 MAX_AUTHORITY_BYTES = 64 * 1024
 _LIVE_DASHBOARD_BASE_URL = "http://100.112.8.81:9119"
 _LIVE_API_BASE_URL = "http://127.0.0.1:8647"
+_LIVE_ENDPOINTS = {
+    "api_base_url": _LIVE_API_BASE_URL,
+    "dashboard_base_url": _LIVE_DASHBOARD_BASE_URL,
+}
+_LIVE_PATHS = {
+    "dashboard_credential": "/etc/recorder-next/dashboard-session.env",
+    "dashboard_metadata": "/etc/recorder-next/dashboard-session.meta.json",
+    "api_credential": "/run/credentials/recorder-next.service/recorder_api_key",
+    "persisted_db": "/home/rumi/.hermes/state.db",
+}
+_PATH_FIELDS = ("dashboard_credential", "dashboard_metadata", "api_credential", "persisted_db")
+_ENDPOINT_FIELDS = ("api_base_url", "dashboard_base_url")
 
 
 def _canonical_argv(argv: list[str]) -> dict[str, str] | None:
-    """Parse the exact five-option canonical invocation; None means HOLD.
+    """Parse the one exact option vector; None means HOLD.
 
-    Accepts only: --read-only-admission plus four paired value options with
-    absolute paths and lowercase 64-hex pins.  Duplicate/unknown flags,
-    positional extras, abbreviation, inline values, missing values, relative
-    or noncanonical paths, and uppercase/short digests all reject.
+    The caller receives only the option suffix of the full timeout/python
+    command.  Its order is nevertheless part of the reviewed argv contract:
+    accepting a reordered vector would authorize a different invocation shape.
     """
-    options = ("--read-only-admission", "--manifest", "--manifest-sha256",
-               "--authorization", "--authorization-sha256")
-    values: dict[str, str] = {}
-    index = 0
-    while index < len(argv):
-        token = argv[index]
-        if token not in options:
-            return None
-        if token == "--read-only-admission":
-            if token in values:
-                return None
-            values[token] = "1"
-            index += 1
-            continue
-        if index + 1 >= len(argv) or argv[index + 1] in options:
-            return None
-        if token in values:
-            return None
-        values[token] = argv[index + 1]
-        index += 2
-    if "--read-only-admission" not in values or len(values) != len(options):
+    if not isinstance(argv, list) or len(argv) != 9:
         return None
-    manifest_path = values["--manifest"]
-    authorization_path = values["--authorization"]
-    for raw in (manifest_path, authorization_path):
-        if not raw or "\x00" in raw or len(raw) > 4096:
+    expected_switch = "--read-only-admission"
+    expected_pairs = (
+        ("--manifest", "manifest_path"),
+        ("--manifest-sha256", "manifest_sha256"),
+        ("--authorization", "authorization_path"),
+        ("--authorization-sha256", "authorization_sha256"),
+    )
+    if argv[0] != expected_switch:
+        return None
+    values: dict[str, str] = {}
+    index = 1
+    for option, key in expected_pairs:
+        if argv[index] != option:
             return None
-        candidate = Path(raw)
-        if not candidate.is_absolute() or str(candidate) != raw:
+        value = argv[index + 1]
+        if not isinstance(value, str) or not value or "\x00" in value:
             return None
-    for digest in (values["--manifest-sha256"], values["--authorization-sha256"]):
-        if re.fullmatch(r"[0-9a-f]{64}", digest) is None:
-            return None
-    return {
-        "manifest_path": manifest_path,
-        "manifest_sha256": values["--manifest-sha256"],
-        "authorization_path": authorization_path,
-        "authorization_sha256": values["--authorization-sha256"],
-    }
+        if key.endswith("_sha256"):
+            if re.fullmatch(r"[0-9a-f]{64}", value) is None:
+                return None
+        else:
+            candidate = Path(value)
+            if len(value) > 4096 or not candidate.is_absolute() or str(candidate) != value:
+                return None
+        values[key] = value
+        index += 2
+    return values
 
 
 def _load_bounded_json(path: Path, limit: int, expected_sha256: str) -> dict[str, Any] | None:
@@ -983,12 +1011,12 @@ def _load_bounded_json(path: Path, limit: int, expected_sha256: str) -> dict[str
         return result
 
     try:
-        info = path.stat()
-        if not path.is_file() or path.is_symlink() or info.st_size > limit:
-            return None
-        payload = path.read_bytes()
+        loaded = _read_regular_file_no_follow(path, limit=limit)
     except OSError:
         return None
+    if loaded is None:
+        return None
+    payload, _identity = loaded
     if hashlib.sha256(payload).hexdigest() != expected_sha256:
         return None
     try:
@@ -1073,8 +1101,51 @@ def _tracked_file_vector(per_file_sha256: dict[str, str]) -> str:
     ).hexdigest()
 
 
+def _canonical_member_name(value: Any, *, allow_leading_dot: bool = False, directory: bool = False) -> str | None:
+    """Normalize one archive/member name or reject it."""
+    if not isinstance(value, str) or not value or "\x00" in value or "\\" in value:
+        return None
+    name = value
+    if name.startswith("./"):
+        if not allow_leading_dot:
+            return None
+        name = name[2:]
+        if name.startswith("./"):
+            return None
+    if name.startswith("/"):
+        return None
+    if directory and name.endswith("/"):
+        name = name[:-1]
+    elif not directory and name.endswith("/"):
+        return None
+    parts = name.split("/")
+    if not parts or any(part in {"", ".", ".."} for part in parts):
+        return None
+    return "/".join(parts)
+
+
+def _read_candidate_member_no_follow(root: Path, relative_name: str) -> tuple[bytes, dict[str, int]] | None:
+    if _canonical_member_name(relative_name) != relative_name:
+        return None
+    current = root
+    parts = relative_name.split("/")
+    for index, part in enumerate(parts):
+        current = current / part
+        try:
+            info = current.lstat()
+        except OSError:
+            return None
+        if stat.S_ISLNK(info.st_mode):
+            return None
+        if index < len(parts) - 1 and not stat.S_ISDIR(info.st_mode):
+            return None
+    return _read_regular_file_no_follow(current)
+
+
 def _verify_manifest_structure(manifest: dict[str, Any]) -> bool:
     """Exact B6 manifest consumption contract (architecture section 5.1)."""
+    if not isinstance(manifest, dict):
+        return False
     if manifest.get("schema") != MANIFEST_SCHEMA or manifest.get("generation") != MANIFEST_GENERATION:
         return False
     if manifest.get("product_identity") != PRODUCT_IDENTITY:
@@ -1086,17 +1157,21 @@ def _verify_manifest_structure(manifest: dict[str, Any]) -> bool:
         return False
     if re.fullmatch(r"[a-z0-9][a-z0-9._-]*", candidate_id) is None:
         return False
-    for key in ("candidate_sha256",):
-        if re.fullmatch(r"[0-9a-f]{64}", manifest.get(key) or "") is None:
-            return False
+    candidate_sha256 = manifest.get("candidate_sha256")
+    if not isinstance(candidate_sha256, str) or re.fullmatch(r"[0-9a-f]{64}", candidate_sha256) is None:
+        return False
     for key in ("source_commit", "source_tree"):
-        if re.fullmatch(r"[0-9a-f]{40}", manifest.get(key) or "") is None:
+        value = manifest.get(key)
+        if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{40}", value) is None:
             return False
     per_file = manifest.get("per_file_sha256")
     if not isinstance(per_file, dict) or not per_file:
         return False
-    if not all(re.fullmatch(r"[0-9a-f]{64}", value or "") for value in per_file.values()):
-        return False
+    for relative_name, digest in per_file.items():
+        if not isinstance(relative_name, str) or _canonical_member_name(relative_name) != relative_name:
+            return False
+        if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+            return False
     count = manifest.get("tracked_file_count")
     if isinstance(count, bool) or not isinstance(count, int) or count != len(per_file):
         return False
@@ -1115,31 +1190,160 @@ def _verify_manifest_structure(manifest: dict[str, Any]) -> bool:
     if not isinstance(authorities, dict):
         return False
     for key in ("owner_packet_sha256", "specification_sha256", "inherited_specification_sha256"):
-        if re.fullmatch(r"[0-9a-f]{64}", authorities.get(key) or "") is None:
+        value = authorities.get(key)
+        if not isinstance(value, str) or value != RATIFIED_AUTHORITY_DIGESTS[key]:
             return False
     control = manifest.get("control")
     if not isinstance(control, dict):
         return False
     for key in ("packet_sha256", "probe_runner_sha256"):
-        if re.fullmatch(r"[0-9a-f]{64}", control.get(key) or "") is None:
+        value = control.get(key)
+        if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None:
             return False
     return True
 
 
+def _stat_identity(info: os.stat_result) -> dict[str, int]:
+    return {
+        "device": info.st_dev,
+        "inode": info.st_ino,
+        "uid": info.st_uid,
+        "gid": info.st_gid,
+        "mode": stat.S_IMODE(info.st_mode),
+    }
+
+
+def _regular_file_identity_no_follow(path: Path) -> dict[str, int] | None:
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError:
+        return None
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode):
+            return None
+        return _stat_identity(info)
+    except OSError:
+        return None
+    finally:
+        os.close(descriptor)
+
+
+def _read_regular_file_no_follow(path: Path, *, limit: int | None = None) -> tuple[bytes, dict[str, int]] | None:
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError:
+        return None
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            return None
+        if limit is not None and before.st_size > limit:
+            return None
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            chunk = os.read(descriptor, 65536)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+            if limit is not None and total > limit:
+                return None
+        after = os.fstat(descriptor)
+        if _stat_identity(before) != _stat_identity(after) or after.st_size != total:
+            return None
+        return b"".join(chunks), _stat_identity(after)
+    except OSError:
+        return None
+    finally:
+        os.close(descriptor)
+
+
+def _cold_rehash_ratified_authorities() -> bool:
+    for key, path in RATIFIED_AUTHORITY_PATHS.items():
+        loaded = _read_regular_file_no_follow(path, limit=4 * 1024 * 1024)
+        if loaded is None or hashlib.sha256(loaded[0]).hexdigest() != RATIFIED_AUTHORITY_DIGESTS[key]:
+            return False
+    return True
+
+
+def _is_lower_hex(value: Any, length: int) -> bool:
+    return isinstance(value, str) and re.fullmatch(rf"[0-9a-f]{{{length}}}", value) is not None
+
+
+def _bounded_absolute_path(value: Any) -> Path | None:
+    if not isinstance(value, str) or not value or len(value) > 4096 or "\x00" in value:
+        return None
+    path = Path(value)
+    if not path.is_absolute() or str(path) != value or os.path.normpath(value) != value:
+        return None
+    return path
+
+
+def _path_has_no_symlink_components(path: Path) -> bool:
+    current = Path(path.anchor)
+    for component in path.parts[1:]:
+        current /= component
+        try:
+            info = current.lstat()
+        except FileNotFoundError:
+            break
+        except OSError:
+            return False
+        if stat.S_ISLNK(info.st_mode):
+            return False
+    return True
+
+
+def _fixture_origin(value: Any) -> tuple[str, int] | None:
+    if not isinstance(value, str) or len(value) > 4096:
+        return None
+    try:
+        from urllib.parse import urlsplit
+
+        parsed = urlsplit(value)
+        port = parsed.port
+    except (TypeError, ValueError):
+        return None
+    if (
+        parsed.scheme != "http"
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.hostname != "127.0.0.1"
+        or parsed.path not in ("", "/")
+        or parsed.query
+        or parsed.fragment
+        or port is None
+        or not 1024 <= port <= 65535
+        or port in {8647, 9119}
+    ):
+        return None
+    return parsed.hostname, port
+
+
 def _verify_authority_binding(manifest: dict[str, Any], authorization: dict[str, Any], manifest_sha256: str) -> bool:
-    """Exact manifest/authorization identity equality (sections 5.1/5.2)."""
+    """Verify exact authority identity plus scope-bound targets before I/O."""
+    if not isinstance(manifest, dict) or not isinstance(authorization, dict):
+        return False
     if authorization.get("schema") != AUTHORIZATION_SCHEMA:
         return False
     if set(authorization) != AUTHORIZATION_KEYS:
         return False
     if authorization.get("product_identity") != PRODUCT_IDENTITY:
         return False
-    if authorization.get("execution_scope") not in EXECUTION_SCOPES:
+    scope = authorization.get("execution_scope")
+    if not isinstance(scope, str) or scope not in EXECUTION_SCOPES:
         return False
     if authorization.get("approved_actions") != list(APPROVED_ACTIONS):
         return False
-    # Identity fields compare exactly against the manifest; root-authority
-    # digests must be lowercase 64-hex strings.
+    if not _is_lower_hex(manifest_sha256, 64):
+        return False
+
+    # Identity fields compare exactly against the validated manifest and the
+    # ratified authority pins.  Type-gate every scalar before regex/equality.
     for auth_key, manifest_key in (
         ("candidate_id", "candidate_id"),
         ("candidate_sha256", "candidate_sha256"),
@@ -1152,16 +1356,31 @@ def _verify_authority_binding(manifest: dict[str, Any], authorization: dict[str,
         ("owner_packet_sha256", None),
     ):
         value = authorization.get(auth_key)
-        if not isinstance(value, str):
+        if not isinstance(value, str) or not value or len(value) > 4096:
             return False
         if manifest_key is not None:
-            if value != manifest.get(manifest_key):
+            expected = manifest.get(manifest_key)
+            if value != expected:
+                return False
+            if manifest_key == "candidate_sha256" and not _is_lower_hex(value, 64):
+                return False
+            if manifest_key in {"source_commit", "source_tree"} and not _is_lower_hex(value, 40):
                 return False
             continue
-        if re.fullmatch(r"[0-9a-f]{64}", value) is None:
+        if not _is_lower_hex(value, 64):
             return False
-    authorities = manifest.get("authorities") or {}
-    control = manifest.get("control") or {}
+        if auth_key in RATIFIED_AUTHORITY_DIGESTS and value != RATIFIED_AUTHORITY_DIGESTS[auth_key]:
+            return False
+
+    authorities = manifest.get("authorities")
+    control = manifest.get("control")
+    if not isinstance(authorities, dict) or not isinstance(control, dict):
+        return False
+    if any(
+        authorities.get(key) != RATIFIED_AUTHORITY_DIGESTS[key]
+        for key in RATIFIED_AUTHORITY_DIGESTS
+    ):
+        return False
     if authorization.get("specification_sha256") != authorities.get("specification_sha256"):
         return False
     if authorization.get("inherited_specification_sha256") != authorities.get("inherited_specification_sha256"):
@@ -1176,15 +1395,32 @@ def _verify_authority_binding(manifest: dict[str, Any], authorization: dict[str,
         return False
     if authorization.get("selected_session_id_sha256") != EXPECTED_S_SHA256:
         return False
+    if not _is_lower_hex(authorization.get("persisted_key_sha256"), 64):
+        return False
+
+    candidate_root = _bounded_absolute_path(authorization.get("candidate_root"))
+    archive_path = _bounded_absolute_path(authorization.get("archive_path"))
+    if candidate_root is None or archive_path is None:
+        return False
+
     endpoints = authorization.get("endpoints")
-    if not isinstance(endpoints, dict) or set(endpoints) != {"api_base_url", "dashboard_base_url"}:
+    if not isinstance(endpoints, dict) or set(endpoints) != set(_ENDPOINT_FIELDS):
         return False
     paths = authorization.get("paths")
-    if not isinstance(paths, dict) or set(paths) != {"dashboard_credential", "dashboard_metadata", "api_credential", "persisted_db"}:
+    if not isinstance(paths, dict) or set(paths) != set(_PATH_FIELDS):
         return False
+    for value in paths.values():
+        if _bounded_absolute_path(value) is None:
+            return False
     metadata = authorization.get("credential_metadata")
     if not isinstance(metadata, dict) or set(metadata) != {"dashboard_credential", "api_credential"}:
         return False
+    for pin in metadata.values():
+        if not isinstance(pin, dict) or set(pin) != {"device", "inode", "uid", "gid", "mode"}:
+            return False
+        if any(isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in pin.values()):
+            return False
+
     not_before = _utc_parse(authorization.get("not_before_utc"))
     expires_at = _utc_parse(authorization.get("expires_at_utc"))
     if not_before is None or expires_at is None or not_before >= expires_at:
@@ -1192,83 +1428,73 @@ def _verify_authority_binding(manifest: dict[str, Any], authorization: dict[str,
     now = int(time.time())
     if not (not_before <= now <= expires_at):
         return False
-    scope = authorization.get("execution_scope")
+
+    fixture_root_raw = authorization.get("fixture_root")
     if scope == "live_readonly":
-        if authorization.get("fixture_root") is not None:
+        if fixture_root_raw is not None or authorization.get("persisted_key_sha256") != EXPECTED_KEY_SHA256:
             return False
-        if authorization.get("persisted_key_sha256") != EXPECTED_KEY_SHA256:
+        if endpoints != _LIVE_ENDPOINTS or paths != _LIVE_PATHS:
             return False
     else:
-        fixture_root = authorization.get("fixture_root")
-        if not isinstance(fixture_root, str) or not fixture_root or len(fixture_root) > 4096:
-            return False
         if authorization.get("persisted_key_sha256") != FIXTURE_KEY_SHA256:
+            return False
+        fixture_root = _bounded_absolute_path(fixture_root_raw)
+        if fixture_root is None or not _path_has_no_symlink_components(fixture_root):
+            return False
+        try:
+            root_info = fixture_root.lstat()
+        except OSError:
+            return False
+        if not stat.S_ISDIR(root_info.st_mode) or stat.S_ISLNK(root_info.st_mode):
+            return False
+        if stat.S_IMODE(root_info.st_mode) & 0o077:
+            return False
+        for protected in (Path("/var/lib/recorder-next"), Path("/home/rumi/.hermes"), Path("/etc/recorder-next")):
+            try:
+                fixture_root.relative_to(protected)
+            except ValueError:
+                continue
+            return False
+        for field in _PATH_FIELDS:
+            target = Path(paths[field])
+            try:
+                relative = target.relative_to(fixture_root)
+            except ValueError:
+                return False
+            if not relative.parts or any(part in {"", ".", ".."} for part in relative.parts):
+                return False
+            if not _path_has_no_symlink_components(target):
+                return False
+        origins = [_fixture_origin(endpoints[field]) for field in _ENDPOINT_FIELDS]
+        if any(origin is None for origin in origins) or origins[0] == origins[1]:
             return False
     return True
 
 
 def _verify_candidate_source(authorization: dict[str, Any], manifest: dict[str, Any]) -> bool:
-    """Complete archive/candidate-root binding before any protected action.
-
-    Architecture (F-1 repair): before any project-module import or protected
-    boundary, this validates the pinned archive, its SHA-256 against
-    manifest.candidate_sha256, the safe exact regular-member set against
-    manifest.per_file_sha256 / tracked_file_count, the canonical per-file
-    vector, every candidate-root member digest, and lexical+resolved
-    candidate-root equality with the executing runner's own root.  It opens
-    no candidate project module and performs no network/storage action.
-    """
-    candidate_root_raw = authorization.get("candidate_root")
-    archive_path_raw = authorization.get("archive_path")
-    if not isinstance(candidate_root_raw, str) or not isinstance(archive_path_raw, str):
+    """Complete archive/candidate-root binding before any protected action."""
+    if not isinstance(authorization, dict) or not isinstance(manifest, dict):
         return False
-    if not candidate_root_raw or not archive_path_raw:
-        return False
-    if len(candidate_root_raw) > 4096 or len(archive_path_raw) > 4096:
-        return False
-    if "\x00" in candidate_root_raw or "\x00" in archive_path_raw:
-        return False
-
-    root = Path(candidate_root_raw)
-    archive_path = Path(archive_path_raw)
-    if not root.is_absolute() or root.is_symlink():
-        return False
-    if not archive_path.is_absolute():
-        return False
-
-    # lexical root equality: the authorization's candidate_root must be
-    # exactly the runner's own lexical parent-parent (no resolved/path
-    # substitute accepted in either direction).
-    lexical_root = CONTROL_DIR.parent
-    if root != lexical_root:
+    root = _bounded_absolute_path(authorization.get("candidate_root"))
+    archive_path = _bounded_absolute_path(authorization.get("archive_path"))
+    if root is None or archive_path is None or root != CONTROL_DIR.parent:
         return False
     try:
-        resolved_root = root.resolve(strict=True)
+        root_info = root.lstat()
+        if stat.S_ISLNK(root_info.st_mode) or not stat.S_ISDIR(root_info.st_mode):
+            return False
+        if root.resolve(strict=True) != CONTROL_DIR.parent.resolve(strict=True):
+            return False
     except OSError:
         return False
-    if resolved_root != lexical_root.resolve(strict=True):
-        return False
-    if resolved_root.is_symlink() or not resolved_root.is_dir():
-        return False
 
-    # -- 1. pinned archive: exists, regular, no symlink, exact SHA ----------
-
-    try:
-        archive_info = archive_path.lstat()
-    except OSError:
+    archive_loaded = _read_regular_file_no_follow(archive_path, limit=64 * 1024 * 1024)
+    if archive_loaded is None:
         return False
-    import stat as _stat
-
-    if not _stat.S_ISREG(archive_info.st_mode):
+    archive_bytes, _archive_identity = archive_loaded
+    candidate_sha256 = manifest.get("candidate_sha256")
+    if not _is_lower_hex(candidate_sha256, 64) or hashlib.sha256(archive_bytes).hexdigest() != candidate_sha256:
         return False
-    try:
-        archive_bytes = archive_path.read_bytes()
-    except OSError:
-        return False
-    if hashlib.sha256(archive_bytes).hexdigest() != manifest.get("candidate_sha256"):
-        return False
-
-    # -- 2. safe exact archive member set vs the manifest vector -------------
 
     import io
     import tarfile
@@ -1277,48 +1503,47 @@ def _verify_candidate_source(authorization: dict[str, Any], manifest: dict[str, 
     if not isinstance(per_file, dict) or not per_file:
         return False
     try:
+        seen_members: set[str] = set()
+        seen_dirs: set[str] = set()
+        regular_names: set[str] = set()
         with tarfile.open(fileobj=io.BytesIO(archive_bytes), mode="r:*") as tar:
-            members = tar.getmembers()
-            declared_names = set(per_file)
-            seen_dirs: set[str] = set()
-            regular_names: set[str] = set()
-            for member in members:
-                name = member.name[2:] if member.name.startswith("./") else member.name
+            for member in tar.getmembers():
+                name = _canonical_member_name(
+                    member.name,
+                    allow_leading_dot=True,
+                    directory=member.isdir(),
+                )
+                if name is None or name in seen_members:
+                    return False
+                seen_members.add(name)
                 if member.isdir():
-                    # Directory members are allowed only as ancestors of
-                    # regular members.
                     seen_dirs.add(name)
                     continue
-                if not member.isreg():
-                    # No symlink/hardlink/device/fifo members are authorized.
-                    return False
-                if name not in declared_names or name in regular_names:
+                if not member.isreg() or name not in per_file:
                     return False
                 regular_names.add(name)
-                member_digest = hashlib.sha256()
                 extracted = tar.extractfile(member)
                 if extracted is None:
                     return False
+                digest = hashlib.sha256()
                 with extracted:
                     while True:
                         chunk = extracted.read(65536)
                         if not chunk:
                             break
-                        member_digest.update(chunk)
-                if member_digest.hexdigest() != per_file[name]:
+                        digest.update(chunk)
+                expected = per_file.get(name)
+                if not _is_lower_hex(expected, 64) or digest.hexdigest() != expected:
                     return False
-            if regular_names != declared_names:
-                return False
-            for name in regular_names:
-                parts = name.split("/")
-                for depth in range(1, len(parts)):
-                    ancestor = "/".join(parts[:depth])
-                    if ancestor and ancestor not in seen_dirs:
-                        # tarfile commonly omits ancestor dir entries; accept
-                        # only when the member itself declares the full path
-                        # (implicit ancestors).  Explicit non-ancestor dirs
-                        # were already collected; nothing else to reject here.
-                        continue
+        if regular_names != set(per_file) or len(regular_names) != len(per_file):
+            return False
+        required_dirs = {
+            "/".join(name.split("/")[:depth])
+            for name in regular_names
+            for depth in range(1, len(name.split("/")))
+        }
+        if not seen_dirs.issubset(required_dirs):
+            return False
     except (tarfile.TarError, EOFError, OSError):
         return False
 
@@ -1334,45 +1559,132 @@ def _verify_candidate_source(authorization: dict[str, Any], manifest: dict[str, 
     # -- 4. every candidate-root member digest and opened identity -----------
 
     for relative_name, expected_digest in sorted(per_file.items()):
-        if not isinstance(relative_name, str) or not relative_name:
+        if not isinstance(relative_name, str) or not _is_lower_hex(expected_digest, 64):
             return False
-        candidate_parts = Path(relative_name).parts
-        if not candidate_parts or any(part in ("..", "") for part in candidate_parts):
-            return False
-        member_path = root.joinpath(*candidate_parts)
-        try:
-            member_info = member_path.lstat()
-        except OSError:
-            return False
-        if not _stat.S_ISREG(member_info.st_mode):
-            return False
-        try:
-            member_bytes = member_path.read_bytes()
-        except OSError:
-            return False
-        if hashlib.sha256(member_bytes).hexdigest() != expected_digest:
+        loaded = _read_candidate_member_no_follow(root, relative_name)
+        if loaded is None or hashlib.sha256(loaded[0]).hexdigest() != expected_digest:
             return False
 
-    # The executing control itself must be the candidate root's runner and
-    # its bytes must equal the manifest control pin.
-    control_hash = (manifest.get("control") or {}).get("probe_runner_sha256")
-    if not isinstance(control_hash, str):
+    control = manifest.get("control")
+    control_hash = control.get("probe_runner_sha256") if isinstance(control, dict) else None
+    runner_loaded = _read_regular_file_no_follow(Path(__file__), limit=16 * 1024 * 1024)
+    if not _is_lower_hex(control_hash, 64) or runner_loaded is None:
+        return False
+    if hashlib.sha256(runner_loaded[0]).hexdigest() != control_hash:
         return False
     try:
-        runner_bytes = Path(__file__).read_bytes()
+        return Path(__file__).resolve(strict=True) == (root / "run" / "qa_probe_runner.py").resolve(strict=True)
     except OSError:
         return False
-    if hashlib.sha256(runner_bytes).hexdigest() != control_hash:
+
+
+def _verify_imported_module_identity(
+    module: Any,
+    root_or_per_file: Path | dict[str, str],
+    per_file: dict[str, str] | None = None,
+) -> bool:
+    if isinstance(root_or_per_file, dict) and per_file is None:
+        per_file = root_or_per_file
+        module_file = getattr(module, "__file__", None)
+        if not isinstance(module_file, str) or not module_file:
+            return False
+        try:
+            root = Path(module_file).resolve(strict=True).parents[1]
+        except (IndexError, OSError):
+            return False
+    elif isinstance(root_or_per_file, Path):
+        root = root_or_per_file
+    else:
+        return False
+    expected = root / "recorder_next" / "adapters.py"
+    module_file = getattr(module, "__file__", None)
+    spec = getattr(module, "__spec__", None)
+    origin = getattr(spec, "origin", None) if spec is not None else None
+    loader = getattr(spec, "loader", None) if spec is not None else None
+    if not all(isinstance(value, str) and value for value in (module_file, origin)):
+        return False
+    if loader is None or not callable(getattr(loader, "get_filename", None)):
         return False
     try:
-        self_identity = Path(__file__).resolve(strict=True)
-    except OSError:
+        loader_file = loader.get_filename("recorder_next.adapters")
+    except Exception:
+        return False
+    if not isinstance(loader_file, str) or not loader_file:
         return False
     try:
-        pinned_runner = (root / "run" / "qa_probe_runner.py").resolve(strict=True)
+        expected_resolved = expected.resolve(strict=True)
+        if any(Path(value).resolve(strict=True) != expected_resolved for value in (module_file, origin, loader_file)):
+            return False
     except OSError:
         return False
-    return self_identity == pinned_runner
+    expected_digest = per_file.get("recorder_next/adapters.py") if per_file is not None else None
+    loaded = _read_regular_file_no_follow(expected, limit=16 * 1024 * 1024)
+    if loaded is None:
+        return False
+    if per_file is None:
+        expected_digest = hashlib.sha256(loaded[0]).hexdigest()
+    return _is_lower_hex(expected_digest, 64) and hashlib.sha256(loaded[0]).hexdigest() == expected_digest
+
+
+def _profile_observations_ready(omitted_response: Any, explicit_response: Any) -> bool:
+    """Use one strict projection/validator path for both observations."""
+    if not isinstance(omitted_response, dict) or type(omitted_response.get("status")) is not int:
+        return False
+    if not 200 <= omitted_response["status"] < 300:
+        return False
+    omitted_body = omitted_response.get("body")
+    explicit_status = explicit_response.get("status") if isinstance(explicit_response, dict) else None
+    explicit_projection = explicit_response.get("projection") if isinstance(explicit_response, dict) else None
+    if type(explicit_status) is not int or not 200 <= explicit_status < 300:
+        return False
+    omitted_projection = _tts_reduction(omitted_body)
+    if omitted_projection is None or not isinstance(explicit_projection, dict):
+        return False
+    try:
+        if not _validate_tts_projection_ready(omitted_projection):
+            return False
+        if not _validate_tts_projection_ready(explicit_projection):
+            return False
+    except Exception:
+        return False
+    return omitted_projection == explicit_projection
+
+
+def _closing_identity_equal(context: dict[str, Any], adapters_module: Any = None) -> bool:
+    """Re-read all identity inputs and the imported module at terminalization."""
+    if not isinstance(context, dict):
+        return False
+    manifest_path = context.get("manifest_path")
+    authorization_path = context.get("authorization_path")
+    manifest_sha256 = context.get("manifest_sha256")
+    authorization_sha256 = context.get("authorization_sha256")
+    if not all(isinstance(value, str) and value for value in (
+        manifest_path, authorization_path, manifest_sha256, authorization_sha256,
+    )):
+        return False
+    manifest = _load_bounded_json(Path(manifest_path), MAX_AUTHORITY_BYTES, manifest_sha256)
+    authorization = _load_bounded_json(Path(authorization_path), MAX_AUTHORITY_BYTES, authorization_sha256)
+    if manifest is None or authorization is None:
+        return False
+    if manifest != context.get("manifest") or authorization != context.get("authorization"):
+        return False
+    if not _verify_manifest_structure(manifest):
+        return False
+    if not _verify_authority_binding(manifest, authorization, manifest_sha256):
+        return False
+    if not _verify_candidate_source(authorization, manifest):
+        return False
+    if not _cold_rehash_ratified_authorities():
+        return False
+    module = adapters_module if adapters_module is not None else context.get("adapters_module")
+    if module is None:
+        try:
+            module = importlib.import_module("recorder_next.adapters")
+        except Exception:
+            return False
+    root = _bounded_absolute_path(authorization.get("candidate_root"))
+    per_file = manifest.get("per_file_sha256")
+    return root is not None and isinstance(per_file, dict) and _verify_imported_module_identity(module, root, per_file)
 
 
 def run_voice1_readonly_admission(context: dict[str, Any]) -> dict[str, Any]:
@@ -1439,11 +1751,6 @@ def run_voice1_readonly_admission(context: dict[str, Any]) -> dict[str, Any]:
     metadata = authorization.get("credential_metadata") or {}
 
     # -- 0. authority, candidate, and import-origin bindings ----------------
-    # Every binding predicate is a real validation against the pinned
-    # context: the manifest/authorization identity pair, the on-disk
-    # candidate root vs the manifest identity, and the origin of the
-    # recorder_next package this process actually imported.  No predicate
-    # is emitted from a caller-supplied boolean.
     predicates["authorization_bound"] = bool(
         isinstance(manifest_sha256_arg := context.get("manifest_sha256"), str)
         and _verify_manifest_structure(manifest)
@@ -1451,39 +1758,17 @@ def run_voice1_readonly_admission(context: dict[str, Any]) -> dict[str, Any]:
         and scope in EXECUTION_SCOPES
         and within_budget()
     )
-    candidate_root_raw = authorization.get("candidate_root")
-    candidate_bound = False
-    if isinstance(candidate_root_raw, str) and candidate_root_raw:
-        candidate_root_path = Path(candidate_root_raw)
-        try:
-            candidate_pyproject = (candidate_root_path / "pyproject.toml").read_bytes()
-            candidate_adapters = (candidate_root_path / "recorder_next" / "adapters.py").read_bytes()
-            candidate_runner = (candidate_root_path / "run" / "qa_probe_runner.py").read_bytes()
-        except OSError:
-            candidate_bound = False
-        else:
-            imported_adapters = adapters_module.__file__ if adapters_module is not None else None
-            root_matches_import = bool(
-                imported_adapters
-                and Path(imported_adapters).resolve() == (candidate_root_path / "recorder_next" / "adapters.py").resolve()
-            )
-            candidate_bound = bool(
-                root_matches_import
-                and hashlib.sha256(candidate_runner).hexdigest() == (manifest.get("control") or {}).get("probe_runner_sha256")
-                and len(candidate_pyproject) > 0
-                and len(candidate_adapters) > 0
-                and within_budget()
-            )
-    predicates["candidate_bound"] = bool(candidate_bound)
-    imports_bound = False
-    if adapters_module is not None and getattr(adapters_module, "__name__", "") == "recorder_next.adapters":
-        imported_file = getattr(adapters_module, "__file__", None)
-        if isinstance(imported_file, str) and imported_file:
-            resolved = Path(imported_file).resolve()
-            expected_parent = (Path(__file__).resolve().parent.parent / "recorder_next" / "adapters.py").resolve()
-            spec_loader_ok = True
-            imports_bound = bool(resolved == expected_parent and spec_loader_ok and within_budget())
-    predicates["imports_bound"] = bool(imports_bound)
+    per_file = manifest.get("per_file_sha256") if isinstance(manifest, dict) else None
+    candidate_root = _bounded_absolute_path(authorization.get("candidate_root")) if isinstance(authorization, dict) else None
+    imports_bound = bool(
+        candidate_source_ok
+        and candidate_root is not None
+        and isinstance(per_file, dict)
+        and _verify_imported_module_identity(adapters_module, candidate_root, per_file)
+        and within_budget()
+    )
+    predicates["imports_bound"] = imports_bound
+    predicates["candidate_bound"] = bool(candidate_source_ok and imports_bound and within_budget())
     if not (predicates["authorization_bound"] and predicates["candidate_bound"] and predicates["imports_bound"]):
         reason_codes.append("authority_mismatch")
         return _admission_report(context, predicates, reason_codes, started_monotonic, started_utc, identity,
@@ -1615,15 +1900,13 @@ def run_voice1_readonly_admission(context: dict[str, Any]) -> dict[str, Any]:
         omitted_response = open_probe(dashboard_base, omitted_target,
                                       credential=dashboard_value, deadline_at=time.monotonic() + PROVIDER_TIMEOUT_SECONDS)
         explicit_response = tts._probe(explicit_target, deadline_at=time.monotonic() + min(PROVIDER_TIMEOUT_SECONDS, max(budget_remaining(), 0.001)))
-        omitted_reduction = _tts_reduction(omitted_response.get("body") if isinstance(omitted_response, dict) else None)
-        # tts._probe returns the projected payload dict directly (no "body"
-        # wrapper), so the explicit leg reduces the projection itself;
-        # wrapping it in .get("body") always reduced None (B6 finding F-3).
-        explicit_reduction = _tts_reduction(explicit_response if isinstance(explicit_response, dict) else None)
-        equal = omitted_reduction is not None and omitted_reduction == explicit_reduction
+        profile_ready = _profile_observations_ready(
+            omitted_response,
+            {"status": 200, "projection": explicit_response},
+        )
         distinct_targets = omitted_target != explicit_target
-        predicates["omitted_profile_equal"] = bool(equal and distinct_targets)
-        predicates["omitted_profile_ready"] = bool(equal and distinct_targets)
+        predicates["omitted_profile_equal"] = bool(profile_ready and distinct_targets)
+        predicates["omitted_profile_ready"] = bool(profile_ready and distinct_targets)
     except Exception:
         predicates["omitted_profile_equal"] = False
         predicates["omitted_profile_ready"] = False
@@ -1692,7 +1975,8 @@ def run_voice1_readonly_admission(context: dict[str, Any]) -> dict[str, Any]:
         remaining_post is not None and remaining_post >= DASHBOARD_LIFETIME_FLOOR_SECONDS
     )
     predicates["closing_identity_equal"] = bool(
-        _credential_metadata_matches(dashboard_cred_path, dashboard_pin)
+        _closing_identity_equal(context, adapters_module)
+        and _credential_metadata_matches(dashboard_cred_path, dashboard_pin)
         and _credential_metadata_matches(api_cred_path, api_pin)
         and within_budget()
     )
@@ -1820,16 +2104,29 @@ def _tts_reduction(body: Any) -> dict[str, Any] | None:
             continue
         reduced_subtree: dict[str, Any] = {}
         for key, value in subtree.items():
-            if isinstance(value, bool):
-                reduced_subtree[key] = value
-            elif key not in _TTS_NORMATIVE_FLAGS and key not in _TTS_NORMATIVE_STRINGS:
-                reduced_subtree[key] = reduce_value(value)
-            elif value is None or value is absent:
-                reduced_subtree[key] = "absent"
+            if key in _TTS_NORMATIVE_FLAGS:
+                reduced_subtree[key] = value if isinstance(value, bool) else f"invalid:{type(value).__name__}"
+            elif key in _TTS_NORMATIVE_STRINGS:
+                reduced_subtree[key] = value if isinstance(value, str) else f"invalid:{type(value).__name__}"
             else:
-                reduced_subtree[key] = f"invalid:{type(value).__name__}"
+                reduced_subtree[key] = reduce_value(value)
         reduction[subtree_key] = reduced_subtree
     return reduction
+
+
+def _validate_tts_projection_ready(projection: dict[str, Any]) -> bool:
+    """Apply the candidate adapter's strict Hermes envelope/TTS validators."""
+    if not isinstance(projection, dict):
+        return False
+    try:
+        module = importlib.import_module("recorder_next.adapters")
+        module._validate_envelope_semantics(projection, provider_kind="hermes")
+        if not module.HermesAudioTTSProvider._envelope_flags_satisfied(projection):
+            return False
+        module.HermesAudioTTSProvider._validate_tts_capability(projection)
+        return True
+    except Exception:
+        return False
 
 
 def _dashboard_remaining_seconds(metadata_raw: str) -> int | None:
@@ -1939,30 +2236,35 @@ def main(argv: list[str] | None = None) -> int:
         report = _hold_report({}, "authority_mismatch", started_monotonic, started_utc, identity)
         print(json.dumps(report, sort_keys=True))
         return 2
-    identity.update(
-        candidate_id=manifest.get("candidate_id"),
-        archive_sha256=manifest.get("candidate_sha256"),
-        source_commit=manifest.get("source_commit"),
-        source_tree=manifest.get("source_tree"),
-        control_sha256=(manifest.get("control") or {}).get("probe_runner_sha256"),
-        spec_sha256=(manifest.get("authorities") or {}).get("specification_sha256"),
-    )
-    if not _verify_manifest_structure(manifest):
+    try:
+        control = manifest.get("control") if isinstance(manifest, dict) else {}
+        authorities = manifest.get("authorities") if isinstance(manifest, dict) else {}
+        identity.update(
+            candidate_id=manifest.get("candidate_id") if isinstance(manifest, dict) else None,
+            archive_sha256=manifest.get("candidate_sha256") if isinstance(manifest, dict) else None,
+            source_commit=manifest.get("source_commit") if isinstance(manifest, dict) else None,
+            source_tree=manifest.get("source_tree") if isinstance(manifest, dict) else None,
+            control_sha256=control.get("probe_runner_sha256") if isinstance(control, dict) else None,
+            spec_sha256=authorities.get("specification_sha256") if isinstance(authorities, dict) else None,
+        )
+        if not _verify_manifest_structure(manifest):
+            raise ValueError("manifest structure")
+        if not _verify_authority_binding(manifest, authorization, parsed["manifest_sha256"]):
+            raise ValueError("authority binding")
+        if not _cold_rehash_ratified_authorities():
+            raise ValueError("ratified authority drift")
+        if not _verify_candidate_source(authorization, manifest):
+            raise ValueError("candidate source")
+    except Exception:
         report = _hold_report({}, "authority_mismatch", started_monotonic, started_utc, identity)
-        print(json.dumps(report, sort_keys=True))
-        return 2
-    if not _verify_authority_binding(manifest, authorization, parsed["manifest_sha256"]):
-        report = _hold_report({}, "authority_mismatch", started_monotonic, started_utc, identity)
-        print(json.dumps(report, sort_keys=True))
-        return 2
-    if not _verify_candidate_source(authorization, manifest):
-        report = _hold_report({}, "source_drift", started_monotonic, started_utc, identity)
         print(json.dumps(report, sort_keys=True))
         return 2
     try:
         report = run_voice1_readonly_admission({
             "manifest": manifest,
             "authorization": authorization,
+            "manifest_path": parsed["manifest_path"],
+            "authorization_path": parsed["authorization_path"],
             "manifest_sha256": parsed["manifest_sha256"],
             "authorization_sha256": parsed["authorization_sha256"],
             "started_monotonic": started_monotonic,
@@ -3468,13 +3770,20 @@ def _signal_fixture_a1_params(context: dict[str, Any]) -> dict[str, Any]:
 
 
 def _signal_child_argv(mode: str, signal_name: str, root: Path) -> tuple[list[str], dict[str, str]]:
-    """Exact fresh-process argv/env for the signal-gap child."""
-    argv = [
-        sys.executable, "-B", "-s", str(Path(__file__).resolve()),
-        "--voice1-gap-child", mode,
-    ]
+    """Run the fixture signal child by direct helper import, not a CLI mode."""
+    runner = os.path.abspath(__file__)
+    child = (
+        "import importlib.util, os, sys\n"
+        f"spec = importlib.util.spec_from_file_location('voice1_gap_control', {runner!r})\n"
+        "module = importlib.util.module_from_spec(spec)\n"
+        "sys.modules[spec.name] = module\n"
+        "spec.loader.exec_module(module)\n"
+        "module._signal_fixture_bootstrap(os.environ['VOICE1_GAP_MODE'], os.environ['VOICE1_GAP_ROOT'])\n"
+    )
+    argv = [sys.executable, "-B", "-s", "-c", child]
     env = dict(os.environ)
     env["VOICE1_SIGNAL_NAME"] = signal_name
+    env["VOICE1_GAP_MODE"] = mode
     env["VOICE1_GAP_ROOT"] = str(root)
     return argv, env
 
@@ -3631,10 +3940,4 @@ class Voice1CommitReceiptGapSignalTests(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    _gap_args = sys.argv[1:]
-    if len(_gap_args) == 2 and _gap_args[0] == "--voice1-gap-child":
-        # Fixture-only signal-gap child mode (R-GAP evidence); it is not an
-        # admission invocation and never touches live paths or credentials.
-        _signal_fixture_bootstrap(_gap_args[1], os.environ.get("VOICE1_GAP_ROOT", ""))
-        raise SystemExit(5)  # bootstrap only ever exits via SystemExit
     raise SystemExit(main())
