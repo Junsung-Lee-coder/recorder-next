@@ -1735,7 +1735,8 @@ class Voice1B6E4FindingRegressionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
             db_path = root / "state.db"
-            with sqlite3.connect(db_path) as connection:
+            connection = sqlite3.connect(db_path)
+            try:
                 connection.executescript(
                     """
                     CREATE TABLE sessions (
@@ -1750,6 +1751,8 @@ class Voice1B6E4FindingRegressionTests(unittest.TestCase):
                     );
                     """
                 )
+            finally:
+                connection.close()
 
             real_connect = sqlite3.connect
             observed: dict[str, Any] = {}
@@ -1782,7 +1785,8 @@ class Voice1B6E4FindingRegressionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
             db_path = root / "state.db"
-            with sqlite3.connect(db_path) as connection:
+            connection = sqlite3.connect(db_path)
+            try:
                 connection.executescript(
                     """
                     CREATE TABLE sessions (
@@ -1797,6 +1801,8 @@ class Voice1B6E4FindingRegressionTests(unittest.TestCase):
                     );
                     """
                 )
+            finally:
+                connection.close()
 
             real_connect = sqlite3.connect
             observed: dict[str, Any] = {}
@@ -1863,14 +1869,20 @@ class Voice1B6E4FindingRegressionTests(unittest.TestCase):
                 );
                 CREATE INDEX sessions_id_idx ON sessions(id);
             """
-            with sqlite3.connect(inside_db) as connection:
+            connection = sqlite3.connect(inside_db)
+            try:
                 connection.executescript(schema)
-            with sqlite3.connect(outside_db) as connection:
+            finally:
+                connection.close()
+            connection = sqlite3.connect(outside_db)
+            try:
                 connection.executescript(schema)
                 connection.execute(
                     "INSERT INTO sessions VALUES (?, ?, ?, ?)",
                     ("20260703_210417_8f66b434", "outside", "outside-key", None),
                 )
+            finally:
+                connection.close()
 
             context = {"authorization": {"paths": {"persisted_db": str(inside_db)}}}
             try:
@@ -2877,6 +2889,7 @@ class R25IntegratedRegressionTests(unittest.TestCase):
             with self.assertRaises(sqlite3.OperationalError):
                 RecorderStore._execute_sql_script(conn, "CREATE TABLE malformed (")
             conn.execute("ROLLBACK")
+        conn.close()
 
     def test_schema_preparation_failure_after_real_r25_rolls_back_pre_a_state(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2898,6 +2911,7 @@ class R25IntegratedRegressionTests(unittest.TestCase):
             with sqlite3.connect(db_path) as conn:
                 self.assertEqual(conn.execute("SELECT value FROM schema_meta WHERE key='schema_version'").fetchone()[0], "4")
                 self.assertEqual(conn.execute("SELECT device_id FROM devices WHERE device_id='sentinel-device'").fetchone()[0], "sentinel-device")
+            conn.close()
             migrated = RecorderStore(db_path, storage_root=root / "data")
             with migrated._read() as conn:
                 self.assertEqual(conn.execute("SELECT value FROM schema_meta WHERE key='schema_version'").fetchone()[0], "5")
@@ -3024,6 +3038,7 @@ class R25IntegratedRegressionTests(unittest.TestCase):
             with sqlite3.connect(db_path) as conn:
                 self.assertEqual(conn.execute("SELECT value FROM schema_meta WHERE key='schema_version'").fetchone()[0], "4")
                 self.assertIsNotNone(conn.execute("SELECT 1 FROM sqlite_master WHERE name='hermes_run_bindings'").fetchone())
+            conn.close()
 
     def test_unsupported_version_rejection_rolls_back_bootstrap_changes(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -3053,6 +3068,7 @@ class R25IntegratedRegressionTests(unittest.TestCase):
             with sqlite3.connect(db_path) as conn:
                 self.assertEqual(conn.execute("SELECT value FROM schema_meta WHERE key='schema_version'").fetchone()[0], "4")
                 self.assertIsNotNone(conn.execute("SELECT 1 FROM sqlite_master WHERE name='hermes_run_bindings'").fetchone())
+            conn.close()
             resumed = RecorderStore(db_path, storage_root=root / "data")
             with resumed._read() as conn:
                 self.assertEqual(conn.execute("SELECT value FROM schema_meta WHERE key='schema_version'").fetchone()[0], "5")
@@ -3097,6 +3113,7 @@ class R25IntegratedRegressionTests(unittest.TestCase):
             with sqlite3.connect(db_path) as conn:
                 self.assertEqual(conn.execute("SELECT value FROM schema_meta WHERE key='schema_version'").fetchone()[0], "4")
                 self.assertIsNotNone(conn.execute("SELECT 1 FROM sqlite_master WHERE name='hermes_run_bindings'").fetchone())
+            conn.close()
 
     def test_connect_closes_acquired_connection_when_pragma_setup_fails(self):
         real_connect = sqlite3.connect
