@@ -3541,15 +3541,100 @@ class Voice1B6E6SuccessorRegressionTests(unittest.TestCase):
             pin = self.control._regular_file_identity_no_follow(credential)
             handle = self.control._open_custodied_file(credential, pin, max_bytes=128)
             try:
+                with patch.object(self.control.os, "open", side_effect=AssertionError("reopen forbidden")):
+                    self.assertEqual(handle.read_bytes(), b"fixture-secret")
                 self.assertTrue(handle.revalidate())
                 replacement = root / "replacement"
                 replacement.write_bytes(b"fixture-secret")
                 original = root / "original"
                 credential.rename(original)
                 replacement.rename(credential)
+                with self.assertRaises(OSError):
+                    handle.read_bytes()
                 credential.rename(replacement)
                 original.rename(credential)
                 self.assertFalse(handle.revalidate(), "swap/restore must invalidate the held custody")
+            finally:
+                handle.close()
+
+    def test_e6_custody_handle_detects_swap_during_read(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            credential = root / "credential"
+            credential.write_bytes(b"fixture-secret")
+            replacement = root / "replacement"
+            replacement.write_bytes(b"replacement-secret")
+            handle = self.control._open_custodied_file(
+                credential,
+                self.control._regular_file_identity_no_follow(credential),
+                max_bytes=128,
+            )
+            original = root / "original"
+            swapped = False
+            real_read = self.control.os.read
+
+            def swap_then_read(fd, size):
+                nonlocal swapped
+                if not swapped:
+                    credential.rename(original)
+                    replacement.rename(credential)
+                    swapped = True
+                return real_read(fd, size)
+
+            try:
+                with patch.object(self.control.os, "read", side_effect=swap_then_read):
+                    with self.assertRaises(OSError):
+                        handle.read_bytes()
+                credential.rename(replacement)
+                original.rename(credential)
+            finally:
+                handle.close()
+
+    def test_e6_dashboard_metadata_handle_detects_swap_restore(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            metadata = root / "metadata.json"
+            metadata.write_text("{\"expires_at_utc\":\"2099-01-01T00:00:00Z\"}", encoding="utf-8")
+            handle = self.control._open_custodied_file(metadata, None, max_bytes=4096)
+            try:
+                self.assertEqual(handle.read_text(), metadata.read_text(encoding="utf-8"))
+                replacement = root / "metadata-replacement.json"
+                replacement.write_bytes(metadata.read_bytes())
+                original = root / "metadata-original.json"
+                metadata.rename(original)
+                replacement.rename(metadata)
+                metadata.rename(replacement)
+                original.rename(metadata)
+                self.assertFalse(handle.revalidate(), "metadata swap/restore must invalidate custody")
+            finally:
+                handle.close()
+
+    def test_e6_dashboard_metadata_handle_detects_swap_during_read(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            metadata = root / "metadata.json"
+            metadata.write_bytes(b"{\"expires_at_utc\":\"2099-01-01T00:00:00Z\"}")
+            replacement = root / "metadata-replacement.json"
+            replacement.write_bytes(b"{\"expires_at_utc\":\"2099-01-01T00:00:00Z\"}")
+            original = root / "metadata-original.json"
+            handle = self.control._open_custodied_file(metadata, None, max_bytes=4096)
+            swapped = False
+            real_read = self.control.os.read
+
+            def swap_then_read(fd, size):
+                nonlocal swapped
+                if not swapped:
+                    metadata.rename(original)
+                    replacement.rename(metadata)
+                    swapped = True
+                return real_read(fd, size)
+
+            try:
+                with patch.object(self.control.os, "read", side_effect=swap_then_read):
+                    with self.assertRaises(OSError):
+                        handle.read_bytes()
+                metadata.rename(replacement)
+                original.rename(metadata)
             finally:
                 handle.close()
 
@@ -3559,6 +3644,7 @@ class Voice1B6E6SuccessorRegressionTests(unittest.TestCase):
             db_path = root / "sessions.sqlite3"
             with sqlite3.connect(db_path) as connection:
                 connection.executescript(
+                    "PRAGMA journal_mode=WAL;"
                     "CREATE TABLE sessions (id TEXT, source TEXT, session_key TEXT, ended_at TEXT);"
                     "CREATE INDEX sessions_id_idx ON sessions(id);"
                     "INSERT INTO sessions VALUES ('20260703_210417_8f66b434','discord','fixture-key',NULL);"
@@ -3571,6 +3657,13 @@ class Voice1B6E6SuccessorRegressionTests(unittest.TestCase):
             with patch.object(self.control.sqlite3, "connect", side_effect=original_connect):
                 drifted = self.control._persisted_lookup(context, deadline_at=time.monotonic() + 5.0)
             self.assertFalse(drifted["read_only"], "a replaced connect callable is not authorized")
+            alias = root / "sessions-alias.sqlite3"
+            alias.symlink_to(db_path)
+            symlinked = self.control._persisted_lookup(
+                {"authorization": {"paths": {"persisted_db": str(alias)}}},
+                deadline_at=time.monotonic() + 5.0,
+            )
+            self.assertFalse(symlinked["read_only"], "SQLite authority must reject symlinked paths")
 
     def test_e6_admission_report_requires_fresh_observation_and_scope_key(self):
         now = time.monotonic_ns()
@@ -3629,6 +3722,22 @@ class Voice1B6E6SuccessorRegressionTests(unittest.TestCase):
             "admission_sha256": hashlib.sha256(raw).hexdigest(),
         }
         self.assertIsNotNone(self.control._validate_a3_admission_report(admission_context, raw))
+        freshness_mutations = {
+            "stale_monotonic": {"session_observed_monotonic_ns": max(0, now - 10_000_000_001)},
+            "future_finished": {"finished_utc": "2099-01-01T00:00:00Z"},
+            "cross_boot": {"boot_id": "00000000-0000-4000-8000-000000000001"},
+            "stale_utc": {"session_observed_utc": "2000-01-01T00:00:00Z"},
+        }
+        for label, mutation in freshness_mutations.items():
+            with self.subTest(freshness=label):
+                mutated = dict(report, **mutation)
+                mutated_raw = (json.dumps(mutated, sort_keys=True) + "\n").encode("utf-8")
+                self.assertIsNone(
+                    self.control._validate_a3_admission_report(
+                        dict(admission_context, admission_sha256=hashlib.sha256(mutated_raw).hexdigest()),
+                        mutated_raw,
+                    )
+                )
         trailing_space = raw[:-1] + b" \n"
         self.assertIsNone(
             self.control._validate_a3_admission_report(
