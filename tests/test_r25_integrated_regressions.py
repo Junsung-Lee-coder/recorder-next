@@ -3642,13 +3642,16 @@ class Voice1B6E6SuccessorRegressionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
             db_path = root / "sessions.sqlite3"
-            with sqlite3.connect(db_path) as connection:
+            connection = sqlite3.connect(db_path)
+            try:
                 connection.executescript(
                     "PRAGMA journal_mode=WAL;"
                     "CREATE TABLE sessions (id TEXT, source TEXT, session_key TEXT, ended_at TEXT);"
                     "CREATE INDEX sessions_id_idx ON sessions(id);"
                     "INSERT INTO sessions VALUES ('20260703_210417_8f66b434','discord','fixture-key',NULL);"
                 )
+            finally:
+                connection.close()
             context = {"authorization": {"paths": {"persisted_db": str(db_path)}}}
             healthy = self.control._persisted_lookup(context, deadline_at=time.monotonic() + 5.0)
             self.assertTrue(healthy["read_only"])
@@ -3797,12 +3800,15 @@ class Voice1B6E6SuccessorRegressionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
             db_path = root / "sessions.sqlite3"
-            with sqlite3.connect(db_path) as connection:
+            connection = sqlite3.connect(db_path)
+            try:
                 connection.executescript(
                     "CREATE TABLE sessions (id TEXT, source TEXT, session_key TEXT, ended_at TEXT);"
                     "CREATE INDEX sessions_id_idx ON sessions(id);"
                     "INSERT INTO sessions VALUES ('20260703_210417_8f66b434','discord','fixture-key',NULL);"
                 )
+            finally:
+                connection.close()
             replacement = root / "replacement.sqlite3"
             replacement.write_bytes(db_path.read_bytes())
 

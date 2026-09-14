@@ -3216,10 +3216,37 @@ def _directory_custody_signature(path: Path) -> tuple[int, ...] | None:
         return None
     if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
         return None
+    # Directory timestamps detect a same-directory swap/restore.  SQLite WAL
+    # sidecars are handled by _directory_custody_equal at comparison time.
     return (
         info.st_dev, info.st_ino, info.st_uid, info.st_gid,
         stat.S_IMODE(info.st_mode), info.st_ctime_ns, info.st_mtime_ns,
     )
+
+
+def _sqlite_wal_mode(reference_fd: int) -> bool:
+    """Read SQLite's format-version bytes from the already-held DB descriptor."""
+    try:
+        header = os.pread(reference_fd, 20, 0)
+    except (AttributeError, OSError):
+        return False
+    return len(header) == 20 and header[:16] == b"SQLite format 3\x00" and header[18:20] == b"\x02\x02"
+
+
+def _directory_custody_equal(
+    expected: tuple[int, ...] | None,
+    actual: tuple[int, ...] | None,
+    *,
+    wal_mode: bool,
+) -> bool:
+    if expected is None or actual is None:
+        return False
+    if expected == actual:
+        return True
+    # SQLite may create/remove -wal/-shm entries during an otherwise
+    # read-only WAL observation, changing only parent timestamps.  The
+    # directory's device/inode/owner/mode remain the custody identity.
+    return wal_mode and expected[:5] == actual[:5]
 
 
 def _connection_db_fd(
@@ -3302,6 +3329,8 @@ def _persisted_lookup(context: dict[str, Any], *, deadline_at: float | None = No
         return result
     opening_identity = reference_identity
     opening_parent_signature = _directory_custody_signature(db_path)
+    wal_mode = _sqlite_wal_mode(reference_fd)
+    result["db_wal_mode"] = wal_mode
     if opening_parent_signature is None:
         os.close(reference_fd)
         return result
@@ -3313,6 +3342,7 @@ def _persisted_lookup(context: dict[str, Any], *, deadline_at: float | None = No
             raise TimeoutError("admission deadline")
 
     connection: sqlite3.Connection | None = None
+    connection_parent_signature: tuple[int, ...] | None = None
     try:
         ensure_deadline()
         remaining = deadline - time.monotonic()
@@ -3357,6 +3387,12 @@ def _persisted_lookup(context: dict[str, Any], *, deadline_at: float | None = No
         ensure_deadline()
         connection.execute(f"PRAGMA busy_timeout={busy_timeout_ms}")
         ensure_deadline()
+        connection_parent_signature = _directory_custody_signature(db_path)
+        result["db_parent_signature_connected"] = connection_parent_signature
+        if not _directory_custody_equal(
+            opening_parent_signature, connection_parent_signature, wal_mode=wal_mode
+        ):
+            return result
         indexes = connection.execute("PRAGMA index_list('sessions')").fetchall()
         ensure_deadline()
         columns = [row[1] for row in connection.execute("PRAGMA table_info('sessions')").fetchall()]
@@ -3380,8 +3416,16 @@ def _persisted_lookup(context: dict[str, Any], *, deadline_at: float | None = No
             (SELECTED_S,),
         ).fetchall()
         result["rows"] = [tuple(row) for row in rows]
-        if connection_fd is None or not _connection_identity_ok(db_path, reference_fd, connection_fd):
-            raise OSError("SQLite connection object drifted after query")
+        if (
+            connection_fd is None
+            or not _connection_identity_ok(db_path, reference_fd, connection_fd)
+            or not _directory_custody_equal(
+                connection_parent_signature,
+                _directory_custody_signature(db_path),
+                wal_mode=wal_mode,
+            )
+        ):
+            raise OSError("SQLite connection or parent custody drifted after query")
     except (sqlite3.Error, OSError, TimeoutError, TypeError, ValueError):
         result["read_only"] = False
         result["indexed"] = False
@@ -3421,8 +3465,13 @@ def _persisted_lookup(context: dict[str, Any], *, deadline_at: float | None = No
             result["db_parent_signature_post_close"] = post_close_parent_signature
             if (
                 close_failed
+                or connection_parent_signature is None
                 or post_close_path_identity != opening_identity
-                or post_close_parent_signature != opening_parent_signature
+                or not _directory_custody_equal(
+                    connection_parent_signature,
+                    post_close_parent_signature,
+                    wal_mode=wal_mode,
+                )
                 or not result["db_identity_equal"]
                 or not result.get("db_connected_file_equal")
             ):
