@@ -1055,8 +1055,8 @@ class Voice1B6ExecutableClosureTests(unittest.TestCase):
         self.assertTrue(callable(control.execute_attempt_phase))
         self.assertTrue(callable(control.cleanup_attempt))
         self.assertIsInstance(control.REQUIRED_PREDICATES, tuple)
-        self.assertEqual(len(control.REQUIRED_PREDICATES), 32)
-        self.assertEqual(len(set(control.REQUIRED_PREDICATES)), 32)
+        self.assertEqual(len(control.REQUIRED_PREDICATES), 33)
+        self.assertEqual(len(set(control.REQUIRED_PREDICATES)), 33)
 
     def test_main_without_flags_is_structured_hold_exit_2(self):
         # B6 REV-008: any noncanonical invocation prints one JSON HOLD/2.
@@ -1876,6 +1876,448 @@ class Voice1B6E4FindingRegressionTests(unittest.TestCase):
         )
         self.assertEqual(fixture["persisted_key_sha256"], self.control.FIXTURE_KEY_SHA256)
         self.assertEqual(live["persisted_key_sha256"], self.control.EXPECTED_KEY_SHA256)
+
+
+class Voice1B6E5FindingRegressionTests(unittest.TestCase):
+    """Focused regression tests for the seven E5 review findings (F-1..F-7)."""
+
+    E5_GIT_COMMIT = "54887b63b690daa74627efef8a06257396ffaab0"
+    E5_GIT_TREE = "d45735715e8f75ef7c91bb280a433df9f1ebb89b"
+    E5_GIT_TRACKED_COUNT = 77
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        control_dir = Path(__file__).resolve().parents[1] / "run"
+        if str(control_dir) not in sys.path:
+            sys.path.insert(0, str(control_dir))
+        import qa_probe_runner as control
+
+        cls.control = control
+
+    # -- shared fixtures -----------------------------------------------------
+
+    _BUNDLE_MEMBERS = (
+        "recorder_next/__init__.py",
+        "recorder_next/adapters.py",
+        "recorder_next/canonical.py",
+        "recorder_next/hermes_wire.py",
+        "recorder_next/media.py",
+        "recorder_next/models.py",
+    )
+
+    def _candidate_root(self) -> Path:
+        return Path(self.control.__file__ or "run/qa_probe_runner.py").resolve().parents[1]
+
+    def _manifest(self) -> dict[str, Any]:
+        return Voice1B6E4FindingRegressionTests._manifest(self)
+
+    def _authorization(self, root: Path, manifest: dict[str, Any]) -> dict[str, Any]:
+        return Voice1B6E4FindingRegressionTests._authorization(self, root, manifest)
+
+    def _bundle_fixture(self, root: Path) -> tuple[dict[str, str], Path]:
+        """A real 6-member candidate archive whose bytes are digest-pinned."""
+        import io
+        import tarfile
+
+        datas: dict[str, bytes] = {}
+        per_file: dict[str, str] = {}
+        for member in self._BUNDLE_MEMBERS:
+            if member == "recorder_next/__init__.py":
+                data = b'"""fixture candidate package."""\n'
+            else:
+                data = (self._candidate_root() / member).read_bytes()
+            datas[member] = data
+            per_file[member] = hashlib.sha256(data).hexdigest()
+        archive = root / "candidate.tar"
+        with tarfile.open(archive, "w") as handle:
+            for member in self._BUNDLE_MEMBERS:
+                info = tarfile.TarInfo(member)
+                info.size = len(datas[member])
+                handle.addfile(info, io.BytesIO(datas[member]))
+        return per_file, archive
+
+    def _snapshot_candidate_modules(self) -> dict[str, Any]:
+        return {
+            name: module
+            for name, module in sys.modules.items()
+            if name == "recorder_next" or name.startswith("recorder_next.")
+        }
+
+    def _restore_candidate_modules(self, snapshot: dict[str, Any]) -> None:
+        for name in [
+            name
+            for name in sys.modules
+            if name == "recorder_next" or name.startswith("recorder_next.")
+        ]:
+            if name not in snapshot:
+                del sys.modules[name]
+        sys.modules.update(snapshot)
+
+    # -- F-1: the gate precedes any recorder_next import ----------------------
+
+    def test_f1_authority_drift_imports_nothing_and_holds(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            root.chmod(0o700)
+            manifest = self._manifest()
+            authorization = self._authorization(root, manifest)
+            mp = root / "manifest.json"
+            ap = root / "authorization.json"
+            mp.write_text(json.dumps(manifest), encoding="utf-8")
+            ap.write_text(json.dumps(authorization), encoding="utf-8")
+            argv = [
+                "--read-only-admission", "--manifest", str(mp),
+                "--manifest-sha256", hashlib.sha256(mp.read_bytes()).hexdigest(),
+                "--authorization", str(ap),
+                "--authorization-sha256", hashlib.sha256(ap.read_bytes()).hexdigest(),
+            ]
+            snapshot = self._snapshot_candidate_modules()
+            calls: list[str] = []
+            real_import = importlib.import_module
+
+            def guarded(name: str, *args: Any, **kwargs: Any):
+                if name == "recorder_next" or name.startswith("recorder_next."):
+                    calls.append(name)
+                    raise AssertionError(f"import before gate: {name}")
+                return real_import(name, *args, **kwargs)
+
+            try:
+                with patch.object(
+                    self.control, "_cold_rehash_ratified_authorities", return_value=False
+                ), patch.object(importlib, "import_module", side_effect=guarded):
+                    stdout = io.StringIO()
+                    stderr = io.StringIO()
+                    with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                        exit_code = self.control.main(argv)
+                report = json.loads(stdout.getvalue())
+                self.assertEqual(exit_code, 2)
+                self.assertEqual(report["status"], "HOLD")
+                self.assertEqual(calls, [], "no recorder_next import may occur on authority drift")
+                self.assertEqual(stderr.getvalue(), "")
+            finally:
+                self._restore_candidate_modules(snapshot)
+
+    # -- F-2: manifest-byte-bound candidate loader ---------------------------
+
+    def test_f2_loader_binds_candidate_modules_to_manifest_bytes(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            per_file, archive = self._bundle_fixture(root)
+            snapshot = self._snapshot_candidate_modules()
+            try:
+                # The test module itself preloads recorder_next; the loader must
+                # see a clean namespace, so drop them for the load and restore after.
+                self._restore_candidate_modules({})
+                with patch.object(self.control, "_verify_candidate_source", return_value=True):
+                    bundle = self.control._load_candidate_module_bundle(
+                        {"per_file_sha256": per_file}, {"archive_path": str(archive)}
+                    )
+                self.assertIsInstance(bundle, dict)
+                assert isinstance(bundle, dict)
+                self.assertIn("recorder_next.adapters", bundle["modules"])
+                adapters = bundle["adapters"]
+                self.assertEqual(getattr(adapters, "__manifest_member__", None), "recorder_next/adapters.py")
+                for name, member in bundle["modules"].items():
+                    module = sys.modules.get(name)
+                    self.assertIsNotNone(module)
+                    spec = getattr(module, "__spec__", None)
+                    self.assertIsInstance(getattr(spec, "loader", None), self.control._ManifestBytesLoader)
+                    self.assertEqual(getattr(module, "__manifest_member__", None), member)
+                self.assertTrue(
+                    self.control._candidate_modules_still_bound(
+                        bundle, {"per_file_sha256": per_file}, {"archive_path": str(archive)}
+                    )
+                )
+            finally:
+                self._restore_candidate_modules(snapshot)
+
+    def test_f2_loader_rejects_forged_digest_drifted_archive_and_preload(self):
+        import io
+        import tarfile
+
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            per_file, archive = self._bundle_fixture(root)
+            snapshot = self._snapshot_candidate_modules()
+            try:
+                self._restore_candidate_modules({})
+                # (a) forged manifest digest for a member present in the archive:
+                forged = dict(per_file)
+                forged["recorder_next/adapters.py"] = "0" * 64
+                with patch.object(self.control, "_verify_candidate_source", return_value=True):
+                    self.assertIsNone(
+                        self.control._load_candidate_module_bundle(
+                            {"per_file_sha256": forged}, {"archive_path": str(archive)}
+                        )
+                    )
+                # (b) archive member bytes drifted from the manifest pin:
+                drifted_archive = root / "drifted.tar"
+                data = (self._candidate_root() / "recorder_next" / "adapters.py").read_bytes() + b"\n# drift\n"
+                with tarfile.open(drifted_archive, "w") as handle:
+                    info = tarfile.TarInfo("recorder_next/adapters.py")
+                    info.size = len(data)
+                    handle.addfile(info, io.BytesIO(data))
+                with patch.object(self.control, "_verify_candidate_source", return_value=True):
+                    self.assertIsNone(
+                        self.control._load_candidate_module_bundle(
+                            {"per_file_sha256": per_file}, {"archive_path": str(drifted_archive)}
+                        )
+                    )
+                # (c) a preloaded foreign recorder_next module blocks the bundle:
+                self._restore_candidate_modules({})
+                sentinel = importlib.util.module_from_spec(
+                    importlib.util.spec_from_loader("recorder_next", loader=None)
+                )
+                sys.modules["recorder_next"] = sentinel
+                try:
+                    with patch.object(self.control, "_verify_candidate_source", return_value=True):
+                        self.assertIsNone(
+                            self.control._load_candidate_module_bundle(
+                                {"per_file_sha256": per_file}, {"archive_path": str(archive)}
+                            )
+                        )
+                finally:
+                    del sys.modules["recorder_next"]
+            finally:
+                self._restore_candidate_modules(snapshot)
+
+    # -- F-3: identity-bound credential custody ------------------------------
+
+    def test_f3_credential_read_binds_value_to_custody_pinned_object(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            credential = root / "dashboard.env"
+            credential.write_bytes(b"API_SERVER_KEY=Abc123value\n")
+            info = credential.stat()
+            import stat as stat_module
+
+            pin = {
+                "device": info.st_dev,
+                "inode": info.st_ino,
+                "uid": info.st_uid,
+                "gid": info.st_gid,
+                "mode": stat_module.S_IMODE(info.st_mode),
+            }
+            value = self.control._read_credential_default(credential, pin)
+            self.assertEqual(value, "Abc123value")
+            swapped = root / "swap.env"
+            swapped.write_bytes(b"API_SERVER_KEY=EvilSwapValue\n")
+            # Pin the SWAPPED object's own identity, then corrupt one field so
+            # the pin can never match the object actually opened (inode reuse
+            # in a fresh directory makes off-by-one guesses unreliable).
+            swapped_info = swapped.stat()
+            drifted = {
+                "device": swapped_info.st_dev,
+                "inode": swapped_info.st_ino,
+                "uid": swapped_info.st_uid,
+                "gid": swapped_info.st_gid,
+                "mode": stat_module.S_IMODE(swapped_info.st_mode),
+            }
+            drifted["mode"] = drifted["mode"] ^ 0o040  # always flips one mode bit
+            with self.assertRaises(CredentialError):
+                self.control._read_credential_default(swapped, drifted)
+            link = root / "link.env"
+            link.symlink_to(credential)
+            with self.assertRaises(CredentialError):
+                self.control._read_credential_default(link, pin)
+
+    # -- F-4: redirected SQLite connection rejection -------------------------
+
+    def test_f4_persisted_lookup_rejects_redirected_connection_file(self):
+        def make_db(target: Path, row_id: str) -> None:
+            connection = sqlite3.connect(str(target))
+            try:
+                connection.execute(
+                    "CREATE TABLE sessions (id TEXT PRIMARY KEY, source TEXT,"
+                    " session_key TEXT, ended_at TEXT)"
+                )
+                connection.execute(
+                    "INSERT INTO sessions (id, source, session_key, ended_at)"
+                    " VALUES (?, 'x', 'k', NULL)",
+                    (row_id,),
+                )
+                connection.commit()
+            finally:
+                connection.close()
+
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            real_db = root / "state.db"
+            elsewhere = root / "elsewhere.db"
+            make_db(real_db, "s1")
+            make_db(elsewhere, "evil")
+            context = {
+                "authorization": {"paths": {"persisted_db": str(real_db)}},
+                "session_deadline": time.monotonic() + 5.0,
+            }
+            healthy = self.control._persisted_lookup(dict(context))
+            self.assertTrue(healthy["read_only"])
+            self.assertTrue(healthy["db_connected_file_equal"])
+
+            real_connect = sqlite3.connect
+
+            def redirected_connect(*args: Any, **kwargs: Any):
+                return real_connect(str(elsewhere))
+
+            with patch.object(self.control.sqlite3, "connect", side_effect=redirected_connect):
+                hijacked = self.control._persisted_lookup(dict(context))
+            self.assertEqual(hijacked.get("rows"), [], "rows from a redirected connection must be dropped")
+            self.assertFalse(hijacked.get("db_connected_file_equal", True))
+
+    # -- F-5: one shared collision-free TTS projection ------------------------
+
+    def test_f5_shared_projection_is_lossless_and_collision_free(self):
+        reduce = self.control._tts_reduction
+        self.assertNotEqual(reduce({"ok": False, "reason": 7}), reduce({"ok": False, "reason": "7"}))
+        self.assertNotEqual(
+            reduce({"ok": False, "reason": "invalid:list"}),
+            reduce({"ok": False, "reason": ["a", "b"]}),
+        )
+        self.assertEqual(
+            reduce({"tts": {"configured": "invalid:str"}}),
+            reduce({"tts": {"configured": "invalid:str"}}),
+        )
+        self.assertEqual(
+            reduce({"tts": {"voices": ["a", "b"]}}),
+            reduce({"tts": {"voices": ["a", "b"]}}),
+        )
+        self.assertNotEqual(
+            reduce({"tts": {"voices": ["a", "b"]}}),
+            reduce({"tts": {"voices": ["b", "a"]}}),
+        )
+        self.assertNotEqual(reduce({"ok": True}), reduce({"ok": 1}))
+        once = reduce({"ok": True, "tts": {"voices": ["a"]}})
+        self.assertEqual(once, reduce(once))
+
+    def _profile_response(self, body: Any) -> dict[str, Any]:
+        return {"status": 200, "body": json.dumps(body).encode("utf-8")}
+
+    def test_f5_profile_readiness_compares_through_one_shared_projection(self):
+        valid = {
+            "ok": True, "ready": True, "configured": True, "enabled": True, "audio_api": True,
+            "stt": {"mode": "relay", "provider": "hermes-stt"},
+            "tts": {"mode": "relay", "reason": "command/plugin provider", "wire": "server",
+                    "provider": "edge", "configured": True, "enabled": True, "ready": True,
+                    "ok": True, "status": "ok"},
+        }
+        explicit = {"status": 200, "projection": self.control._tts_reduction(valid)}
+        self.assertTrue(self.control._profile_observations_ready(self._profile_response(valid), explicit))
+
+    def test_f5_profile_readiness_rejects_collision_and_divergence(self):
+        base = {
+            "ok": True, "ready": True, "configured": True, "enabled": True, "audio_api": True,
+            "stt": {"mode": "relay", "provider": "hermes-stt"},
+            "tts": {"mode": "relay", "reason": "command/plugin provider", "wire": "server",
+                    "provider": "edge", "configured": True, "enabled": True, "ready": True,
+                    "ok": True, "status": "ok"},
+        }
+        mutated = {
+            "ok": True, "ready": True, "configured": True, "enabled": True, "audio_api": True,
+            "stt": {"mode": "relay", "provider": "hermes-stt"},
+            "tts": {"mode": "relay", "reason": "command/plugin provider", "wire": "server",
+                    "provider": "edge", "configured": "invalid:str", "enabled": True,
+                    "ready": True, "ok": True, "status": "ok"},
+        }
+        self.assertFalse(
+            self.control._profile_observations_ready(
+                self._profile_response(base),
+                {"status": 200, "projection": self.control._tts_reduction(mutated)},
+            )
+        )
+        diverged = dict(base)
+        diverged["tts"] = dict(base["tts"], status="degraded")
+        self.assertFalse(
+            self.control._profile_observations_ready(
+                self._profile_response(base),
+                {"status": 200, "projection": self.control._tts_reduction(diverged)},
+            )
+        )
+        spoofed = dict(base)
+        spoofed["tts"] = dict(base["tts"], status="invalid:list")
+        self.assertFalse(
+            self.control._profile_observations_ready(
+                self._profile_response(base),
+                {"status": 200, "projection": self.control._tts_reduction(spoofed)},
+            )
+        )
+
+    # -- F-6: canonical argv rejects double-slash aliases ---------------------
+
+    def test_f6_canonical_argv_rejects_double_slash_path_aliases(self):
+        digest = "a" * 64
+        for manifest_alias, authorization_alias in (
+            ("//tmp/m.json", "/tmp/a.json"),
+            ("/tmp//m.json", "/tmp/a.json"),
+            ("/tmp/m.json", "//tmp/a.json"),
+        ):
+            argv = [
+                "--read-only-admission", "--manifest", manifest_alias,
+                "--manifest-sha256", digest,
+                "--authorization", authorization_alias,
+                "--authorization-sha256", digest,
+            ]
+            self.assertIsNone(
+                self.control._canonical_argv(argv),
+                f"double-slash alias must be rejected: {manifest_alias}, {authorization_alias}",
+            )
+
+    def test_f6_admission_holds_on_double_slash_manifest_argv(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            manifest = root / "manifest.json"
+            authorization = root / "authorization.json"
+            manifest.write_text("{}", encoding="utf-8")
+            authorization.write_text("{}", encoding="utf-8")
+            argv = [
+                "--read-only-admission",
+                "--manifest", f"//{str(manifest).lstrip('/')}",
+                "--manifest-sha256", hashlib.sha256(manifest.read_bytes()).hexdigest(),
+                "--authorization", str(authorization),
+                "--authorization-sha256", hashlib.sha256(authorization.read_bytes()).hexdigest(),
+            ]
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                exit_code = self.control.main(argv)
+            report = json.loads(stdout.getvalue())
+            self.assertEqual(exit_code, 2)
+            self.assertEqual(report["status"], "HOLD")
+            self.assertIn("invalid_argv", report["reason_codes"])
+            self.assertEqual(stderr.getvalue(), "")
+
+    # -- F-7: evidence-side anchors (sealed E4 packet) -------------------------
+
+    def test_f7_sealed_e4_packet_anchors_git_identity_and_full_files(self):
+        packet = Path(__file__).resolve().parents[1] / (
+            ".release-artifacts/voice1-b6-e4-fresh-repair-candidate-final-r6"
+        )
+        self.assertTrue(packet.is_dir(), "sealed E4 packet must exist")
+        manifest = json.loads((packet / "candidate-manifest.json").read_text(encoding="utf-8"))
+        # Git-true 40-hex identity (never an abbreviated or invented vector):
+        self.assertEqual(manifest.get("source_commit"), self.E5_GIT_COMMIT)
+        self.assertEqual(manifest.get("source_tree"), self.E5_GIT_TREE)
+        # tracked count states the real Git-tracked file count (77), and the
+        # manifest carries a full-file detached anchor for EVERY tracked file:
+        per_file = manifest.get("per_file_sha256")
+        self.assertIsInstance(per_file, dict)
+        self.assertEqual(manifest.get("tracked_file_count"), self.E5_GIT_TRACKED_COUNT)
+        self.assertEqual(len(per_file), self.E5_GIT_TRACKED_COUNT)
+        self.assertIn("run/qa_probe_runner.py", per_file)
+        self.assertRegex(str(per_file["run/qa_probe_runner.py"]), r"^[0-9a-f]{64}$")
+        # the detached manifest binds every other evidence member by full sha256
+        # and the anchor for the runner is byte-verifiable against the source tar:
+        detached = (packet / "detached-manifest.txt").read_text(encoding="utf-8")
+        self.assertIn(f"source_commit={self.E5_GIT_COMMIT}", detached)
+        self.assertIn(f"source_tree={self.E5_GIT_TREE}", detached)
+        anchored: dict[str, str] = {}
+        for line in detached.splitlines():
+            if line.startswith("member="):
+                name = line.split("=", 1)[1].split("\t", 1)[0]
+                digest = line.rsplit("sha256=", 1)[1].strip()
+                anchored[name] = digest
+        self.assertIn("candidate-manifest.json", anchored)
+        actual = hashlib.sha256((packet / "candidate-manifest.json").read_bytes()).hexdigest()
+        self.assertEqual(anchored["candidate-manifest.json"], actual)
 
 
 class R19ArgvProjectionTests(unittest.TestCase):

@@ -748,6 +748,7 @@ REQUIRED_PREDICATES: tuple[str, ...] = (
     "candidate_bound",
     "imports_bound",
     "credential_custody",
+    "credential_custody_after_reads",
     "dashboard_credential_parse",
     "api_credential_parse",
     "lifetime_pre",
@@ -1279,7 +1280,20 @@ def _is_lower_hex(value: Any, length: int) -> bool:
 
 
 def _bounded_absolute_path(value: Any) -> Path | None:
+    """Exact lexical canonical absolute path or None (E5 F-6).
+
+    Canonical means: exactly one leading slash, no empty, "." or ".."
+    components anywhere, and the string is already its own lexical
+    normalization (no realpath resolution — symlink freedom is proven
+    separately by the no-follow identity checks).  Aliases such as
+    ``//tmp/x`` (POSIX normpath preserves exactly two leading slashes) or
+    ``/tmp//x`` therefore reject before any protected work.
+    """
     if not isinstance(value, str) or not value or len(value) > 4096 or "\x00" in value:
+        return None
+    if not value.startswith("/") or value.startswith("//"):
+        return None
+    if any(part in {"", ".", ".."} for part in value.split("/")[1:]):
         return None
     path = Path(value)
     if not path.is_absolute() or str(path) != value or os.path.normpath(value) != value:
@@ -1630,6 +1644,259 @@ def _verify_imported_module_identity(
     return _is_lower_hex(expected_digest, 64) and hashlib.sha256(loaded[0]).hexdigest() == expected_digest
 
 
+def _extract_manifest_member_bytes(
+    archive_path: Path, per_file: dict[str, str]
+) -> dict[str, bytes] | None:
+    """Extract exactly the manifest members from the verified archive (E5 F-2).
+
+    Every returned byte string is digest-checked against ``per_file`` while
+    streaming out of the tar, so the loader below executes exactly the bytes
+    the manifest pinned — never whatever a pathname currently resolves to.
+    """
+    import io
+    import tarfile
+
+    archive_loaded = _read_regular_file_no_follow(archive_path, limit=64 * 1024 * 1024)
+    if archive_loaded is None:
+        return None
+    archive_bytes = archive_loaded[0]
+    members: dict[str, bytes] = {}
+    try:
+        with tarfile.open(fileobj=io.BytesIO(archive_bytes), mode="r:*") as tar:
+            for member in tar.getmembers():
+                if not member.isreg():
+                    continue
+                name = member.name
+                if name.startswith("./"):
+                    name = name[2:]
+                if name not in per_file:
+                    continue
+                extracted = tar.extractfile(member)
+                if extracted is None:
+                    return None
+                digest = hashlib.sha256()
+                chunks: list[bytes] = []
+                with extracted:
+                    while True:
+                        chunk = extracted.read(65536)
+                        if not chunk:
+                            break
+                        digest.update(chunk)
+                        chunks.append(chunk)
+                expected = per_file.get(name)
+                if not _is_lower_hex(expected, 64) or digest.hexdigest() != expected:
+                    return None
+                members[name] = b"".join(chunks)
+    except (tarfile.TarError, EOFError, OSError):
+        return None
+    if set(members) != set(per_file):
+        return None
+    return members
+
+
+def _member_module_name(member: str) -> str | None:
+    """Map a manifest member name to the module it defines, if any."""
+    if not member.startswith("recorder_next/") or not member.endswith(".py"):
+        return None
+    stem = member[:-3]
+    if stem.endswith("/__init__"):
+        stem = stem[: -len("/__init__")]
+    return stem.replace("/", ".")
+
+
+class _ManifestBytesLoader:
+    """Loader executing exactly one manifest member's verified bytes (E5 F-2)."""
+
+    def __init__(self, member: str, data: bytes) -> None:
+        self._member = member
+        self._data = data
+
+    def get_filename(self, fullname: Any = None) -> str:
+        return f"recorder-next-manifest:{self._member}"
+
+    def create_module(self, spec: Any) -> None:
+        return None
+
+    def exec_module(self, module: Any) -> None:
+        compiled = compile(self._data, self.get_filename(), "exec")
+        # The candidate's modules reference module-level dunder state
+        # (__file__/__package__) that a bare exec does not provide; bind the
+        # manifest-virtual identity, never a real filesystem pathname.
+        module.__file__ = self.get_filename()
+        module.__package__ = self._package_for()
+        exec(compiled, module.__dict__)
+        module.__manifest_member__ = self._member
+
+    def is_package(self, fullname: Any) -> bool:
+        return self._member.endswith("__init__.py")
+
+    def _package_for(self) -> str:
+        if self._member.endswith("__init__.py"):
+            stem = self._member[: -len("__init__.py")]
+            return stem.rstrip("/").replace("/", ".")
+        parent = self._member.rsplit("/", 1)[0]
+        return parent.replace("/", ".")
+
+
+class _RejectingLoader:
+    """Loader that refuses candidate modules outside the manifest (E5 F-2)."""
+
+    def __init__(self, fullname: str) -> None:
+        self._fullname = fullname
+
+    def get_filename(self, fullname: Any = None) -> str:
+        return f"recorder-next-manifest:absent:{self._fullname}"
+
+    def create_module(self, spec: Any) -> None:
+        return None
+
+    def exec_module(self, module: Any) -> None:
+        raise ImportError(
+            f"candidate module {self._fullname!r} is not a manifest member"
+        )
+
+
+class _ManifestPackageFinder:
+    """Meta-path finder serving recorder_next* only from manifest bytes.
+
+    Any recorder_next import not present in the manifest resolves to a
+    rejecting loader (ImportError on exec) — the real filesystem is never
+    consulted for candidate code while the finder is installed.
+    """
+
+    def __init__(self, module_map: dict[str, tuple[str, bytes]]) -> None:
+        self._module_map = module_map
+
+    def find_spec(self, fullname: str, path: Any = None, target: Any = None) -> Any:
+        if fullname != "recorder_next" and not fullname.startswith("recorder_next."):
+            return None
+        entry = self._module_map.get(fullname)
+        if entry is None:
+            return importlib.machinery.ModuleSpec(
+                fullname,
+                _RejectingLoader(fullname),
+                origin=f"recorder-next-manifest:absent:{fullname}",
+            )
+        member, data = entry
+        spec = importlib.machinery.ModuleSpec(
+            fullname,
+            _ManifestBytesLoader(member, data),
+            origin=f"recorder-next-manifest:{member}",
+        )
+        if member.endswith("__init__.py"):
+            # A package spec needs submodule_search_locations for
+            # `recorder_next.adapters` to import under it (E5 F-2).
+            spec.submodule_search_locations = []
+        return spec
+
+
+def _loaded_candidate_modules() -> dict[str, Any]:
+    return {
+        name: module
+        for name, module in sys.modules.items()
+        if name == "recorder_next" or name.startswith("recorder_next.")
+    }
+
+
+def _load_candidate_module_bundle(
+    manifest: dict[str, Any], authorization: dict[str, Any]
+) -> dict[str, Any] | None:
+    """Execute candidate modules only from manifest-verified bytes (E5 F-2).
+
+    Full source verification runs first; then every recorder_next module is
+    imported through a finder that serves exactly the pinned member bytes.
+    Preloaded foreign recorder_next modules are rejected (never silently
+    reused), and after import every loaded candidate module must be
+    manifest-bound.  Returns {"adapters": module, "modules": {name: member}}
+    or None on any failure.
+    """
+    if not _verify_candidate_source(authorization, manifest):
+        return None
+    per_file = manifest.get("per_file_sha256")
+    if not isinstance(per_file, dict) or not per_file:
+        return None
+    archive_path = _bounded_absolute_path(authorization.get("archive_path"))
+    if archive_path is None:
+        return None
+    member_bytes = _extract_manifest_member_bytes(archive_path, per_file)
+    if member_bytes is None:
+        return None
+    module_map: dict[str, tuple[str, bytes]] = {}
+    for member, data in member_bytes.items():
+        module_name = _member_module_name(member)
+        if module_name is not None:
+            if module_name in module_map:
+                return None
+            module_map[module_name] = (member, data)
+    if "recorder_next" not in module_map or "recorder_next.adapters" not in module_map:
+        return None
+
+    preloaded = _loaded_candidate_modules()
+    if preloaded:
+        return None
+    finder = _ManifestPackageFinder(module_map)
+    sys.meta_path.insert(0, finder)
+    try:
+        loaded = importlib.import_module("recorder_next.adapters")
+        bound: dict[str, str] = {}
+        for name, module in _loaded_candidate_modules().items():
+            spec = getattr(module, "__spec__", None)
+            loader = getattr(spec, "loader", None) if spec is not None else None
+            if not isinstance(loader, _ManifestBytesLoader):
+                return None
+            entry = module_map.get(name)
+            if entry is None:
+                return None
+            bound[name] = entry[0]
+        if "recorder_next.adapters" not in bound:
+            return None
+    except Exception:
+        return None
+    finally:
+        try:
+            sys.meta_path.remove(finder)
+        except ValueError:
+            pass
+    return {"adapters": loaded, "modules": bound}
+
+
+def _candidate_modules_still_bound(
+    bundle: Any, manifest: dict[str, Any], authorization: dict[str, Any]
+) -> bool:
+    """Closing-side check: loaded candidate modules remain manifest-bound (E5 F-2)."""
+    if not isinstance(bundle, dict):
+        return False
+    bound = bundle.get("modules")
+    if not isinstance(bound, dict) or "recorder_next.adapters" not in bound:
+        return False
+    for name in bound:
+        module = sys.modules.get(name)
+        if module is None:
+            return False
+        spec = getattr(module, "__spec__", None)
+        loader = getattr(spec, "loader", None) if spec is not None else None
+        if not isinstance(loader, _ManifestBytesLoader):
+            return False
+        if getattr(module, "__dict__", {}).get("__manifest_member__") != bound[name]:
+            return False
+    per_file = manifest.get("per_file_sha256") if isinstance(manifest, dict) else None
+    if not isinstance(per_file, dict) or set(bound.values()) - set(per_file):
+        return False
+    archive_path = (
+        _bounded_absolute_path(authorization.get("archive_path"))
+        if isinstance(authorization, dict)
+        else None
+    )
+    if archive_path is None:
+        return False
+    member_bytes = _extract_manifest_member_bytes(archive_path, per_file)
+    if member_bytes is None:
+        return False
+    for name, member in bound.items():
+        if member_bytes.get(member) is None:
+            return False
+    return True
+
 def _profile_observations_ready(omitted_response: Any, explicit_response: Any) -> bool:
     """Use one strict projection/validator path for both observations."""
     if not isinstance(omitted_response, dict) or type(omitted_response.get("status")) is not int:
@@ -1641,17 +1908,22 @@ def _profile_observations_ready(omitted_response: Any, explicit_response: Any) -
     explicit_projection = explicit_response.get("projection") if isinstance(explicit_response, dict) else None
     if type(explicit_status) is not int or not 200 <= explicit_status < 300:
         return False
+    # E5 F-5: BOTH observations pass through the one shared projection — the
+    # explicit probe output is no longer compared raw, so identical envelope
+    # semantics compare equal regardless of which observation carried them,
+    # and wrong-typed values can never collide with literal marker strings.
     omitted_projection = _tts_reduction(omitted_body)
-    if omitted_projection is None or not isinstance(explicit_projection, dict):
+    explicit_reduction = _tts_reduction(explicit_projection)
+    if omitted_projection is None or explicit_reduction is None:
         return False
     try:
         if not _validate_tts_projection_ready(omitted_projection):
             return False
-        if not _validate_tts_projection_ready(explicit_projection):
+        if not _validate_tts_projection_ready(explicit_reduction):
             return False
     except Exception:
         return False
-    return omitted_projection == explicit_projection
+    return omitted_projection == explicit_reduction
 
 
 def _closing_identity_equal(context: dict[str, Any], adapters_module: Any = None) -> bool:
@@ -1688,7 +1960,24 @@ def _closing_identity_equal(context: dict[str, Any], adapters_module: Any = None
             return False
     root = _bounded_absolute_path(authorization.get("candidate_root"))
     per_file = manifest.get("per_file_sha256")
-    return root is not None and isinstance(per_file, dict) and _verify_imported_module_identity(module, root, per_file)
+    # E5 F-2: a manifest-bound module carries a virtual manifest origin, so
+    # the pathname identity check cannot apply to it; its identity is the
+    # member stamp plus the digest-verifiable archive bytes checked below.
+    manifest_stamped = getattr(module, "__manifest_member__", None) == "recorder_next/adapters.py"
+    if not manifest_stamped:
+        if not (root is not None and isinstance(per_file, dict) and _verify_imported_module_identity(module, root, per_file)):
+            return False
+    # E5 F-2: the loaded candidate bundle must still be manifest-bound at
+    # closing — the executed modules must still carry their manifest loader,
+    # member stamp, and digest-verifiable archive bytes.
+    bundle = context.get("candidate_bundle")
+    if bundle is not None:
+        if not _candidate_modules_still_bound(bundle, manifest, authorization):
+            return False
+    elif manifest_stamped:
+        # A stamped module without a closing bundle cannot be re-verified.
+        return False
+    return True
 
 
 def run_voice1_readonly_admission(context: dict[str, Any]) -> dict[str, Any]:
@@ -1743,12 +2032,32 @@ def run_voice1_readonly_admission(context: dict[str, Any]) -> dict[str, Any]:
     # missing/mismatched archive still reaches an import or a protected
     # boundary.
     adapters_module = None
-    candidate_source_ok = _verify_candidate_source(authorization, manifest)
+    # E5 F-1: the gate is ONE-WAY and precedes the import — ratified
+    # authority cold-rehash, authority binding, and candidate-source
+    # verification must ALL hold before any recorder_next module is
+    # imported.  Authority drift after main()'s precheck (or at any later
+    # time) can no longer reach an import; a failed gate leaves
+    # adapters_module None and the candidate predicates fail closed.
+    candidate_source_ok = False
+    candidate_bundle: dict[str, Any] | None = None
+    if (
+        _cold_rehash_ratified_authorities()
+        and within_budget()
+        and isinstance(context.get("manifest_sha256"), str)
+        and _verify_manifest_structure(manifest)
+        and _verify_authority_binding(manifest, authorization, context["manifest_sha256"])
+    ):
+        candidate_source_ok = _verify_candidate_source(authorization, manifest)
     if candidate_source_ok:
-        try:
-            adapters_module = importlib.import_module("recorder_next.adapters")
-        except Exception:
-            adapters_module = None
+        # E5 F-2: the candidate executes only through the manifest-byte-bound
+        # loader — verified archive bytes, never a pathname re-open.  Preloaded
+        # foreign recorder_next modules and any forged loader metadata are
+        # rejected inside the bundle loader.
+        candidate_bundle = _load_candidate_module_bundle(manifest, authorization)
+        if candidate_bundle is not None:
+            adapters_module = candidate_bundle["adapters"]
+            # E5 F-2: keep the bundle reachable for the closing identity check.
+            context["candidate_bundle"] = candidate_bundle
 
     scope = authorization.get("execution_scope")
     paths = authorization.get("paths") or {}
@@ -1766,14 +2075,25 @@ def run_voice1_readonly_admission(context: dict[str, Any]) -> dict[str, Any]:
     candidate_root = _bounded_absolute_path(authorization.get("candidate_root")) if isinstance(authorization, dict) else None
     imports_bound = bool(
         candidate_source_ok
-        and candidate_root is not None
-        and isinstance(per_file, dict)
-        and _verify_imported_module_identity(adapters_module, candidate_root, per_file)
+        and candidate_bundle is not None
+        and isinstance(candidate_bundle.get("modules"), dict)
+        and "recorder_next.adapters" in candidate_bundle["modules"]
+        and adapters_module is not None
         and within_budget()
     )
-    predicates["imports_bound"] = imports_bound
+    predicates["imports_bound"] = bool(imports_bound)
     predicates["candidate_bound"] = bool(candidate_source_ok and imports_bound and within_budget())
-    if not (predicates["authorization_bound"] and predicates["candidate_bound"] and predicates["imports_bound"]):
+    # E5 F-2 ordering: a candidate-bundle failure is still fatal, but the
+    # credential/metadata boundaries are observed FIRST so the report names
+    # the earliest failing boundary exactly as the closure design requires.
+    # The bundle gate is re-enforced before the capability stage below, so no
+    # credential-bearing provider observation can run on a weak candidate.
+    candidate_bundle_deferred = (
+        bool(predicates["authorization_bound"])
+        and not bool(predicates["candidate_bound"])
+        and candidate_bundle is None
+    )
+    if not (predicates["authorization_bound"] and predicates["candidate_bound"]) and not candidate_bundle_deferred:
         reason_codes.append("authority_mismatch")
         return _admission_report(context, predicates, reason_codes, started_monotonic, started_utc, identity,
                                  observations=observations, authorization=authorization)
@@ -1796,10 +2116,30 @@ def run_voice1_readonly_admission(context: dict[str, Any]) -> dict[str, Any]:
     dashboard_value = None
     api_value = None
     try:
-        dashboard_value = read_credential(dashboard_cred_path)
-        api_value = read_credential(api_cred_path)
+        if read_credential is _read_credential_default:
+            # E5 F-3: the default reader binds each value to the custody-
+            # checked object (no-follow open, fstat identity == pin,
+            # bounded bytes from that same descriptor).
+            dashboard_value = read_credential(dashboard_cred_path, dashboard_pin)
+            api_value = read_credential(api_cred_path, api_pin)
+        else:
+            dashboard_value = read_credential(dashboard_cred_path)
+            api_value = read_credential(api_cred_path)
     except Exception:
         dashboard_value = api_value = None
+    # E5 F-3: revalidate custody immediately after the reads — any pathname
+    # substitution racing the reads leaves a different object at the path and
+    # must fail closed before the values authorize anything.
+    custody_after_reads = (
+        _credential_metadata_matches(dashboard_cred_path, dashboard_pin)
+        and _credential_metadata_matches(api_cred_path, api_pin)
+    )
+    predicates["credential_custody_after_reads"] = bool(custody_after_reads and within_budget())
+    if not custody_after_reads:
+        predicates.setdefault("credential_custody", False)
+        reason_codes.append("credential_custody")
+        return _admission_report(context, predicates, reason_codes, started_monotonic, started_utc, identity,
+                                 observations=observations, authorization=authorization)
     dashboard_parse_ok = isinstance(dashboard_value, str) and bool(dashboard_value) and len(dashboard_value) <= 4096
     api_parse_ok = isinstance(api_value, str) and bool(api_value) and len(api_value) <= 4096
     predicates["dashboard_credential_parse"] = bool(dashboard_parse_ok and within_budget())
@@ -1842,6 +2182,13 @@ def run_voice1_readonly_admission(context: dict[str, Any]) -> dict[str, Any]:
         reason_codes.append("unauthenticated_gate")
         return _admission_report(context, predicates, reason_codes, started_monotonic, started_utc, identity,
                                  observations=observations, authorization=authorization)
+    if candidate_bundle_deferred:
+        # E5 F-2: no credential-bearing provider observation may run unless
+        # the candidate executed from manifest-verified bytes; nothing below
+        # this line is reachable with a weak candidate binding.
+        reason_codes.append("authority_mismatch")
+        return _admission_report(context, predicates, reason_codes, started_monotonic, started_utc, identity,
+                                 observations=observations, authorization=authorization)
 
     # -- 3. candidate capability + ASR/TTS readiness (true-default API) ----
     api_base = authorization.get("endpoints", {}).get("api_base_url")
@@ -1867,6 +2214,13 @@ def run_voice1_readonly_admission(context: dict[str, Any]) -> dict[str, Any]:
 
         gateway = HttpHermesGateway(str(api_base), api_key_file=credential_file, require_existing_session=False)
         capability = gateway.capability_check()
+        # E5 F-3: keep custody through the exact provider observation — a
+        # credential substitution during any provider call fails closed.
+        if not (
+            _credential_metadata_matches(dashboard_cred_path, dashboard_pin)
+            and _credential_metadata_matches(api_cred_path, api_pin)
+        ):
+            raise ValueError("credential custody drifted during provider observation")
         predicates["api_capability"] = bool(
             isinstance(capability, dict) and (capability.get("features") or {}).get("run_submission") is True
         )
@@ -1875,12 +2229,22 @@ def run_voice1_readonly_admission(context: dict[str, Any]) -> dict[str, Any]:
                                      credential_file=dashboard_credential_file,
                                      timeout=min(PROVIDER_TIMEOUT_SECONDS, half_budget()))
         asr_result = asr.readiness_check()
+        if not (
+            _credential_metadata_matches(dashboard_cred_path, dashboard_pin)
+            and _credential_metadata_matches(api_cred_path, api_pin)
+        ):
+            raise ValueError("credential custody drifted during provider observation")
         predicates["asr_ready"] = bool(isinstance(asr_result, dict) and asr_result.get("capability"))
 
         tts = HermesAudioTTSProvider(str(dashboard_base), profile="default",
                                      credential_file=dashboard_credential_file,
                                      timeout=min(PROVIDER_TIMEOUT_SECONDS, half_budget()))
         tts_result = tts.readiness_check()
+        if not (
+            _credential_metadata_matches(dashboard_cred_path, dashboard_pin)
+            and _credential_metadata_matches(api_cred_path, api_pin)
+        ):
+            raise ValueError("credential custody drifted during provider observation")
         predicates["tts_ready"] = bool(isinstance(tts_result, dict) and tts_result.get("capability"))
     except Exception:
         if "api_capability" not in predicates:
@@ -2009,10 +2373,45 @@ def quote_safe(value: str) -> str:
     return quote(value, safe="")
 
 
-def _read_credential_default(path: Path) -> str:
-    from recorder_next.adapters import _read_provider_credential
+def _read_credential_default(path: Path, pinned: Any = None) -> str:
+    """Identity-bound credential read (E5 F-3).
+    The value is read from the exact regular object the custody metadata was
+    verified against: one no-follow open, fstat identity compared to the pin,
+    bounded bytes read from that same descriptor, then parsed by the
+    candidate's own credential record parser.  A path that is a symlink, a
+    non-regular object, or whose fstat identity differs from the pin never
+    yields a value.
+    """
+    from recorder_next.adapters import CredentialError, _parse_credential_record
 
-    return _read_provider_credential(str(path))
+    if pinned is not None and not isinstance(pinned, dict):
+        raise CredentialError("credential custody metadata is invalid")
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise CredentialError("credential file is unavailable") from error
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode):
+            raise CredentialError("credential file is not a regular object")
+        if pinned is not None:
+            actual = _stat_identity(info)
+            for key in ("device", "inode", "uid", "gid", "mode"):
+                expected = pinned.get(key)
+                if isinstance(expected, bool) or not isinstance(expected, int) or actual[key] != expected:
+                    raise CredentialError("credential custody identity drifted before read")
+        chunks: list[bytes] = []
+        remaining = 4113
+        while remaining > 0:
+            chunk = os.read(descriptor, remaining)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        return _parse_credential_record(b"".join(chunks))
+    finally:
+        os.close(descriptor)
 
 
 def _probe_dashboard_default(base_url: str, path: str, *, credential: str | None,
@@ -2051,25 +2450,56 @@ def _secrets_absent(body: Any, secrets: tuple[str | None, ...]) -> bool:
     return False
 
 
+class _ReductionMarker:
+    """Collision-free reduction marker (E5 F-5).
+
+    Reduction output values must never be confusable with any value a real
+    payload can carry.  Real payloads reduce to dict/list/str/bool or to one
+    of these marker objects; a provider string such as ``"invalid:list"``
+    stays a plain str and can therefore never equal the marker emitted for
+    an actually wrong-typed value.
+    """
+
+    __slots__ = ("kind", "detail")
+
+    def __init__(self, kind: str, detail: str = "") -> None:
+        self.kind = kind
+        self.detail = detail
+
+    def __eq__(self, other: Any) -> bool:
+        if not isinstance(other, _ReductionMarker):
+            return NotImplemented
+        return self.kind == other.kind and self.detail == other.detail
+
+    def __hash__(self) -> int:
+        return hash((_ReductionMarker, self.kind, self.detail))
+
+    def __repr__(self) -> str:  # pragma: no cover - debug aid only
+        return f"_ReductionMarker({self.kind!r}, {self.detail!r})"
+
+
+_INVALID = "invalid"
+_NULL = _ReductionMarker("null")
+
+
 def _tts_reduction(body: Any) -> dict[str, Any] | None:
-    """Bounded, presence-preserving envelope/tts reduction.
+    """Single shared, bounded, lossless, collision-free projection (E5 F-5).
 
-    Architecture (F-3 repair): the omitted-vs-explicit equivalence compares
-    the complete normative shape.  The reduction therefore covers
+    BOTH omitted and explicit observations reduce through this one function
+    before equality, so the two observations can never diverge by passing
+    through different pipelines.  Rules:
 
-    * top-level normative flags (ok, ready, configured, enabled, audio_api)
-      — absent keys stay ABSENT, non-boolean values are marked INVALID and
-      never collapse into a true/false;
-    * every top-level key that is neither ``tts`` nor ``stt`` (complete
-      envelope coverage — no normative top-level difference can vanish);
-    * ``stt`` reduced recursively with the same presence-preserving rules;
-    * the ``tts`` subtree including the nested normative flags
-      configured/enabled plus mode/reason/provider/wire/status/ok/ready.
-
-    Absent vs present-invalid remain distinguishable (INVALID marker), so
-    the reduction never equates a projection that omits a normative field
-    with one that carries an invalid value, and it never equates omitted
-    stt/tts subtrees with structurally different ones.
+    * dicts recurse (keys stay the JSON string keys they already are);
+    * bools stay bool (True never equals a reduced number 1);
+    * plain strings stay plain strings — a literal ``"invalid:list"`` from
+      the wire therefore never collides with the marker emitted for a
+      genuinely wrong-typed list;
+    * None, numbers, and every other non-container reduce to marker objects
+      that no wire payload can produce;
+    * lists are preserved element-wise (bounded) so byte-identical valid
+      lists compare equal instead of collapsing to one opaque token;
+    * normative flag/string slots mark wrong types with markers, keeping
+      absent vs present-invalid distinguishable.
     """
     if isinstance(body, bytes):
         try:
@@ -2083,20 +2513,26 @@ def _tts_reduction(body: Any) -> dict[str, Any] | None:
     if not isinstance(payload, dict):
         return None
 
-    absent = object()
-
-    def reduce_value(value: Any) -> Any:
+    def reduce_value(value: Any, depth: int = 0) -> Any:
+        if isinstance(value, _ReductionMarker):
+            return value
+        if depth > 16:
+            return _ReductionMarker(_INVALID, "depth")
         if isinstance(value, dict):
-            return {key: reduce_value(item) for key, item in value.items()}
+            return {key: reduce_value(item, depth + 1) for key, item in value.items()}
+        if isinstance(value, list):
+            if len(value) > 64:
+                return _ReductionMarker(_INVALID, "list-length")
+            return [reduce_value(item, depth + 1) for item in value]
         if isinstance(value, bool):
             return value
-        if value is None:
-            return "null"
-        if isinstance(value, (int, float)):
-            return f"num:{value!r}"
         if isinstance(value, str):
             return value
-        return "opaque"
+        if value is None:
+            return _NULL
+        if isinstance(value, (int, float)):
+            return _ReductionMarker("num", repr(value))
+        return _ReductionMarker(_INVALID, type(value).__name__)
 
     reduction: dict[str, Any] = {}
     for key, value in payload.items():
@@ -2110,15 +2546,21 @@ def _tts_reduction(body: Any) -> dict[str, Any] | None:
         subtree = payload[subtree_key]
         if not isinstance(subtree, dict):
             reduction[subtree_key] = (
-                "absent" if subtree is None else f"invalid:{type(subtree).__name__}"
+                _NULL if subtree is None else _ReductionMarker(_INVALID, type(subtree).__name__)
             )
             continue
         reduced_subtree: dict[str, Any] = {}
         for key, value in subtree.items():
             if key in _TTS_NORMATIVE_FLAGS:
-                reduced_subtree[key] = value if isinstance(value, bool) else f"invalid:{type(value).__name__}"
+                reduced_subtree[key] = (
+                    value if isinstance(value, bool)
+                    else _ReductionMarker(_INVALID, type(value).__name__)
+                )
             elif key in _TTS_NORMATIVE_STRINGS:
-                reduced_subtree[key] = value if isinstance(value, str) else f"invalid:{type(value).__name__}"
+                reduced_subtree[key] = (
+                    value if isinstance(value, str)
+                    else _ReductionMarker(_INVALID, type(value).__name__)
+                )
             else:
                 reduced_subtree[key] = reduce_value(value)
         reduction[subtree_key] = reduced_subtree
@@ -2166,6 +2608,7 @@ def _persisted_lookup(context: dict[str, Any], *, deadline_at: float | None = No
         "authorizer_installed": False,
         "progress_handler_installed": False,
         "db_identity_equal": False,
+        "db_connected_file_equal": False,
     }
     if deadline_at is None:
         deadline_at = context.get("session_deadline")
@@ -2202,6 +2645,21 @@ def _persisted_lookup(context: dict[str, Any], *, deadline_at: float | None = No
             timeout=min(5.0, max(remaining, 0.001)),
             isolation_level=None,
         )
+        # E5 F-4: the connection itself must name the approved canonical path
+        # as its main database.  A redirected factory/connection (or any URI
+        # reinterpretation) opens a different file; PRAGMA database_list
+        # reports the actually opened main-db filename through the connection,
+        # so rows from any other object can never participate.
+        try:
+            db_rows = connection.execute("PRAGMA database_list").fetchall()
+        except sqlite3.Error:
+            db_rows = []
+        connected_file = next((row[2] for row in db_rows if row[1] == "main"), None)
+        result["db_connected_file_equal"] = bool(
+            connected_file is not None and os.path.normpath(connected_file) == str(db_path)
+        )
+        if not result["db_connected_file_equal"]:
+            return result
         connected_identity = _regular_file_identity_no_follow(db_path)
         result["db_identity_connected"] = connected_identity
         if connected_identity != opening_identity:
@@ -2252,7 +2710,7 @@ def _persisted_lookup(context: dict[str, Any], *, deadline_at: float | None = No
             closing_identity = _regular_file_identity_no_follow(db_path)
             result["db_identity_closing"] = closing_identity
             result["db_identity_equal"] = closing_identity == opening_identity
-            if not result["db_identity_equal"]:
+            if not result["db_identity_equal"] or not result.get("db_connected_file_equal"):
                 result["read_only"] = False
                 result["indexed"] = False
                 result["rows"] = []
@@ -2274,7 +2732,7 @@ def _admission_authorizer(action: Any, arg1: Any, arg2: Any, db_name: Any, trigg
     except (TypeError, ValueError):
         return sqlite3.SQLITE_DENY
     if code == sqlite3.SQLITE_PRAGMA:
-        allowed = {"table_info", "index_list", "index_info", "query_only", "busy_timeout"}
+        allowed = {"table_info", "index_list", "index_info", "query_only", "busy_timeout", "database_list"}
         return sqlite3.SQLITE_OK if isinstance(arg1, str) and arg1 in allowed else sqlite3.SQLITE_DENY
     if code == sqlite3.SQLITE_SELECT:
         return sqlite3.SQLITE_OK
