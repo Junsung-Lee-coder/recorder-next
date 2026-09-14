@@ -997,8 +997,7 @@ def _canonical_argv(argv: list[str]) -> dict[str, str] | None:
             if re.fullmatch(r"[0-9a-f]{64}", value) is None:
                 return None
         else:
-            candidate = Path(value)
-            if len(value) > 4096 or not candidate.is_absolute() or str(candidate) != value:
+            if _bounded_absolute_path(value) is None:
                 return None
         values[key] = value
         index += 2
@@ -1997,6 +1996,13 @@ def run_voice1_readonly_admission(context: dict[str, Any]) -> dict[str, Any]:
                              observations=observations, authorization=authorization)
 
 
+def _sqlite_uri_path(path: Path) -> str:
+    """Escape a filesystem path before embedding it in a SQLite URI."""
+    from urllib.parse import quote
+
+    return quote(str(path), safe="/")
+
+
 def quote_safe(value: str) -> str:
     from urllib.parse import quote
 
@@ -2191,7 +2197,7 @@ def _persisted_lookup(context: dict[str, Any], *, deadline_at: float | None = No
         if busy_timeout_ms <= 0:
             return result
         connection = sqlite3.connect(
-            f"file:{db_path}?mode=ro",
+            f"file:{_sqlite_uri_path(db_path)}?mode=ro",
             uri=True,
             timeout=min(5.0, max(remaining, 0.001)),
             isolation_level=None,

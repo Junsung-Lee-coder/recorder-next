@@ -1639,6 +1639,37 @@ class Voice1B6E4FindingRegressionTests(unittest.TestCase):
         self.assertNotIn("_gap_args", guard)
         self.assertEqual(guard.strip(), "raise SystemExit(main())")
 
+    def test_canonical_argv_rejects_absolute_dot_alias_paths_as_invalid(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            nested = root / "nested"
+            nested.mkdir()
+            manifest = nested / "manifest.json"
+            authorization = nested / "authorization.json"
+            manifest.write_text("{}", encoding="utf-8")
+            authorization.write_text("{}", encoding="utf-8")
+            manifest_alias = nested / ".." / "nested" / "manifest.json"
+            authorization_alias = nested / "sub" / ".." / "authorization.json"
+            # The files exist and their digests are correct; only the argv
+            # path spelling is noncanonical and must be held before file I/O.
+            argv = [
+                "--read-only-admission", "--manifest", str(manifest_alias),
+                "--manifest-sha256", hashlib.sha256(manifest.read_bytes()).hexdigest(),
+                "--authorization", str(authorization_alias),
+                "--authorization-sha256", hashlib.sha256(authorization.read_bytes()).hexdigest(),
+            ]
+            self.assertIsNone(self.control._canonical_argv(argv))
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                exit_code = self.control.main(argv)
+            report = json.loads(stdout.getvalue())
+            self.assertEqual(exit_code, 2)
+            self.assertEqual(report["status"], "HOLD")
+            self.assertEqual(report["status_code"], 2)
+            self.assertIn("invalid_argv", report["reason_codes"])
+            self.assertEqual(stderr.getvalue(), "")
+
     def test_profile_validator_rejects_non2xx_and_identical_invalid_projections(self):
         valid = {
             "ok": True, "ready": True, "configured": True, "enabled": True, "audio_api": True,
@@ -1794,6 +1825,44 @@ class Voice1B6E4FindingRegressionTests(unittest.TestCase):
                 )
         self.assertFalse(drifted["read_only"])
         self.assertFalse(drifted["indexed"])
+
+    def test_persisted_lookup_uri_escapes_percent_encoded_path_components(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            inside_dir = root / "%2e%2e"
+            inside_dir.mkdir()
+            inside_db = inside_dir / "selected.db"
+            outside_db = root.parent / "selected.db"
+
+            schema = """
+                CREATE TABLE sessions (
+                    id TEXT NOT NULL,
+                    source TEXT NOT NULL,
+                    session_key TEXT NOT NULL,
+                    ended_at TEXT
+                );
+                CREATE INDEX sessions_id_idx ON sessions(id);
+            """
+            with sqlite3.connect(inside_db) as connection:
+                connection.executescript(schema)
+            with sqlite3.connect(outside_db) as connection:
+                connection.executescript(schema)
+                connection.execute(
+                    "INSERT INTO sessions VALUES (?, ?, ?, ?)",
+                    ("20260703_210417_8f66b434", "outside", "outside-key", None),
+                )
+
+            context = {"authorization": {"paths": {"persisted_db": str(inside_db)}}}
+            try:
+                result = self.control._persisted_lookup(
+                    context, deadline_at=time.monotonic() + 5.0
+                )
+            finally:
+                outside_db.unlink(missing_ok=True)
+
+        self.assertTrue(result["read_only"])
+        self.assertTrue(result["indexed"])
+        self.assertEqual(result["rows"], [], "lookup must not observe the outside DB row")
 
     def test_report_projects_scope_specific_persisted_key_digest(self):
         predicates = {name: True for name in self.control.REQUIRED_PREDICATES}
