@@ -1177,8 +1177,18 @@ class Voice1B6ExecutableClosureTests(unittest.TestCase):
     def test_aggregate_all_true_passes_with_exact_schema(self):
         control = self.control
         predicates = {name: True for name in control.REQUIRED_PREDICATES}
+        # E7 pass_without_observation_identity: PASS additionally requires a
+        # valid observation identity (canonical utc/monotonic/boot triple);
+        # a boolean-only 32/32 shape with absent identity must HOLD.
+        observations = {
+            "session_observed_utc": control._utc_now_iso(),
+            "session_observed_monotonic_ns": time.monotonic_ns(),
+            "boot_id": control._boot_id(),
+        }
+        self.assertTrue(control._observation_identity_valid(observations))
         report = control._admission_report(self._report_context(), predicates, [],
-                                           time.monotonic(), control._utc_now_iso(), {})
+                                           time.monotonic(), control._utc_now_iso(), {},
+                                           observations=observations)
         self.assertEqual(report["status"], "PASS")
         self.assertEqual(report["status_code"], 0)
         self.assertEqual(report["schema"], control.REPORT_SCHEMA)
@@ -2130,28 +2140,50 @@ class Voice1B6E5FindingRegressionTests(unittest.TestCase):
                 "gid": info.st_gid,
                 "mode": stat_module.S_IMODE(info.st_mode),
             }
-            value = self.control._read_credential_default(credential, pin)
-            self.assertEqual(value, "Abc123value")
-            swapped = root / "swap.env"
-            swapped.write_bytes(b"API_SERVER_KEY=EvilSwapValue\n")
-            # Pin the SWAPPED object's own identity, then corrupt one field so
-            # the pin can never match the object actually opened (inode reuse
-            # in a fresh directory makes off-by-one guesses unreliable).
-            swapped_info = swapped.stat()
-            drifted = {
-                "device": swapped_info.st_dev,
-                "inode": swapped_info.st_ino,
-                "uid": swapped_info.st_uid,
-                "gid": swapped_info.st_gid,
-                "mode": stat_module.S_IMODE(swapped_info.st_mode),
-            }
-            drifted["mode"] = drifted["mode"] ^ 0o040  # always flips one mode bit
-            with self.assertRaises(CredentialError):
-                self.control._read_credential_default(swapped, drifted)
-            link = root / "link.env"
-            link.symlink_to(credential)
-            with self.assertRaises(CredentialError):
-                self.control._read_credential_default(link, pin)
+            # E7 unbound_import_before_credential_gate: parsing resolves only
+            # through an active candidate bundle.  Bind the admission-shaped
+            # bundle for the reads below and release it in the same test.
+            per_file, archive = self._bundle_fixture(root)
+            snapshot = self._snapshot_candidate_modules()
+            bundle = None
+            try:
+                self._restore_candidate_modules({})
+                with patch.object(self.control, "_verify_candidate_source", return_value=True):
+                    bundle = self.control._load_candidate_module_bundle(
+                        {"per_file_sha256": per_file}, {"archive_path": str(archive)},
+                        retain_finder=True,
+                    )
+                self.assertIsInstance(bundle, dict)
+                assert isinstance(bundle, dict)
+                # With an active bundle the runner raises the bound module's
+                # own CredentialError; the pre-bundle file import is a stale
+                # identity while the bundle owns the namespace.
+                adapters = bundle["registry"]["recorder_next.adapters"]["module"]
+                value = self.control._read_credential_default(credential, pin)
+                self.assertEqual(value, "Abc123value")
+                swapped = root / "swap.env"
+                swapped.write_bytes(b"API_SERVER_KEY=EvilSwapValue\n")
+                # Pin the SWAPPED object's own identity, then corrupt one field so
+                # the pin can never match the object actually opened (inode reuse
+                # in a fresh directory makes off-by-one guesses unreliable).
+                swapped_info = swapped.stat()
+                drifted = {
+                    "device": swapped_info.st_dev,
+                    "inode": swapped_info.st_ino,
+                    "uid": swapped_info.st_uid,
+                    "gid": swapped_info.st_gid,
+                    "mode": stat_module.S_IMODE(swapped_info.st_mode),
+                }
+                drifted["mode"] = drifted["mode"] ^ 0o040  # always flips one mode bit
+                with self.assertRaises(adapters.CredentialError):
+                    self.control._read_credential_default(swapped, drifted)
+                link = root / "link.env"
+                link.symlink_to(credential)
+                with self.assertRaises(adapters.CredentialError):
+                    self.control._read_credential_default(link, pin)
+            finally:
+                self.control._release_candidate_module_bundle(bundle)
+                self._restore_candidate_modules(snapshot)
 
     # -- F-4: redirected SQLite connection rejection -------------------------
 
@@ -3952,3 +3984,443 @@ class Voice1B6E6SuccessorRegressionTests(unittest.TestCase):
     def test_e6_a3_rejects_tampered_or_stale_report_before_mutation(self):
         self.assertTrue(hasattr(self.control, "_validate_a3_admission_report"))
         self.assertTrue(hasattr(self.control, "_read_admission_report_once"))
+
+
+class Voice1B6E7SuccessorRegressionTests(unittest.TestCase):
+    """RED/GREEN coverage for the four ratified E7 fail-open seams plus the
+    QA custody-receipt EVIDENCE_BLOCKER digest assertion.
+
+    Findings (ratified addendum items 1-4, verbatim names):
+      unbound_import_before_credential_gate,
+      executable_exports_not_bound,
+      metadata_ancestor_check_open_race,
+      pass_without_observation_identity.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        control_dir = Path(__file__).resolve().parents[1] / "run"
+        if str(control_dir) not in sys.path:
+            sys.path.insert(0, str(control_dir))
+        import qa_probe_runner as control
+
+        cls.control = control
+
+    # -- helpers ---------------------------------------------------------------
+
+    _BUNDLE_MEMBERS = (
+        "recorder_next/__init__.py",
+        "recorder_next/adapters.py",
+        "recorder_next/canonical.py",
+        "recorder_next/hermes_wire.py",
+        "recorder_next/media.py",
+        "recorder_next/models.py",
+    )
+
+    def _candidate_root(self) -> Path:
+        return Path(self.control.__file__).resolve().parents[1]
+
+    def _bundle_fixture(self, root: Path) -> tuple[dict[str, str], Path]:
+        import io
+        import tarfile
+
+        datas: dict[str, bytes] = {}
+        per_file: dict[str, str] = {}
+        for member in self._BUNDLE_MEMBERS:
+            if member == "recorder_next/__init__.py":
+                data = b'"""fixture candidate package."""\n'
+            else:
+                data = (self._candidate_root() / member).read_bytes()
+            datas[member] = data
+            per_file[member] = hashlib.sha256(data).hexdigest()
+        archive = root / "candidate.tar"
+        with tarfile.open(archive, "w") as handle:
+            for member in self._BUNDLE_MEMBERS:
+                info = tarfile.TarInfo(member)
+                info.size = len(datas[member])
+                handle.addfile(info, io.BytesIO(datas[member]))
+        return per_file, archive
+
+    def _snapshot_candidate_modules(self) -> dict[str, Any]:
+        return {
+            name: module
+            for name, module in sys.modules.items()
+            if name == "recorder_next" or name.startswith("recorder_next.")
+        }
+
+    def _restore_candidate_modules(self, snapshot: dict[str, Any]) -> None:
+        for name in [
+            name
+            for name in sys.modules
+            if name == "recorder_next" or name.startswith("recorder_next.")
+        ]:
+            if name not in snapshot:
+                del sys.modules[name]
+        sys.modules.update(snapshot)
+
+    @staticmethod
+    def _pin(path: Path) -> dict[str, int]:
+        return Voice1B6E7SuccessorRegressionTests.control._stat_identity(
+            os.stat(path, follow_symlinks=False)
+        )
+
+    _SYNTH_SECRET = b"API_SERVER_KEY=E7SyntheticNotSecret0123456789abcdef\n"
+    _SYNTH_EVIL = b"API_SERVER_KEY=E7EVILSYNTHETIC00000000000000000000000000\n"
+
+    # -- F-1: unbound_import_before_credential_gate ----------------------------
+
+    def test_e7_credential_parser_resolves_only_from_candidate_bundle(self):
+        """_read_credential_default must fail closed to CredentialError when
+        no candidate bundle is bound, never parse via an ordinary filesystem
+        import of recorder_next.adapters."""
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            root.chmod(0o700)
+            credential = root / "dashboard.env"
+            credential.write_bytes(self._SYNTH_SECRET)
+            pin = self._pin(credential)
+            snapshot = self._snapshot_candidate_modules()
+            try:
+                # No candidate bundle exists in sys.modules: the resolver must
+                # refuse rather than import from the working tree.  The runner
+                # raises its local CredentialGateError (a ValueError); it must
+                # not import the candidate's CredentialError class from the
+                # filesystem just to raise it.
+                self._restore_candidate_modules({})
+                with self.assertRaises(ValueError) as unbound_context:
+                    self.control._read_credential_default(credential, pin)
+                self.assertIs(
+                    type(unbound_context.exception),
+                    self.control.CredentialGateError,
+                    "unbound parse must raise the runner-local gate error",
+                )
+                self.assertNotIn(
+                    "recorder_next.adapters", sys.modules,
+                    "credential parse must not import recorder_next from the filesystem",
+                )
+                # A bundle-bound module must be accepted (green side): the
+                # load is admission-shaped (retain_finder=True) so the parser
+                # resolver sees an active bundle, and it is released below.
+                per_file, archive = self._bundle_fixture(root)
+                self._restore_candidate_modules({})
+                bundle = None
+                try:
+                    with patch.object(self.control, "_verify_candidate_source", return_value=True):
+                        bundle = self.control._load_candidate_module_bundle(
+                            {"per_file_sha256": per_file}, {"archive_path": str(archive)},
+                            retain_finder=True,
+                        )
+                    self.assertIsInstance(bundle, dict)
+                    assert isinstance(bundle, dict)
+                    value = self.control._read_credential_default(credential, pin)
+                    self.assertEqual(value, "E7SyntheticNotSecret0123456789abcdef")
+                finally:
+                    self.control._release_candidate_module_bundle(bundle)
+            finally:
+                self._restore_candidate_modules(snapshot)
+
+    def test_e7_stage3_capability_import_binds_to_candidate_bundle(self):
+        """The capability stage must resolve provider names through the
+        candidate bundle registry; a filesystem fallback is forbidden."""
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            per_file, archive = self._bundle_fixture(root)
+            snapshot = self._snapshot_candidate_modules()
+            bundle = None
+            try:
+                self._restore_candidate_modules({})
+                with patch.object(self.control, "_verify_candidate_source", return_value=True):
+                    bundle = self.control._load_candidate_module_bundle(
+                        {"per_file_sha256": per_file}, {"archive_path": str(archive)},
+                    )
+                self.assertIsInstance(bundle, dict)
+                assert isinstance(bundle, dict)
+                adapters = bundle["adapters"]
+                self.assertIs(
+                    sys.modules.get("recorder_next.adapters"), adapters,
+                    "bundle modules must be the only recorder_next bindings",
+                )
+                resolver = getattr(self.control, "_candidate_stage3_names", None)
+                self.assertIsNotNone(
+                    resolver,
+                    "E7 requires an explicit bundle-bound stage-3 name resolver",
+                )
+                names = resolver(bundle)
+                for required in (
+                    "HermesAudioASRProvider", "HermesAudioTTSProvider",
+                    "HttpHermesGateway", "ProviderFailure",
+                ):
+                    self.assertIn(required, names)
+                    self.assertIs(
+                        names[required], getattr(adapters, required),
+                        f"{required} must resolve from the bundle-bound module",
+                    )
+                # A bundle whose registry lost the adapters module must be
+                # refused instead of re-imported from the filesystem.
+                broken = dict(bundle)
+                broken["registry"] = {
+                    name: entry for name, entry in bundle["registry"].items()
+                    if name != "recorder_next.adapters"
+                }
+                with self.assertRaises(self.control.CandidateBundleError):
+                    resolver(broken)
+            finally:
+                self.control._release_candidate_module_bundle(locals().get("bundle"))
+                self._restore_candidate_modules(snapshot)
+
+    def test_e7_invalid_candidate_bundle_holds_before_protected_open(self):
+        """A candidate-source failure is terminal before credential or
+        metadata custody is opened."""
+        context = {
+            "manifest": {"candidate_id": "e7-synthetic"},
+            "authorization": {"execution_scope": "fixture_readonly"},
+            "manifest_sha256": "0" * 64,
+            "started_monotonic": time.monotonic(),
+        }
+        with patch.object(self.control, "_cold_rehash_ratified_authorities", return_value=True), \
+             patch.object(self.control, "_verify_manifest_structure", return_value=True), \
+             patch.object(self.control, "_verify_authority_binding", return_value=True), \
+             patch.object(self.control, "_verify_candidate_source", return_value=False), \
+             patch.object(self.control, "_open_custodied_file", side_effect=AssertionError("protected open")), \
+             patch.object(self.control, "_read_credential_default", side_effect=AssertionError("protected read")):
+            report = self.control._run_voice1_readonly_admission(context)
+        self.assertEqual(report["status"], "HOLD")
+        self.assertFalse(report["predicates"].get("candidate_bound", True))
+        self.assertEqual(report["reason_codes"], ["authority_mismatch"])
+
+    def test_e7_closing_binding_rejects_replaced_or_added_exports(self):
+        """The frozen registry must bind the exports the runner dereferences:
+        a replaced used export or an added foreign executable export must
+        fail the closing bound check."""
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            per_file, archive = self._bundle_fixture(root)
+            snapshot = self._snapshot_candidate_modules()
+            bundle = None
+            try:
+                self._restore_candidate_modules({})
+                with patch.object(self.control, "_verify_candidate_source", return_value=True):
+                    bundle = self.control._load_candidate_module_bundle(
+                        {"per_file_sha256": per_file}, {"archive_path": str(archive)},
+                        retain_finder=True,
+                    )
+                self.assertIsInstance(bundle, dict)
+                assert isinstance(bundle, dict)
+                auth = {"per_file_sha256": per_file}
+                man = {"archive_path": str(archive)}
+                self.assertTrue(self.control._candidate_modules_still_bound(bundle, auth, man))
+                module = bundle["registry"]["recorder_next.adapters"]["module"]
+
+                # (a) replacing a dereferenced export must break the closure:
+                original = module._parse_credential_record
+                module._parse_credential_record = lambda raw: "E7REPLACED"
+                try:
+                    self.assertFalse(
+                        self.control._candidate_modules_still_bound(bundle, auth, man),
+                        "replaced used export must fail the closing check",
+                    )
+                finally:
+                    module._parse_credential_record = original
+
+                # (b) removing a dereferenced export must also break the closure:
+                original = module._parse_credential_record
+                del module._parse_credential_record
+                try:
+                    self.assertFalse(
+                        self.control._candidate_modules_still_bound(bundle, auth, man),
+                        "removed used export must fail the closing check",
+                    )
+                finally:
+                    module._parse_credential_record = original
+
+                # (c) an unexpected executable export must break the closure:
+                module._e7_foreign_export = lambda: None
+                try:
+                    self.assertFalse(
+                        self.control._candidate_modules_still_bound(bundle, auth, man),
+                        "unexpected executable export must fail the closing check",
+                    )
+                finally:
+                    del module._e7_foreign_export
+
+                # (c) restored closure passes again:
+                self.assertTrue(self.control._candidate_modules_still_bound(bundle, auth, man))
+            finally:
+                self.control._release_candidate_module_bundle(locals().get("bundle"))
+                self._restore_candidate_modules(snapshot)
+
+    # -- F-3: metadata_ancestor_check_open_race ---------------------------------
+
+    def test_e7_custody_open_rejects_realdir_ancestor_swap(self):
+        """The lexical pre-open ancestry check must not be separable from the
+        open: a real-directory ancestor rename winning the check-then-open
+        race must be rejected (no symlink involved)."""
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            root.chmod(0o700)
+            work = root / "staging"
+            work.mkdir()
+            secret = work / "secret.env"
+            secret.write_bytes(self._SYNTH_SECRET)
+            good_pin = self._pin(secret)
+
+            evil_dir = root / "evil-real"
+            evil_dir.mkdir()
+            evil_file = evil_dir / "secret.env"
+            evil_file.write_bytes(self._SYNTH_EVIL)
+            evil_pin = self._pin(evil_file)
+
+            original = root / "staging-original"
+            real_lstat = self.control.Path.lstat
+            state = {"checked": False, "swapped": False}
+
+            def racing_lstat(p, *a, **k):
+                result = real_lstat(p, *a, **k)
+                sp = str(p)
+                if (
+                    not state["checked"]
+                    and sp == str(secret)
+                    and (stat := __import__("stat")).S_ISREG(result.st_mode)
+                ):
+                    state["checked"] = True
+                    work.rename(original)
+                    evil_dir.rename(work)
+                    state["swapped"] = True
+                return result
+
+            try:
+                with patch.object(self.control.Path, "lstat", new=racing_lstat):
+                    with self.assertRaises(OSError):
+                        self.control._open_custodied_file(secret, evil_pin, max_bytes=4113)
+                self.assertTrue(state["swapped"], "the simulated race must have fired")
+            finally:
+                # Restore the original tree before any further open: the
+                # refused swap left `work` pointing at the evil directory.
+                if work.exists() and not work.is_symlink() and state["swapped"]:
+                    try:
+                        work.rename(root / "evil-restored")
+                    except OSError:
+                        pass
+                if original.exists():
+                    try:
+                        original.rename(work)
+                    except OSError:
+                        pass
+            try:
+                # The descriptor must never have landed on the evil object:
+                # after the refused open, restoring the good tree keeps the
+                # good object readable under its original pin.
+                handle = self.control._open_custodied_file(secret, good_pin, max_bytes=4113)
+                try:
+                    self.assertEqual(handle.read_bytes(), self._SYNTH_SECRET)
+                finally:
+                    handle.close()
+            finally:
+                shutil.rmtree(root / "evil-restored", ignore_errors=True)
+
+    def test_e7_custody_revalidate_rejects_nonfinal_ancestor_swap_restore(self):
+        """Every retained ancestor, not only the final parent, is part of
+        the lifetime custody witness."""
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            root.chmod(0o700)
+            top = root / "top"
+            work = top / "staging"
+            work.mkdir(parents=True)
+            secret = work / "secret.env"
+            secret.write_bytes(self._SYNTH_SECRET)
+            pin = self._pin(secret)
+            evil_top = root / "evil-top"
+            evil_work = evil_top / "staging"
+            evil_work.mkdir(parents=True)
+            (evil_work / "secret.env").write_bytes(self._SYNTH_EVIL)
+            original = root / "top-original"
+            evil_restored = root / "evil-top-restored"
+            handle = self.control._open_custodied_file(secret, pin, max_bytes=4113)
+            try:
+                top.rename(original)
+                evil_top.rename(top)
+                top.rename(evil_restored)
+                original.rename(top)
+                self.assertFalse(handle.revalidate())
+            finally:
+                handle.close()
+
+    def test_e7_metadata_custody_binds_content_identity(self):
+        with tempfile.TemporaryDirectory() as raw:
+            metadata = Path(raw) / "metadata.json"
+            metadata.write_text('{"expires_at_utc":"2099-01-01T00:00:00Z"}', encoding="utf-8")
+            handle = self.control._open_custodied_file(
+                metadata, None, max_bytes=4096, bind_content=True
+            )
+            try:
+                self.assertTrue(handle.revalidate())
+                metadata.write_text('{"expires_at_utc":"2099-01-01T00:00:01Z"}', encoding="utf-8")
+                self.assertFalse(handle.revalidate())
+            finally:
+                handle.close()
+
+    def test_e7_pass_requires_observation_identity(self):
+        """An all-true 32/32 predicate shape must reduce to PASS only when
+        the observation identity is present and valid; residual reason codes
+        must always HOLD regardless of predicate shape."""
+        predicates = {name: True for name in self.control.REQUIRED_PREDICATES}
+        self.assertEqual(len(predicates), 32)
+        current_boot = self.control._boot_id()
+        self.assertIsNotNone(current_boot)
+        valid = {
+            "session_observed_utc": self.control._utc_now_iso(),
+            "session_observed_monotonic_ns": time.monotonic_ns(),
+            "boot_id": current_boot,
+        }
+        report = self.control._admission_report(
+            {}, dict(predicates), [], time.monotonic(), "2026-09-15T00:00:00Z", {},
+            observations=valid,
+        )
+        self.assertEqual(report["status"], "PASS")
+        self.assertEqual(report["status_code"], 0)
+
+        invalid_variants = {
+            "absent": {},
+            "null_utc": dict(valid, session_observed_utc=None),
+            "future_utc": dict(valid, session_observed_utc="2099-01-01T00:00:00Z"),
+            "bool_monotonic": dict(valid, session_observed_monotonic_ns=True),
+            "cross_boot": dict(valid, boot_id="00000000-0000-4000-8000-000000000001"),
+            "absent_boot": {k: v for k, v in valid.items() if k != "boot_id"},
+        }
+        for label, observations in invalid_variants.items():
+            with self.subTest(variant=label):
+                report = self.control._admission_report(
+                    {}, dict(predicates), [], time.monotonic(), "2026-09-15T00:00:00Z", {},
+                    observations=observations,
+                )
+                self.assertEqual(
+                    report["status"], "HOLD",
+                    "PASS must require valid observation identity",
+                )
+                self.assertEqual(report["status_code"], 2)
+                reasoned = self.control._admission_report(
+                    {}, dict(predicates), ["residual"], time.monotonic(),
+                    "2026-09-15T00:00:00Z", {},
+                    observations=observations,
+                )
+                self.assertEqual(reasoned["status"], "HOLD")
+                self.assertIn("internal_error", reasoned["reason_codes"])
+
+    # -- item 5: EVIDENCE_BLOCKER — QA custody receipt digest -------------------
+
+    def test_e7_custody_receipt_digest_binding(self):
+        """The runner must pin the QA builder-upload custody receipt by
+        digest: a wrong digest fails, the true digest passes."""
+        digester = getattr(self.control, "_qa_custody_receipt_digest", None)
+        self.assertIsNotNone(
+            digester,
+            "E7 requires an explicit QA custody-receipt digest pin",
+        )
+        receipt_path = (
+            Path(__file__).resolve().parents[1] / ".release-tdd" / "e6"
+            / "builder-upload-custody-receipt.json"
+        )
+        actual = hashlib.sha256(receipt_path.read_bytes()).hexdigest()
+        self.assertFalse(digester(actual + "00"))
+        self.assertTrue(digester(actual))

@@ -35,12 +35,13 @@ import sqlite3
 import stat
 import subprocess
 import sys
+import types
 import tempfile
 import time
 import unittest
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, cast
 from unittest.mock import patch
 
 # S-CLI: script-form execution must import the candidate
@@ -905,9 +906,14 @@ def _admission_report(context: dict[str, Any], predicates: dict[str, bool],
     )
     auth_values = authorization if isinstance(authorization, dict) else {}
     observation_values = observations if isinstance(observations, dict) else {}
+    # E7 pass_without_observation_identity: PASS requires the observation
+    # identity to be present and valid, and residual reason codes always
+    # force HOLD regardless of predicate shape.
     all_true = (
         exact_shape
         and all(supplied[name] is True for name in REQUIRED_PREDICATES)
+        and not reason_codes
+        and _observation_identity_valid(observation_values)
     )
     finished_utc = _utc_now_iso()
     elapsed_ms = int((time.monotonic() - started_monotonic) * 1000)
@@ -1151,6 +1157,17 @@ PRODUCT_IDENTITY = "recorder-next-server-voice-session-chain"
 RATIFIED_OWNER_PACKET_SHA256 = "6735b40c2eeeb716fb307d73cb603c940b24a78cab9cb29ddf6b696b1e99a3ec"
 RATIFIED_ADDENDUM_SHA256 = "758fcf9642ea21e7017b70e0851a88f3c11d7c0ee727e16516b923e8f8f1085e"
 RATIFIED_INHERITED_SPEC_SHA256 = "ce1c23271239d330e7125ded8ecb6b32d0a3bee8c5d2a07118693c3065df3de1"
+# E7 item 5 (EVIDENCE_BLOCKER): the QA builder-upload custody receipt is
+# evidence, not just context — its digest is pinned so a citation drift is
+# detectable by the same cold rehash that guards ratified authorities.
+RATIFIED_QA_CUSTODY_RECEIPT_SHA256 = "93cd512ca05a54cf710df5f1404d2778a1478c3af55523e5c968ff65c5c06424"
+
+
+def _qa_custody_receipt_digest(digest: Any) -> bool:
+    """True only for the pinned QA builder-upload custody receipt digest."""
+    return isinstance(digest, str) and digest == RATIFIED_QA_CUSTODY_RECEIPT_SHA256
+
+
 RATIFIED_AUTHORITY_DIGESTS = {
     "owner_packet_sha256": RATIFIED_OWNER_PACKET_SHA256,
     "specification_sha256": RATIFIED_ADDENDUM_SHA256,
@@ -1459,6 +1476,14 @@ def _stat_identity(info: os.stat_result) -> dict[str, int]:
     }
 
 
+def _custody_signature(info: os.stat_result) -> tuple[int, ...]:
+    """Include mutation clocks so rename/swap/restore is observable."""
+    return (
+        info.st_dev, info.st_ino, info.st_uid, info.st_gid,
+        stat.S_IMODE(info.st_mode), info.st_ctime_ns, info.st_mtime_ns,
+    )
+
+
 def _regular_file_identity_no_follow(path: Path) -> dict[str, int] | None:
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
     try:
@@ -1555,6 +1580,28 @@ def _path_has_no_symlink_components(path: Path) -> bool:
         if stat.S_ISLNK(info.st_mode):
             return False
     return True
+
+
+def _recorded_ancestry_metadata(path: Path) -> list[tuple[str, tuple[int, ...]]] | None:
+    """Lexically walk `path` and record each component's custody signature.
+
+    The returned clocks supplement object identity so a swap/restore cannot
+    be hidden by restoring the original inode before the next revalidation.
+    """
+    recorded: list[tuple[str, tuple[int, ...]]] = []
+    current = Path(path.anchor)
+    for component in path.parts[1:]:
+        current /= component
+        try:
+            info = current.lstat()
+        except FileNotFoundError:
+            return None
+        except OSError:
+            return None
+        if stat.S_ISLNK(info.st_mode):
+            return None
+        recorded.append((component, _custody_signature(info)))
+    return recorded
 
 
 def _fixture_origin(value: Any) -> tuple[str, int] | None:
@@ -2069,6 +2116,19 @@ def _preloaded_candidate_modules_are_local(preloaded: dict[str, Any], root: Path
     return True
 
 
+# E7: the single admission-owned bundle currently authorized to serve
+# candidate executable objects (parsers, stage-3 names).  Registered by
+# _load_candidate_module_bundle on success, cleared by
+# _release_candidate_module_bundle.  Nothing outside this bundle may be
+# dereferenced by the runner.
+_ACTIVE_CANDIDATE_BUNDLE: dict[str, Any] = {}
+
+
+def _active_candidate_bundle() -> dict[str, Any] | None:
+    bundle = _ACTIVE_CANDIDATE_BUNDLE.get("bundle")
+    return bundle if isinstance(bundle, dict) and not bundle.get("load_failed") else None
+
+
 def _release_candidate_module_bundle(bundle: Any) -> None:
     """Remove the candidate finder and every module it owned.
 
@@ -2079,6 +2139,8 @@ def _release_candidate_module_bundle(bundle: Any) -> None:
     """
     if not isinstance(bundle, dict):
         return
+    if _ACTIVE_CANDIDATE_BUNDLE.get("bundle") is bundle:
+        _ACTIVE_CANDIDATE_BUNDLE.clear()
     _remove_candidate_finder(bundle)
     preloaded = bundle.get("preloaded")
     protected = set(preloaded) if isinstance(preloaded, dict) else set()
@@ -2097,6 +2159,17 @@ def _release_candidate_module_bundle(bundle: Any) -> None:
         # Restore same-root modules that were temporarily evicted to ensure
         # candidate imports cannot reuse their mutable objects.
         sys.modules.update(preloaded)
+
+
+_REQUIRED_ADAPTER_EXPORTS = (
+    "_parse_credential_record",
+    "_validate_envelope_semantics",
+    "CredentialError",
+    "HermesAudioASRProvider",
+    "HermesAudioTTSProvider",
+    "HttpHermesGateway",
+    "ProviderFailure",
+)
 
 
 def _freeze_candidate_module_registry(
@@ -2125,6 +2198,11 @@ def _freeze_candidate_module_registry(
             or getattr(module, "__loader__", None) is not loader
         ):
             return None
+        exports = _candidate_exports(module)
+        if name == "recorder_next.adapters" and any(
+            required not in exports for required in _REQUIRED_ADAPTER_EXPORTS
+        ):
+            return None
         locations = getattr(spec, "submodule_search_locations", None)
         registry[name] = {
             "module": module,
@@ -2139,6 +2217,7 @@ def _freeze_candidate_module_registry(
             "module_path": tuple(getattr(module, "__path__")) if hasattr(module, "__path__") else None,
             "spec_name": getattr(spec, "name", None),
             "executed_byte_digest": executed_digest,
+            "exports": dict(exports),
         }
     return registry if "recorder_next.adapters" in registry else None
 
@@ -2209,7 +2288,19 @@ def _load_candidate_module_bundle(
         cleanup_bundle["module_map_frozen"] = {
             name: (member, bytes(data)) for name, (member, data) in module_map.items()
         }
+        # E7: freeze the export surface of every registry module so the
+        # closing check can reject replaced or added executable exports.
+        cleanup_bundle["exports_frozen"] = {
+            name: dict(_candidate_exports(entry["module"])) for name, entry in registry.items()
+        }
         cleanup_bundle["load_failed"] = False
+        # E7: the global bundle activation is what authorizes the credential
+        # parser and stage-3 resolvers.  A direct-test load must not leave
+        # that authority installed after it returns (the direct-test bundle
+        # is not the admission-owned registry), so only a retained-finder
+        # load publishes it.
+        if retain_finder:
+            _ACTIVE_CANDIDATE_BUNDLE["bundle"] = cleanup_bundle
         return cleanup_bundle
     except Exception:
         cleanup_bundle["load_failed"] = True
@@ -2296,6 +2387,19 @@ def _candidate_modules_still_bound(
             digest != expected.get("executed_byte_digest")
             or getattr(loader, "_executed_byte_digest", None) != digest
         ):
+            return False
+    # E7 executable_exports_not_bound: the registry binds the export surface
+    # as well as the executed bytes.  A replaced dereferenced export or an
+    # added foreign executable export breaks the closure (value identity).
+    exports_frozen = bundle.get("exports_frozen")
+    if not isinstance(exports_frozen, dict):
+        return False
+    for name, expected in registry.items():
+        frozen = exports_frozen.get(name)
+        bound = expected.get("exports")
+        if not isinstance(frozen, dict) or not isinstance(bound, dict):
+            return False
+        if bound != frozen or _candidate_exports(expected.get("module")) != frozen:
             return False
     return True
 
@@ -2479,17 +2583,11 @@ def _run_voice1_readonly_admission(context: dict[str, Any]) -> dict[str, Any]:
     )
     predicates["imports_bound"] = bool(imports_bound)
     predicates["candidate_bound"] = bool(candidate_source_ok and imports_bound and within_budget())
-    # E5 F-2 ordering: a candidate-bundle failure is still fatal, but the
-    # credential/metadata boundaries are observed FIRST so the report names
-    # the earliest failing boundary exactly as the closure design requires.
-    # The bundle gate is re-enforced before the capability stage below, so no
-    # credential-bearing provider observation can run on a weak candidate.
-    candidate_bundle_deferred = (
-        bool(predicates["authorization_bound"])
-        and not bool(predicates["candidate_bound"])
-        and candidate_bundle is None
-    )
-    if not (predicates["authorization_bound"] and predicates["candidate_bound"]) and not candidate_bundle_deferred:
+    # E7: a missing or invalid candidate bundle is terminal for this
+    # admission.  Do not defer the failure until after credential or metadata
+    # custody has been opened; the fail-closed boundary is before protected
+    # bytes and before any provider construction.
+    if not (predicates["authorization_bound"] and predicates["candidate_bound"]):
         reason_codes.append("authority_mismatch")
         return _admission_report(context, predicates, reason_codes, started_monotonic, started_utc, identity,
                                  observations=observations, authorization=authorization)
@@ -2507,7 +2605,9 @@ def _run_voice1_readonly_admission(context: dict[str, Any]) -> dict[str, Any]:
         # All later reads and drift checks use the retained descriptors.
         custody_handles.append(_open_custodied_file(dashboard_cred_path, dashboard_pin, max_bytes=4113))
         custody_handles.append(_open_custodied_file(api_cred_path, api_pin, max_bytes=4113))
-        custody_handles.append(_open_custodied_file(metadata_path, None, max_bytes=4096))
+        custody_handles.append(_open_custodied_file(
+            metadata_path, None, max_bytes=4096, bind_content=True
+        ))
     except (OSError, ValueError):
         predicates["credential_custody"] = False
         reason_codes.append("credential_custody")
@@ -2551,15 +2651,6 @@ def _run_voice1_readonly_admission(context: dict[str, Any]) -> dict[str, Any]:
         reason_codes.append("credential_parse")
         return _admission_report(context, predicates, reason_codes, started_monotonic, started_utc, identity,
                                  observations=observations, authorization=authorization)
-    if not _install_custody_reader_hooks(
-        context, adapters_module, dashboard_cred_path, api_cred_path,
-        dashboard_value, api_value,
-    ):
-        predicates["credential_custody"] = False
-        reason_codes.append("credential_custody")
-        return _admission_report(context, predicates, reason_codes, started_monotonic, started_utc, identity,
-                                 observations=observations, authorization=authorization)
-
     # Dashboard metadata lifetime: exact UTC string, >=3900s pre and post.
     try:
         metadata_raw = custody_handles[2].read_text()
@@ -2593,13 +2684,6 @@ def _run_voice1_readonly_admission(context: dict[str, Any]) -> dict[str, Any]:
         reason_codes.append("unauthenticated_gate")
         return _admission_report(context, predicates, reason_codes, started_monotonic, started_utc, identity,
                                  observations=observations, authorization=authorization)
-    if candidate_bundle_deferred:
-        # E5 F-2: no credential-bearing provider observation may run unless
-        # the candidate executed from manifest-verified bytes; nothing below
-        # this line is reachable with a weak candidate binding.
-        reason_codes.append("authority_mismatch")
-        return _admission_report(context, predicates, reason_codes, started_monotonic, started_utc, identity,
-                                 observations=observations, authorization=authorization)
 
     # -- 3. candidate capability + ASR/TTS readiness (true-default API) ----
     api_base = authorization.get("endpoints", {}).get("api_base_url")
@@ -2611,19 +2695,24 @@ def _run_voice1_readonly_admission(context: dict[str, Any]) -> dict[str, Any]:
         return _admission_report(context, predicates, reason_codes, started_monotonic, started_utc, identity,
                                  observations=observations, authorization=authorization)
     try:
-        from recorder_next.adapters import (
-            HermesAudioASRProvider,
-            HermesAudioTTSProvider,
-            HttpHermesGateway,
-            ProviderFailure,
-        )
-        credential_file = str(Path(str(paths.get("api_credential"))))
-        dashboard_credential_file = str(dashboard_cred_path)
+        # E7 unbound_import_before_credential_gate: the capability stage
+        # resolves every provider name through the bundle registry; a plain
+        # filesystem import here would be an unbound import source.
+        stage3 = _candidate_stage3_names(candidate_bundle)
+        HermesAudioASRProvider = stage3["HermesAudioASRProvider"]
+        HermesAudioTTSProvider = stage3["HermesAudioTTSProvider"]
+        HttpHermesGateway = stage3["HttpHermesGateway"]
+        ProviderFailure = stage3["ProviderFailure"]
 
         def half_budget() -> float:
             return max(budget_remaining() / 2.0, 0.0)
 
-        gateway = HttpHermesGateway(str(api_base), api_key_file=credential_file, require_existing_session=False)
+        # The providers are candidate-bound classes, but their path-based
+        # credential readers are not allowed to reopen protected files.  Feed
+        # the already custody-validated values into the instances directly so
+        # the module export registry remains immutable for close validation.
+        gateway = HttpHermesGateway(str(api_base), api_key_file=None, require_existing_session=False)
+        gateway._api_key = api_value
         capability = gateway.capability_check()
         # E5 F-3: keep custody through the exact provider observation — a
         # credential substitution during any provider call fails closed.
@@ -2634,16 +2723,18 @@ def _run_voice1_readonly_admission(context: dict[str, Any]) -> dict[str, Any]:
         )
 
         asr = HermesAudioASRProvider(str(dashboard_base), profile="default",
-                                     credential_file=dashboard_credential_file,
+                                     credential_file=None,
                                      timeout=min(PROVIDER_TIMEOUT_SECONDS, half_budget()))
+        asr._credential = dashboard_value
         asr_result = asr.readiness_check()
         if not _custody_handles_revalidate(custody_handles):
             raise ValueError("credential custody drifted during provider observation")
         predicates["asr_ready"] = bool(isinstance(asr_result, dict) and asr_result.get("capability"))
 
         tts = HermesAudioTTSProvider(str(dashboard_base), profile="default",
-                                     credential_file=dashboard_credential_file,
+                                     credential_file=None,
                                      timeout=min(PROVIDER_TIMEOUT_SECONDS, half_budget()))
+        tts._credential = dashboard_value
         tts_result = tts.readiness_check()
         if not _custody_handles_revalidate(custody_handles):
             raise ValueError("credential custody drifted during provider observation")
@@ -2855,13 +2946,15 @@ def quote_safe(value: str) -> str:
 
 
 class _CustodiedFile:
-    """A bounded no-follow descriptor plus its path/parent drift witness."""
+    """A bounded descriptor retaining every checked ancestry object."""
 
-    def __init__(self, path: Path, pinned: Any, max_bytes: int) -> None:
+    def __init__(self, path: Path, pinned: Any, max_bytes: int, *, bind_content: bool = False) -> None:
         if isinstance(max_bytes, bool) or not isinstance(max_bytes, int) or max_bytes < 0:
             raise ValueError("invalid custody bound")
+        if not isinstance(bind_content, bool):
+            raise ValueError("invalid content binding")
         canonical = _bounded_absolute_path(str(path))
-        if canonical is None or not _path_has_no_symlink_components(canonical):
+        if canonical is None:
             raise OSError("credential ancestry is not canonical")
         if pinned is not None and (
             not isinstance(pinned, dict)
@@ -2871,53 +2964,116 @@ class _CustodiedFile:
         ):
             raise ValueError("credential custody metadata is invalid")
         flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
-        descriptor = os.open(canonical, flags)
-        self.path = canonical
-        self.fd = descriptor
-        self.pinned = dict(pinned) if isinstance(pinned, dict) else None
-        self.max_bytes = max_bytes
+        directory_flags = flags | getattr(os, "O_DIRECTORY", 0)
+        # E7 metadata_ancestor_check_open_race: retain the root and every
+        # directory opened by the verified openat walk.  The descriptors are
+        # the lifetime witness; a pathname-only recheck cannot prove that a
+        # renamed ancestor still denotes the object used for the read.
+        ancestry = _recorded_ancestry_metadata(canonical)
+        if not ancestry:
+            raise OSError("credential ancestry is not canonical")
+        directory_fds: list[int] = []
+        descriptor = -1
         try:
+            root_fd = os.open("/", directory_flags)
+            directory_fds.append(root_fd)
+            os.set_inheritable(root_fd, False)
+            if _custody_signature(os.fstat(root_fd)) != _custody_signature(os.lstat(Path("/"))):
+                raise OSError("credential root changed during open")
+            walk_fd = root_fd
+            for component, checked_signature in ancestry[:-1]:
+                next_fd = os.open(component, directory_flags, dir_fd=walk_fd)
+                try:
+                    os.set_inheritable(next_fd, False)
+                    if _custody_signature(os.fstat(next_fd)) != checked_signature:
+                        raise OSError("credential ancestry changed during open")
+                    directory_fds.append(next_fd)
+                except BaseException:
+                    os.close(next_fd)
+                    raise
+                walk_fd = next_fd
+            descriptor = os.open(ancestry[-1][0], flags, dir_fd=walk_fd)
+            os.set_inheritable(descriptor, False)
             info = os.fstat(descriptor)
-            path_info = os.lstat(canonical)
-            if not stat.S_ISREG(info.st_mode) or not stat.S_ISREG(path_info.st_mode):
-                raise OSError("custodied object is not regular")
             identity = _stat_identity(info)
-            if identity != _stat_identity(path_info):
-                raise OSError("custodied path changed during open")
-            if self.pinned is not None and identity != self.pinned:
+            if not stat.S_ISREG(info.st_mode):
+                raise OSError("custodied object is not regular")
+            if pinned is not None and identity != pinned:
                 raise OSError("custodied object does not match authorization")
             if info.st_size > max_bytes:
                 raise OSError("custodied object exceeds bound")
+
+            self.path = canonical
+            self.fd = descriptor
+            self.pinned = dict(pinned) if isinstance(pinned, dict) else None
+            self.max_bytes = max_bytes
+            self.bind_content = bind_content
             self.identity = identity
-            self.parent_signature = self._parent_signature()
+            self._object_signature = _custody_signature(info)
+            self._directory_fds = directory_fds
+            self._directory_signatures = [
+                _custody_signature(os.fstat(directory_fd)) for directory_fd in directory_fds
+            ]
+            self._directory_identities = [
+                _stat_identity(os.fstat(directory_fd)) for directory_fd in directory_fds
+            ]
+            self._directory_components = tuple(component for component, _ in ancestry[:-1])
+            self._leaf_name = ancestry[-1][0]
+            self._ancestry = tuple(ancestry)
+            self.content_sha256 = self._read_content_digest_unchecked() if bind_content else None
+            if not self._revalidate_ancestry():
+                raise OSError("custodied path changed during open")
         except BaseException:
-            os.close(descriptor)
+            if descriptor >= 0:
+                os.close(descriptor)
+            for directory_fd in reversed(directory_fds):
+                os.close(directory_fd)
             raise
 
-    def _parent_signature(self) -> tuple[int, ...]:
-        info = os.lstat(self.path.parent)
-        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
-            raise OSError("custody parent is not a directory")
-        return (
-            info.st_dev, info.st_ino, info.st_uid, info.st_gid,
-            stat.S_IMODE(info.st_mode), info.st_ctime_ns, info.st_mtime_ns,
-        )
+    def _read_content_digest_unchecked(self) -> str:
+        os.lseek(self.fd, 0, os.SEEK_SET)
+        digest = hashlib.sha256()
+        total = 0
+        while total <= self.max_bytes:
+            chunk = os.read(self.fd, min(65536, self.max_bytes - total + 1))
+            if not chunk:
+                break
+            digest.update(chunk)
+            total += len(chunk)
+            if total > self.max_bytes:
+                raise OSError("custodied object exceeds bound")
+        return digest.hexdigest()
 
-    def revalidate(self) -> bool:
+    def _revalidate_ancestry(self) -> bool:
         if getattr(self, "fd", -1) < 0:
             return False
+        directory_fds: list[int] = list(getattr(self, "_directory_fds", ()))
+        directory_signatures: list[tuple[int, ...]] = list(
+            getattr(self, "_directory_signatures", ())
+        )
+        if not directory_fds or len(directory_fds) != len(directory_signatures):
+            return False
         try:
-            fd_info = os.fstat(self.fd)
-            path_info = os.lstat(self.path)
-            if not stat.S_ISREG(fd_info.st_mode) or not stat.S_ISREG(path_info.st_mode):
+            for directory_fd, expected_signature in zip(directory_fds, directory_signatures):
+                if _custody_signature(os.fstat(directory_fd)) != expected_signature:
+                    return False
+            info = os.fstat(self.fd)
+            if not stat.S_ISREG(info.st_mode):
                 return False
-            if _stat_identity(fd_info) != self.identity or _stat_identity(path_info) != self.identity:
+            if _stat_identity(info) != self.identity:
                 return False
-            if self.pinned is not None and _stat_identity(fd_info) != self.pinned:
+            if _custody_signature(info) != self._object_signature:
                 return False
-            return self._parent_signature() == self.parent_signature
+            if self.pinned is not None and _stat_identity(info) != self.pinned:
+                return False
+            if self.bind_content and self._read_content_digest_unchecked() != self.content_sha256:
+                return False
+            return True
         except OSError:
             return False
+
+    def revalidate(self) -> bool:
+        return self._revalidate_ancestry()
 
     def read_bytes(self) -> bytes:
         if not self.revalidate():
@@ -2939,6 +3095,8 @@ class _CustodiedFile:
                 raise OSError("custody drifted during read")
             if len(result) != os.fstat(self.fd).st_size:
                 raise OSError("custodied object size changed")
+            if self.bind_content and hashlib.sha256(result).hexdigest() != self.content_sha256:
+                raise OSError("custodied content changed")
             return result
         except OSError:
             raise
@@ -2951,10 +3109,20 @@ class _CustodiedFile:
         self.fd = -1
         if descriptor >= 0:
             os.close(descriptor)
+        directory_fds = list(getattr(self, "_directory_fds", ()))
+        self._directory_fds = []
+        for directory_fd in reversed(directory_fds):
+            os.close(directory_fd)
 
 
-def _open_custodied_file(path: Path, pinned: Any = None, *, max_bytes: int = 4096) -> _CustodiedFile:
-    return _CustodiedFile(path, pinned, max_bytes)
+def _open_custodied_file(
+    path: Path,
+    pinned: Any = None,
+    *,
+    max_bytes: int = 4096,
+    bind_content: bool = False,
+) -> _CustodiedFile:
+    return _CustodiedFile(path, pinned, max_bytes, bind_content=bind_content)
 
 
 def _custody_handles_revalidate(handles: Any) -> bool:
@@ -2963,24 +3131,89 @@ def _custody_handles_revalidate(handles: Any) -> bool:
     return all(isinstance(handle, _CustodiedFile) and handle.revalidate() for handle in handles)
 
 
+class CandidateBundleError(ImportError):
+    """A required candidate-bundle binding is missing (E7 fail-closed)."""
+
+
+class CredentialGateError(ValueError):
+    """No bundle-bound parser was available for a credential read (E7).
+
+    This is the runner-local stand-in for the candidate's CredentialError:
+    when no candidate bundle is bound the runner must not import the
+    candidate's exception class from the filesystem just to raise it.
+    """
+
+
+def _candidate_exports(module: Any) -> dict[str, Any]:
+    """Public + underscore callable/module export values of one module (E7).
+
+    The mapping binds values by identity: a replaced export keeps its name,
+    so only a value comparison can detect the substitution.
+    """
+    exports: dict[str, Any] = {}
+    for name in dir(module):
+        if name.startswith("__"):
+            continue
+        try:
+            value = getattr(module, name)
+        except Exception:
+            continue
+        if callable(value) or isinstance(value, types.ModuleType):
+            exports[name] = value
+    return exports
+
+
+def _candidate_stage3_names(bundle: Any) -> dict[str, Any]:
+    """Resolve the capability-stage names strictly from the bundle registry."""
+    if not isinstance(bundle, dict) or bundle.get("load_failed"):
+        raise CandidateBundleError("candidate bundle is not bound")
+    registry = bundle.get("registry")
+    entry = registry.get("recorder_next.adapters") if isinstance(registry, dict) else None
+    exports = entry.get("exports") if isinstance(entry, dict) else None
+    if not isinstance(exports, dict):
+        raise CandidateBundleError("candidate adapter exports are not bound")
+    names: dict[str, Any] = {}
+    for required in (
+        "HermesAudioASRProvider", "HermesAudioTTSProvider",
+        "HttpHermesGateway", "ProviderFailure",
+    ):
+        value = exports.get(required)
+        if not callable(value):
+            raise CandidateBundleError(f"candidate export {required!r} is not bound")
+        names[required] = value
+    return names
+
+
 def _read_credential_default(path: Path, pinned: Any = None, *, handle: _CustodiedFile | None = None) -> str:
-    """Parse bounded bytes from one already custody-checked descriptor."""
-    from recorder_next.adapters import CredentialError, _parse_credential_record
+    """Parse bounded bytes from one already custody-checked descriptor (E7:
+    the parser executes only from a bundle-bound candidate module)."""
+    bundle = _active_candidate_bundle()
+    registry = bundle.get("registry") if isinstance(bundle, dict) else None
+    entry = registry.get("recorder_next.adapters") if isinstance(registry, dict) else None
+    exports = entry.get("exports") if isinstance(entry, dict) else None
+    parser = exports.get("_parse_credential_record") if isinstance(exports, dict) else None
+    if not callable(parser):
+        raise CredentialGateError("credential parser is not bundle-bound")
+    _parse_record: Callable[[bytes], str] = cast(Callable[[bytes], str], parser)
+    credential_error: type[Exception] = CredentialGateError
+    candidate_error = exports.get("CredentialError") if isinstance(exports, dict) else None
+    if isinstance(candidate_error, type) and issubclass(candidate_error, Exception):
+        credential_error = candidate_error
 
     owned = handle is None
     if handle is None:
         try:
             handle = _open_custodied_file(path, pinned, max_bytes=4113)
         except (OSError, ValueError) as error:
-            raise CredentialError("credential file is unavailable") from error
+            raise credential_error("credential file is unavailable") from error
     try:
         if handle.path != _bounded_absolute_path(str(path)):
-            raise CredentialError("credential path changed")
+            raise credential_error("credential path changed")
         try:
             raw = handle.read_bytes()
         except OSError as error:
-            raise CredentialError("credential custody identity drifted") from error
-        return _parse_credential_record(raw)
+            raise credential_error("credential custody identity drifted") from error
+        return _parse_record(raw)
     finally:
         if owned:
             handle.close()
@@ -3140,15 +3373,34 @@ def _tts_reduction(body: Any) -> dict[str, Any] | None:
 
 
 def _validate_tts_projection_ready(projection: dict[str, Any]) -> bool:
-    """Apply the candidate adapter's strict Hermes envelope/TTS validators."""
+    """Apply the active candidate adapter's strict Hermes validators."""
     if not isinstance(projection, dict):
         return False
-    try:
-        module = importlib.import_module("recorder_next.adapters")
-        module._validate_envelope_semantics(projection, provider_kind="hermes")
-        if not module.HermesAudioTTSProvider._envelope_flags_satisfied(projection):
+    bundle = _active_candidate_bundle()
+    if bundle is None:
+        # Direct unit callers exercise this pure validator outside an
+        # admission-owned bundle.  The admission path always has an active
+        # bundle before it reaches this helper, so this compatibility branch
+        # cannot supply executable objects to the runner's protected lane.
+        try:
+            module = importlib.import_module("recorder_next.adapters")
+        except Exception:
             return False
-        module.HermesAudioTTSProvider._validate_tts_capability(projection)
+        validate_envelope = getattr(module, "_validate_envelope_semantics", None)
+        tts_provider = getattr(module, "HermesAudioTTSProvider", None)
+    else:
+        registry = bundle.get("registry")
+        entry = registry.get("recorder_next.adapters") if isinstance(registry, dict) else None
+        exports = entry.get("exports") if isinstance(entry, dict) else None
+        validate_envelope = exports.get("_validate_envelope_semantics") if isinstance(exports, dict) else None
+        tts_provider = exports.get("HermesAudioTTSProvider") if isinstance(exports, dict) else None
+    if not callable(validate_envelope) or not isinstance(tts_provider, type):
+        return False
+    try:
+        validate_envelope(projection, provider_kind="hermes")
+        if not tts_provider._envelope_flags_satisfied(projection):
+            return False
+        tts_provider._validate_tts_capability(projection)
         return True
     except Exception:
         return False
