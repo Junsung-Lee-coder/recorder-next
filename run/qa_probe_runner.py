@@ -2148,7 +2148,7 @@ def _load_candidate_module_bundle(
 ) -> dict[str, Any] | None:
     """Execute candidate modules only from manifest-verified bytes (E6).
 
-    The default direct-test mode cleans up before returning.  Admission passes
+    The default direct-test mode removes the finder before returning.  Admission passes
     ``retain_finder=True`` and owns the returned bundle until its outer
     ``finally``; this keeps the manifest-byte capability installed through
     every provider/session observation and the closing identity check.
