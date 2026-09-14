@@ -4302,6 +4302,7 @@ def cleanup_attempt(context: dict[str, Any], expected_head_sha256: str) -> dict[
             raise AttemptContextError("protected logical vector drifted inside cleanup")
         conn.execute("COMMIT")
         committed = True
+        conn.close()
     except BaseException:
         try:
             if not committed:
@@ -4750,6 +4751,21 @@ class AttemptExecutorTests(unittest.TestCase):
         self.assertEqual(a3["status"], "PASS")
         result = cleanup_attempt(self.context, a3["resulting_head_sha256"])
         self.assertEqual(result["status"], "PASS", result)
+
+    def test_cleanup_releases_connection_on_success(self):
+        import gc
+        import warnings
+
+        a1 = self._run_a1()
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always", ResourceWarning)
+            result = cleanup_attempt(self.context, a1["resulting_head_sha256"])
+            gc.collect()
+        self.assertEqual(result["status"], "PASS", result)
+        self.assertFalse(
+            any("unclosed database" in str(item.message) for item in caught),
+            caught,
+        )
 
     def test_cleanup_r1_cleaned_is_already_completed(self):
         a1 = self._run_a1()
