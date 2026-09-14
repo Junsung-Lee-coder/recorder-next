@@ -41,6 +41,7 @@ import unittest
 import uuid
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
 # S-CLI: script-form execution must import the candidate
 # package from the candidate root.  When run as a script, sys.path[0] is
@@ -748,7 +749,6 @@ REQUIRED_PREDICATES: tuple[str, ...] = (
     "candidate_bound",
     "imports_bound",
     "credential_custody",
-    "credential_custody_after_reads",
     "dashboard_credential_parse",
     "api_credential_parse",
     "lifetime_pre",
@@ -811,6 +811,41 @@ ADMISSION_TOTAL_BUDGET_SECONDS = 90.0
 PROVIDER_TIMEOUT_SECONDS = 10.0
 SESSION_BUDGET_SECONDS = 10.0
 DASHBOARD_LIFETIME_FLOOR_SECONDS = 3900
+_ORIGINAL_SQLITE_CONNECT = sqlite3.connect
+
+# The public report is deliberately explicit: A3 validates this complete
+# stdout shape instead of treating an arbitrary parsed mapping as authority.
+ADMISSION_REPORT_KEYS: frozenset[str] = frozenset({
+    "schema", "candidate_id", "archive_sha256", "source_commit", "source_tree",
+    "control_sha256", "spec_sha256", "started_utc", "finished_utc", "elapsed_ms",
+    "predicates", "missing_predicates", "failed_predicates", "reason_codes",
+    "expected_session_id_sha256", "expected_key_sha256", "persisted_key_sha256",
+    "manifest_sha256", "authorization_sha256", "control_packet_sha256",
+    "execution_scope", "observation_order", "session_observed_utc",
+    "session_observed_monotonic_ns", "boot_id", "status", "status_code",
+})
+_FIXED_ADMISSION_REASON_CODES: frozenset[str] = frozenset({
+    "invalid_argv", "authority_mismatch", "source_drift", "credential_custody",
+    "credential_parse", "lifetime", "unauthenticated_gate", "capability",
+    "tts_readiness", "profile_mismatch", "session_get", "persisted_lookup",
+    "session_admission", "deadline", "closing_drift", "internal_error",
+})
+
+
+def _fixed_reason_codes(values: Any) -> list[str]:
+    """Return bounded vocabulary-only report reasons (never input text)."""
+    if not isinstance(values, (list, tuple, set, frozenset)):
+        return ["internal_error"]
+    selected: set[str] = set()
+    unknown = False
+    for value in values:
+        if isinstance(value, str) and value in _FIXED_ADMISSION_REASON_CODES:
+            selected.add(value)
+        else:
+            unknown = True
+    if unknown:
+        selected.add("internal_error")
+    return sorted(selected)
 
 def _utc_now_iso() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
@@ -823,7 +858,33 @@ def _boot_id() -> str | None:
     except OSError:
         return None
     value = raw.strip()
-    return value if value else None
+    return _canonical_boot_id(value)
+
+
+def _canonical_boot_id(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = uuid.UUID(value)
+    except (ValueError, AttributeError, TypeError):
+        return None
+    canonical = str(parsed)
+    return canonical if value == canonical else None
+
+
+def _observation_identity_valid(observations: Any) -> bool:
+    if not isinstance(observations, dict):
+        return False
+    observed_utc = observations.get("session_observed_utc")
+    observed_epoch = _utc_parse(observed_utc)
+    observed_ns = observations.get("session_observed_monotonic_ns")
+    boot_id = _canonical_boot_id(observations.get("boot_id"))
+    if observed_epoch is None or observed_epoch > int(time.time()):
+        return False
+    if isinstance(observed_ns, bool) or not isinstance(observed_ns, int) or observed_ns < 0:
+        return False
+    current_boot = _boot_id()
+    return boot_id is not None and current_boot is not None and boot_id == current_boot
 
 
 def _admission_report(context: dict[str, Any], predicates: dict[str, bool],
@@ -842,7 +903,12 @@ def _admission_report(context: dict[str, Any], predicates: dict[str, bool],
         set(supplied) == set(REQUIRED_PREDICATES)
         and all(type(supplied[name]) is bool for name in REQUIRED_PREDICATES)
     )
-    all_true = exact_shape and all(supplied[name] is True for name in REQUIRED_PREDICATES)
+    auth_values = authorization if isinstance(authorization, dict) else {}
+    observation_values = observations if isinstance(observations, dict) else {}
+    all_true = (
+        exact_shape
+        and all(supplied[name] is True for name in REQUIRED_PREDICATES)
+    )
     finished_utc = _utc_now_iso()
     elapsed_ms = int((time.monotonic() - started_monotonic) * 1000)
     report: dict[str, Any] = {
@@ -859,18 +925,18 @@ def _admission_report(context: dict[str, Any], predicates: dict[str, bool],
         "predicates": {name: supplied.get(name) is True for name in REQUIRED_PREDICATES},
         "missing_predicates": missing,
         "failed_predicates": failed,
-        "reason_codes": sorted(set(reason_codes)),
+        "reason_codes": _fixed_reason_codes(reason_codes),
         "expected_session_id_sha256": EXPECTED_S_SHA256,
-        "expected_key_sha256": EXPECTED_KEY_SHA256,
-        "persisted_key_sha256": (authorization or {}).get("persisted_key_sha256"),
+        "expected_key_sha256": auth_values.get("persisted_key_sha256"),
+        "persisted_key_sha256": auth_values.get("persisted_key_sha256"),
         "manifest_sha256": context.get("manifest_sha256"),
         "authorization_sha256": context.get("authorization_sha256"),
-        "control_packet_sha256": (authorization or {}).get("control_packet_sha256"),
-        "execution_scope": (authorization or {}).get("execution_scope"),
+        "control_packet_sha256": auth_values.get("control_packet_sha256"),
+        "execution_scope": auth_values.get("execution_scope"),
         "observation_order": list(OBSERVATION_ORDER),
-        "session_observed_utc": (observations or {}).get("session_observed_utc"),
-        "session_observed_monotonic_ns": (observations or {}).get("session_observed_monotonic_ns"),
-        "boot_id": (observations or {}).get("boot_id"),
+        "session_observed_utc": observation_values.get("session_observed_utc"),
+        "session_observed_monotonic_ns": observation_values.get("session_observed_monotonic_ns"),
+        "boot_id": observation_values.get("boot_id"),
     }
     if all_true:
         report["status"] = "PASS"
@@ -879,6 +945,181 @@ def _admission_report(context: dict[str, Any], predicates: dict[str, bool],
         report["status"] = "HOLD"
         report["status_code"] = 2
     return report
+
+
+def _a3_admission_is_fresh(context: dict[str, Any], parsed: Any) -> bool:
+    if not isinstance(context, dict) or not isinstance(parsed, dict):
+        return False
+    started = _utc_parse(parsed.get("started_utc"))
+    finished = _utc_parse(parsed.get("finished_utc"))
+    observed = _utc_parse(parsed.get("session_observed_utc"))
+    if started is None or finished is None or observed is None or started > finished or observed < started or observed > finished:
+        return False
+    now_epoch = int(time.time())
+    if started > now_epoch or finished > now_epoch or observed > now_epoch:
+        return False
+    observed_ns = parsed.get("session_observed_monotonic_ns")
+    if isinstance(observed_ns, bool) or not isinstance(observed_ns, int) or observed_ns < 0:
+        return False
+    age_ns = time.monotonic_ns() - observed_ns
+    if age_ns < 0 or age_ns > 10_000_000_000:
+        return False
+    report_boot = _canonical_boot_id(parsed.get("boot_id"))
+    current_boot = _boot_id()
+    if report_boot is None or current_boot is None or report_boot != current_boot:
+        return False
+    authorization = context.get("authorization")
+    if not isinstance(authorization, dict):
+        return False
+    not_before = _utc_parse(authorization.get("not_before_utc"))
+    expires_at = _utc_parse(authorization.get("expires_at_utc"))
+    if not_before is None or expires_at is None or not_before >= expires_at:
+        return False
+    return not_before <= min(started, observed) and max(finished, observed) <= expires_at
+
+
+def _validate_a3_admission_report(context: dict[str, Any], raw: bytes) -> dict[str, Any] | None:
+    """Validate one exact, freshly observed admission report for fixture A3."""
+    if not isinstance(context, dict) or not isinstance(raw, bytes) or not raw:
+        return None
+    if len(raw) > 1024 * 1024 or not raw.endswith(b"\n") or raw.endswith(b"\n\n"):
+        return None
+    if raw[:-1].endswith((b"\n", b"\r", b" ", b"\t")):
+        return None
+    expected_digest = context.get("admission_sha256")
+    if not _is_lower_hex(expected_digest, 64) or hashlib.sha256(raw).hexdigest() != expected_digest:
+        return None
+
+    def reject_duplicate_pairs(pairs: list[tuple[Any, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            if not isinstance(key, str) or key in result:
+                raise ValueError("duplicate or non-string report key")
+            result[key] = value
+        return result
+
+    try:
+        parsed = json.loads(raw.decode("utf-8"), object_pairs_hook=reject_duplicate_pairs)
+    except (UnicodeDecodeError, ValueError, json.JSONDecodeError):
+        return None
+    if not isinstance(parsed, dict) or set(parsed) != set(ADMISSION_REPORT_KEYS):
+        return None
+    if parsed.get("schema") != REPORT_SCHEMA or parsed.get("status") != "PASS" or parsed.get("status_code") != 0:
+        return None
+    if type(parsed.get("status_code")) is not int:
+        return None
+    predicates = parsed.get("predicates")
+    if (
+        not isinstance(predicates, dict)
+        or set(predicates) != set(REQUIRED_PREDICATES)
+        or any(type(predicates[name]) is not bool or predicates[name] is not True for name in REQUIRED_PREDICATES)
+    ):
+        return None
+    if parsed.get("missing_predicates") != [] or parsed.get("failed_predicates") != []:
+        return None
+    reason_codes = parsed.get("reason_codes")
+    if not isinstance(reason_codes, list) or reason_codes:
+        return None
+    if parsed.get("observation_order") != list(OBSERVATION_ORDER):
+        return None
+
+    authorization = context.get("authorization")
+    if not isinstance(authorization, dict):
+        return None
+    authorization_scope = authorization.get("execution_scope")
+    authorization_key = authorization.get("persisted_key_sha256")
+    expected_scope = context.get("execution_scope")
+    if expected_scope is None:
+        expected_scope = authorization_scope
+    elif expected_scope != authorization_scope:
+        return None
+    expected_key = context.get("persisted_key_sha256")
+    if expected_key is None:
+        expected_key = authorization_key
+    elif expected_key != authorization_key:
+        return None
+    if expected_scope != "fixture_readonly" or parsed.get("execution_scope") != expected_scope:
+        return None
+    if not _is_lower_hex(expected_key, 64):
+        return None
+    if (
+        parsed.get("expected_session_id_sha256") != EXPECTED_S_SHA256
+        or parsed.get("expected_key_sha256") != expected_key
+        or parsed.get("persisted_key_sha256") != expected_key
+    ):
+        return None
+
+    authorization_identity_fields = (
+        ("candidate_id", "candidate_id"),
+        ("candidate_sha256", "archive_sha256"),
+        ("source_commit", "source_commit"),
+        ("source_tree", "source_tree"),
+        ("control_sha256", "control_sha256"),
+        ("specification_sha256", "spec_sha256"),
+        ("manifest_sha256", "manifest_sha256"),
+        ("control_packet_sha256", "control_packet_sha256"),
+    )
+    for authorization_field, report_field in authorization_identity_fields:
+        expected_value = authorization.get(authorization_field)
+        if not isinstance(expected_value, str) or parsed.get(report_field) != expected_value:
+            return None
+    selected_session_digest = authorization.get("selected_session_id_sha256")
+    if selected_session_digest is not None and selected_session_digest != EXPECTED_S_SHA256:
+        return None
+
+    expected_fields = (
+        "candidate_id", "archive_sha256", "source_commit", "source_tree",
+        "control_sha256", "spec_sha256", "manifest_sha256",
+        "authorization_sha256", "control_packet_sha256",
+    )
+    identity = context.get("identity") if isinstance(context.get("identity"), dict) else {}
+    for field in expected_fields:
+        expected = context.get(field)
+        if expected is None:
+            expected = identity.get(field)
+        if field == "control_packet_sha256" and expected is None:
+            expected = authorization.get(field)
+        if not isinstance(expected, str) or parsed.get(field) != expected:
+            return None
+    for field in ("archive_sha256", "control_sha256", "spec_sha256", "manifest_sha256",
+                  "authorization_sha256", "control_packet_sha256"):
+        if not _is_lower_hex(parsed.get(field), 64):
+            return None
+    for field in ("source_commit", "source_tree"):
+        if not _is_lower_hex(parsed.get(field), 40):
+            return None
+    if not isinstance(parsed.get("candidate_id"), str) or not parsed["candidate_id"]:
+        return None
+    if re.fullmatch(r"[a-z0-9][a-z0-9._-]*", parsed["candidate_id"]) is None or len(parsed["candidate_id"]) > 128:
+        return None
+    elapsed_ms = parsed.get("elapsed_ms")
+    if isinstance(elapsed_ms, bool) or not isinstance(elapsed_ms, int) or elapsed_ms < 0:
+        return None
+    if not _a3_admission_is_fresh(context, parsed):
+        return None
+    return parsed
+
+
+def _read_admission_report_once(context: dict[str, Any]) -> dict[str, Any] | None:
+    """Read and validate report bytes once; a parsed mapping is not authority."""
+    if not isinstance(context, dict) or context.get("_admission_report_consumed"):
+        return None
+    context["_admission_report_consumed"] = True
+    raw = context.get("admission_report_bytes")
+    if raw is None:
+        report_path = context.get("admission_report_path")
+        if not isinstance(report_path, (str, Path)):
+            return None
+        path = _bounded_absolute_path(report_path)
+        if path is None or not _path_has_no_symlink_components(path):
+            return None
+        loaded = _read_regular_file_no_follow(path, limit=1024 * 1024)
+        if loaded is None:
+            return None
+        raw = loaded[0]
+    if not isinstance(raw, bytes):
+        return None
+    return _validate_a3_admission_report(context, raw)
 
 
 def _hold_report(context: dict[str, Any], reason: str, started_monotonic: float,
@@ -1719,6 +1960,10 @@ class _ManifestBytesLoader:
 
     def exec_module(self, module: Any) -> None:
         compiled = compile(self._data, self.get_filename(), "exec")
+        # Freeze the bytes that actually reached compile/exec.  Closing
+        # validation compares this digest with both the loader data and the
+        # registry, never with a later filesystem/archive read.
+        self._executed_byte_digest = hashlib.sha256(self._data).hexdigest()
         # The candidate's modules reference module-level dunder state
         # (__file__/__package__) that a bare exec does not provide; bind the
         # manifest-virtual identity, never a real filesystem pathname.
@@ -1798,17 +2043,115 @@ def _loaded_candidate_modules() -> dict[str, Any]:
     }
 
 
-def _load_candidate_module_bundle(
-    manifest: dict[str, Any], authorization: dict[str, Any]
-) -> dict[str, Any] | None:
-    """Execute candidate modules only from manifest-verified bytes (E5 F-2).
+def _remove_candidate_finder(bundle: dict[str, Any]) -> None:
+    finder = bundle.get("finder")
+    while finder is not None and finder in sys.meta_path:
+        try:
+            sys.meta_path.remove(finder)
+        except ValueError:
+            break
 
-    Full source verification runs first; then every recorder_next module is
-    imported through a finder that serves exactly the pinned member bytes.
-    Preloaded foreign recorder_next modules are rejected (never silently
-    reused), and after import every loaded candidate module must be
-    manifest-bound.  Returns {"adapters": module, "modules": {name: member}}
-    or None on any failure.
+
+def _preloaded_candidate_modules_are_local(preloaded: dict[str, Any], root: Path) -> bool:
+    """Allow replacement only for modules already loaded from this candidate root."""
+    try:
+        root_resolved = root.resolve(strict=True)
+    except OSError:
+        return False
+    for module in preloaded.values():
+        module_file = getattr(module, "__file__", None)
+        if not isinstance(module_file, str) or not module_file or ":" in module_file.split("/", 1)[0]:
+            return False
+        try:
+            Path(module_file).resolve(strict=True).relative_to(root_resolved)
+        except (OSError, ValueError):
+            return False
+    return True
+
+
+def _release_candidate_module_bundle(bundle: Any) -> None:
+    """Remove the candidate finder and every module it owned.
+
+    This is intentionally the sole cleanup point for an admission-owned
+    bundle.  The finder stays installed while observations and terminal
+    validation are in progress, so imports cannot silently fall back to the
+    mutable working tree.
+    """
+    if not isinstance(bundle, dict):
+        return
+    _remove_candidate_finder(bundle)
+    preloaded = bundle.get("preloaded")
+    protected = set(preloaded) if isinstance(preloaded, dict) else set()
+    owned = bundle.get("owned_names")
+    names = set(owned) if isinstance(owned, (set, frozenset, tuple, list)) else set()
+    registry = bundle.get("registry")
+    if isinstance(registry, dict):
+        names.update(registry)
+    # A failed import can leave a partially initialized package behind.  It
+    # is owned by this finder unless it existed before the bundle was loaded.
+    names.update(_loaded_candidate_modules())
+    for name in names:
+        if name not in protected:
+            sys.modules.pop(name, None)
+    if isinstance(preloaded, dict):
+        # Restore same-root modules that were temporarily evicted to ensure
+        # candidate imports cannot reuse their mutable objects.
+        sys.modules.update(preloaded)
+
+
+def _freeze_candidate_module_registry(
+    module_map: dict[str, tuple[str, bytes]], loaded: dict[str, Any]
+) -> dict[str, dict[str, Any]] | None:
+    registry: dict[str, dict[str, Any]] = {}
+    for name, module in loaded.items():
+        entry = module_map.get(name)
+        spec = getattr(module, "__spec__", None)
+        loader = getattr(spec, "loader", None) if spec is not None else None
+        if entry is None or not isinstance(loader, _ManifestBytesLoader):
+            return None
+        member, data = entry
+        executed_digest = getattr(loader, "_executed_byte_digest", None)
+        if not _is_lower_hex(executed_digest, 64):
+            return None
+        if executed_digest != hashlib.sha256(data).hexdigest():
+            return None
+        if executed_digest != hashlib.sha256(getattr(loader, "_data", b"")).hexdigest():
+            return None
+        expected_origin = f"recorder-next-manifest:{member}"
+        if (
+            getattr(module, "__manifest_member__", None) != member
+            or getattr(loader, "_member", None) != member
+            or getattr(spec, "origin", None) != expected_origin
+            or getattr(module, "__loader__", None) is not loader
+        ):
+            return None
+        locations = getattr(spec, "submodule_search_locations", None)
+        registry[name] = {
+            "module": module,
+            "member": member,
+            "loader": loader,
+            "spec": spec,
+            "origin": expected_origin,
+            "locations": tuple(locations) if locations is not None else None,
+            "module_file": getattr(module, "__file__", None),
+            "module_name": getattr(module, "__name__", None),
+            "package": getattr(module, "__package__", None),
+            "module_path": tuple(getattr(module, "__path__")) if hasattr(module, "__path__") else None,
+            "spec_name": getattr(spec, "name", None),
+            "executed_byte_digest": executed_digest,
+        }
+    return registry if "recorder_next.adapters" in registry else None
+
+
+def _load_candidate_module_bundle(
+    manifest: dict[str, Any], authorization: dict[str, Any], *, retain_finder: bool = False
+) -> dict[str, Any] | None:
+    """Execute candidate modules only from manifest-verified bytes (E6).
+
+    The default direct-test mode cleans up before returning.  Admission passes
+    ``retain_finder=True`` and owns the returned bundle until its outer
+    ``finally``; this keeps the manifest-byte capability installed through
+    every provider/session observation and the closing identity check.
     """
     if not _verify_candidate_source(authorization, manifest):
         return None
@@ -1833,67 +2176,126 @@ def _load_candidate_module_bundle(
 
     preloaded = _loaded_candidate_modules()
     if preloaded:
-        return None
+        candidate_root = _bounded_absolute_path(authorization.get("candidate_root"))
+        if candidate_root is None or not _preloaded_candidate_modules_are_local(preloaded, candidate_root):
+            return None
+        # Same-root imports are replaced for the admission window; foreign or
+        # unverifiable preloads remain a hard refusal rather than an import
+        # source that could bypass manifest bytes.
+        for name in preloaded:
+            sys.modules.pop(name, None)
     finder = _ManifestPackageFinder(module_map)
+    cleanup_bundle: dict[str, Any] = {
+        "finder": finder,
+        "preloaded": dict(preloaded),
+        "owned_names": set(),
+        "registry": {},
+        "direct_test_mode": not retain_finder,
+    }
     sys.meta_path.insert(0, finder)
     try:
-        loaded = importlib.import_module("recorder_next.adapters")
-        bound: dict[str, str] = {}
-        for name, module in _loaded_candidate_modules().items():
-            spec = getattr(module, "__spec__", None)
-            loader = getattr(spec, "loader", None) if spec is not None else None
-            if not isinstance(loader, _ManifestBytesLoader):
-                return None
-            entry = module_map.get(name)
-            if entry is None:
-                return None
-            bound[name] = entry[0]
-        if "recorder_next.adapters" not in bound:
-            return None
+        loaded_adapters = importlib.import_module("recorder_next.adapters")
+        loaded = _loaded_candidate_modules()
+        cleanup_bundle["owned_names"] = set(loaded)
+        registry = _freeze_candidate_module_registry(module_map, loaded)
+        if registry is None:
+            cleanup_bundle["load_failed"] = True
+            return cleanup_bundle if retain_finder else None
+        cleanup_bundle["registry"] = registry
+        cleanup_bundle["owned_names"] = set(registry)
+        cleanup_bundle["adapters"] = loaded_adapters
+        cleanup_bundle["modules"] = {name: entry["member"] for name, entry in registry.items()}
+        cleanup_bundle["module_map"] = module_map
+        cleanup_bundle["module_map_frozen"] = {
+            name: (member, bytes(data)) for name, (member, data) in module_map.items()
+        }
+        cleanup_bundle["load_failed"] = False
+        return cleanup_bundle
     except Exception:
-        return None
+        cleanup_bundle["load_failed"] = True
+        cleanup_bundle["owned_names"] = set(_loaded_candidate_modules())
+        return cleanup_bundle if retain_finder else None
     finally:
-        try:
-            sys.meta_path.remove(finder)
-        except ValueError:
-            pass
-    return {"adapters": loaded, "modules": bound}
+        if not retain_finder:
+            if cleanup_bundle.get("load_failed"):
+                _release_candidate_module_bundle(cleanup_bundle)
+            else:
+                _remove_candidate_finder(cleanup_bundle)
 
 
 def _candidate_modules_still_bound(
     bundle: Any, manifest: dict[str, Any], authorization: dict[str, Any]
 ) -> bool:
-    """Closing-side check: loaded candidate modules remain manifest-bound (E5 F-2)."""
-    if not isinstance(bundle, dict):
+    """Verify the frozen module object/loader/spec closure without re-opening source."""
+    if not isinstance(bundle, dict) or bundle.get("load_failed"):
         return False
-    bound = bundle.get("modules")
-    if not isinstance(bound, dict) or "recorder_next.adapters" not in bound:
+    registry = bundle.get("registry")
+    module_map = bundle.get("module_map")
+    frozen_module_map = bundle.get("module_map_frozen")
+    finder = bundle.get("finder")
+    per_file = manifest.get("per_file_sha256") if isinstance(manifest, dict) else None
+    if (
+        not isinstance(registry, dict)
+        or not isinstance(module_map, dict)
+        or not isinstance(frozen_module_map, dict)
+        or module_map != frozen_module_map
+        or (per_file is not None and not isinstance(per_file, dict))
+        or "recorder_next.adapters" not in registry
+        or getattr(finder, "_module_map", None) is not module_map
+        or (finder not in sys.meta_path and not bundle.get("direct_test_mode"))
+    ):
         return False
-    for name in bound:
-        module = sys.modules.get(name)
-        if module is None:
+    current = _loaded_candidate_modules()
+    if set(current) != set(registry):
+        return False
+    if isinstance(per_file, dict) and per_file:
+        for name, expected in registry.items():
+            mapped = module_map.get(name)
+            if not isinstance(mapped, tuple) or len(mapped) != 2:
+                return False
+            member, data = mapped
+            if (
+                expected.get("member") != member
+                or hashlib.sha256(data).hexdigest() != expected.get("executed_byte_digest")
+                or per_file.get(member) != expected.get("executed_byte_digest")
+            ):
+                return False
+    for name, expected in registry.items():
+        module = current.get(name)
+        if module is not expected.get("module"):
             return False
         spec = getattr(module, "__spec__", None)
         loader = getattr(spec, "loader", None) if spec is not None else None
-        if not isinstance(loader, _ManifestBytesLoader):
+        if spec is not expected.get("spec") or loader is not expected.get("loader"):
             return False
-        if getattr(module, "__dict__", {}).get("__manifest_member__") != bound[name]:
+        if getattr(module, "__loader__", None) is not loader:
             return False
-    per_file = manifest.get("per_file_sha256") if isinstance(manifest, dict) else None
-    if not isinstance(per_file, dict) or set(bound.values()) - set(per_file):
-        return False
-    archive_path = (
-        _bounded_absolute_path(authorization.get("archive_path"))
-        if isinstance(authorization, dict)
-        else None
-    )
-    if archive_path is None:
-        return False
-    member_bytes = _extract_manifest_member_bytes(archive_path, per_file)
-    if member_bytes is None:
-        return False
-    for name, member in bound.items():
-        if member_bytes.get(member) is None:
+        if getattr(spec, "origin", None) != expected.get("origin"):
+            return False
+        try:
+            locations = getattr(spec, "submodule_search_locations", None)
+            actual_locations = tuple(locations) if locations is not None else None
+            actual_module_path = tuple(getattr(module, "__path__")) if hasattr(module, "__path__") else None
+        except TypeError:
+            return False
+        if actual_locations != expected.get("locations"):
+            return False
+        member = expected.get("member")
+        if (
+            getattr(module, "__manifest_member__", None) != member
+            or getattr(loader, "_member", None) != member
+            or getattr(module, "__file__", None) != expected.get("module_file")
+            or getattr(module, "__name__", None) != expected.get("module_name")
+            or getattr(module, "__package__", None) != expected.get("package")
+            or getattr(spec, "name", None) != expected.get("spec_name")
+            or actual_module_path != expected.get("module_path")
+        ):
+            return False
+        digest = hashlib.sha256(getattr(loader, "_data", b"")).hexdigest()
+        if (
+            digest != expected.get("executed_byte_digest")
+            or getattr(loader, "_executed_byte_digest", None) != digest
+        ):
             return False
     return True
 
@@ -1930,6 +2332,9 @@ def _closing_identity_equal(context: dict[str, Any], adapters_module: Any = None
     """Re-read all identity inputs and the imported module at terminalization."""
     if not isinstance(context, dict):
         return False
+    custody_handles = context.get("_custody_handles")
+    if custody_handles is not None and not _custody_handles_revalidate(custody_handles):
+        return False
     manifest_path = context.get("manifest_path")
     authorization_path = context.get("authorization_path")
     manifest_sha256 = context.get("manifest_sha256")
@@ -1952,35 +2357,22 @@ def _closing_identity_equal(context: dict[str, Any], adapters_module: Any = None
         return False
     if not _cold_rehash_ratified_authorities():
         return False
-    module = adapters_module if adapters_module is not None else context.get("adapters_module")
-    if module is None:
-        try:
-            module = importlib.import_module("recorder_next.adapters")
-        except Exception:
-            return False
-    root = _bounded_absolute_path(authorization.get("candidate_root"))
-    per_file = manifest.get("per_file_sha256")
-    # E5 F-2: a manifest-bound module carries a virtual manifest origin, so
-    # the pathname identity check cannot apply to it; its identity is the
-    # member stamp plus the digest-verifiable archive bytes checked below.
-    manifest_stamped = getattr(module, "__manifest_member__", None) == "recorder_next/adapters.py"
-    if not manifest_stamped:
-        if not (root is not None and isinstance(per_file, dict) and _verify_imported_module_identity(module, root, per_file)):
-            return False
-    # E5 F-2: the loaded candidate bundle must still be manifest-bound at
-    # closing — the executed modules must still carry their manifest loader,
-    # member stamp, and digest-verifiable archive bytes.
+    # The final identity is the exact module object retained by admission;
+    # importing a replacement module here would hide namespace substitution.
     bundle = context.get("candidate_bundle")
-    if bundle is not None:
-        if not _candidate_modules_still_bound(bundle, manifest, authorization):
-            return False
-    elif manifest_stamped:
-        # A stamped module without a closing bundle cannot be re-verified.
+    if not isinstance(bundle, dict) or not _candidate_modules_still_bound(bundle, manifest, authorization):
+        return False
+    registry = bundle.get("registry")
+    if not isinstance(registry, dict):
+        return False
+    module_entry = registry.get("recorder_next.adapters")
+    module = adapters_module if adapters_module is not None else context.get("adapters_module")
+    if module_entry is None or module is not module_entry.get("module"):
         return False
     return True
 
 
-def run_voice1_readonly_admission(context: dict[str, Any]) -> dict[str, Any]:
+def _run_voice1_readonly_admission(context: dict[str, Any]) -> dict[str, Any]:
     """Real observational read-only Voice1 admission caller (REV-008).
 
     ``context`` is constructed by the executable main() from the root-pinned
@@ -2053,11 +2445,15 @@ def run_voice1_readonly_admission(context: dict[str, Any]) -> dict[str, Any]:
         # loader — verified archive bytes, never a pathname re-open.  Preloaded
         # foreign recorder_next modules and any forged loader metadata are
         # rejected inside the bundle loader.
-        candidate_bundle = _load_candidate_module_bundle(manifest, authorization)
+        candidate_bundle = _load_candidate_module_bundle(
+            manifest, authorization, retain_finder=True
+        )
         if candidate_bundle is not None:
-            adapters_module = candidate_bundle["adapters"]
-            # E5 F-2: keep the bundle reachable for the closing identity check.
+            # The wrapper's outer finally owns cleanup even when import fails
+            # after creating a partially initialized candidate namespace.
             context["candidate_bundle"] = candidate_bundle
+            if not candidate_bundle.get("load_failed"):
+                adapters_module = candidate_bundle["adapters"]
 
     scope = authorization.get("execution_scope")
     paths = authorization.get("paths") or {}
@@ -2101,13 +2497,24 @@ def run_voice1_readonly_admission(context: dict[str, Any]) -> dict[str, Any]:
     # -- 1. credential custody, parse, lifetime (opening) ------------------
     dashboard_cred_path = Path(str(paths.get("dashboard_credential")))
     api_cred_path = Path(str(paths.get("api_credential")))
+    metadata_path = Path(str(paths.get("dashboard_metadata")))
     dashboard_pin = (metadata.get("dashboard_credential") or {})
     api_pin = (metadata.get("api_credential") or {})
-    custody_ok = (
-        _credential_metadata_matches(dashboard_cred_path, dashboard_pin)
-        and _credential_metadata_matches(api_cred_path, api_pin)
-    )
-    predicates["credential_custody"] = bool(custody_ok and within_budget())
+    custody_handles: list[_CustodiedFile] = []
+    context["_custody_handles"] = custody_handles
+    try:
+        # These are the only opens that establish custody for this admission.
+        # All later reads and drift checks use the retained descriptors.
+        custody_handles.append(_open_custodied_file(dashboard_cred_path, dashboard_pin, max_bytes=4113))
+        custody_handles.append(_open_custodied_file(api_cred_path, api_pin, max_bytes=4113))
+        custody_handles.append(_open_custodied_file(metadata_path, None, max_bytes=4096))
+    except (OSError, ValueError):
+        predicates["credential_custody"] = False
+        reason_codes.append("credential_custody")
+        return _admission_report(context, predicates, reason_codes, started_monotonic, started_utc, identity,
+                                 observations=observations, authorization=authorization)
+    custody_ok = _custody_handles_revalidate(custody_handles) and within_budget()
+    predicates["credential_custody"] = bool(custody_ok)
     if not custody_ok:
         reason_codes.append("credential_custody")
         return _admission_report(context, predicates, reason_codes, started_monotonic, started_utc, identity,
@@ -2117,26 +2524,22 @@ def run_voice1_readonly_admission(context: dict[str, Any]) -> dict[str, Any]:
     api_value = None
     try:
         if read_credential is _read_credential_default:
-            # E5 F-3: the default reader binds each value to the custody-
-            # checked object (no-follow open, fstat identity == pin,
-            # bounded bytes from that same descriptor).
-            dashboard_value = read_credential(dashboard_cred_path, dashboard_pin)
-            api_value = read_credential(api_cred_path, api_pin)
+            dashboard_value = read_credential(
+                dashboard_cred_path, dashboard_pin, handle=custody_handles[0]
+            )
+            api_value = read_credential(
+                api_cred_path, api_pin, handle=custody_handles[1]
+            )
         else:
             dashboard_value = read_credential(dashboard_cred_path)
             api_value = read_credential(api_cred_path)
     except Exception:
         dashboard_value = api_value = None
-    # E5 F-3: revalidate custody immediately after the reads — any pathname
-    # substitution racing the reads leaves a different object at the path and
-    # must fail closed before the values authorize anything.
-    custody_after_reads = (
-        _credential_metadata_matches(dashboard_cred_path, dashboard_pin)
-        and _credential_metadata_matches(api_cred_path, api_pin)
-    )
-    predicates["credential_custody_after_reads"] = bool(custody_after_reads and within_budget())
+    # Post-read custody is part of the existing credential_custody observation;
+    # it is intentionally not a new public predicate ABI member.
+    custody_after_reads = _custody_handles_revalidate(custody_handles) and within_budget()
+    predicates["credential_custody"] = bool(custody_ok and custody_after_reads)
     if not custody_after_reads:
-        predicates.setdefault("credential_custody", False)
         reason_codes.append("credential_custody")
         return _admission_report(context, predicates, reason_codes, started_monotonic, started_utc, identity,
                                  observations=observations, authorization=authorization)
@@ -2148,16 +2551,24 @@ def run_voice1_readonly_admission(context: dict[str, Any]) -> dict[str, Any]:
         reason_codes.append("credential_parse")
         return _admission_report(context, predicates, reason_codes, started_monotonic, started_utc, identity,
                                  observations=observations, authorization=authorization)
+    if not _install_custody_reader_hooks(
+        context, adapters_module, dashboard_cred_path, api_cred_path,
+        dashboard_value, api_value,
+    ):
+        predicates["credential_custody"] = False
+        reason_codes.append("credential_custody")
+        return _admission_report(context, predicates, reason_codes, started_monotonic, started_utc, identity,
+                                 observations=observations, authorization=authorization)
 
     # Dashboard metadata lifetime: exact UTC string, >=3900s pre and post.
-    metadata_path = Path(str(paths.get("dashboard_metadata")))
     try:
-        metadata_raw = metadata_path.read_text(encoding="utf-8")
-    except OSError:
+        metadata_raw = custody_handles[2].read_text()
+    except (OSError, UnicodeDecodeError):
         metadata_raw = ""
     remaining_pre = _dashboard_remaining_seconds(metadata_raw)
     predicates["lifetime_pre"] = bool(
-        remaining_pre is not None and remaining_pre >= DASHBOARD_LIFETIME_FLOOR_SECONDS and within_budget()
+        remaining_pre is not None and remaining_pre >= DASHBOARD_LIFETIME_FLOOR_SECONDS
+        and _custody_handles_revalidate(custody_handles) and within_budget()
     )
     if not predicates["lifetime_pre"]:
         reason_codes.append("lifetime")
@@ -2216,10 +2627,7 @@ def run_voice1_readonly_admission(context: dict[str, Any]) -> dict[str, Any]:
         capability = gateway.capability_check()
         # E5 F-3: keep custody through the exact provider observation — a
         # credential substitution during any provider call fails closed.
-        if not (
-            _credential_metadata_matches(dashboard_cred_path, dashboard_pin)
-            and _credential_metadata_matches(api_cred_path, api_pin)
-        ):
+        if not _custody_handles_revalidate(custody_handles):
             raise ValueError("credential custody drifted during provider observation")
         predicates["api_capability"] = bool(
             isinstance(capability, dict) and (capability.get("features") or {}).get("run_submission") is True
@@ -2229,10 +2637,7 @@ def run_voice1_readonly_admission(context: dict[str, Any]) -> dict[str, Any]:
                                      credential_file=dashboard_credential_file,
                                      timeout=min(PROVIDER_TIMEOUT_SECONDS, half_budget()))
         asr_result = asr.readiness_check()
-        if not (
-            _credential_metadata_matches(dashboard_cred_path, dashboard_pin)
-            and _credential_metadata_matches(api_cred_path, api_pin)
-        ):
+        if not _custody_handles_revalidate(custody_handles):
             raise ValueError("credential custody drifted during provider observation")
         predicates["asr_ready"] = bool(isinstance(asr_result, dict) and asr_result.get("capability"))
 
@@ -2240,10 +2645,7 @@ def run_voice1_readonly_admission(context: dict[str, Any]) -> dict[str, Any]:
                                      credential_file=dashboard_credential_file,
                                      timeout=min(PROVIDER_TIMEOUT_SECONDS, half_budget()))
         tts_result = tts.readiness_check()
-        if not (
-            _credential_metadata_matches(dashboard_cred_path, dashboard_pin)
-            and _credential_metadata_matches(api_cred_path, api_pin)
-        ):
+        if not _custody_handles_revalidate(custody_handles):
             raise ValueError("credential custody drifted during provider observation")
         predicates["tts_ready"] = bool(isinstance(tts_result, dict) and tts_result.get("capability"))
     except Exception:
@@ -2275,6 +2677,8 @@ def run_voice1_readonly_admission(context: dict[str, Any]) -> dict[str, Any]:
         distinct_targets = omitted_target != explicit_target
         predicates["omitted_profile_equal"] = bool(profile_ready and distinct_targets)
         predicates["omitted_profile_ready"] = bool(profile_ready and distinct_targets)
+        if not _custody_handles_revalidate(custody_handles):
+            raise ValueError("credential custody drifted during profile observation")
     except Exception:
         predicates["omitted_profile_equal"] = False
         predicates["omitted_profile_ready"] = False
@@ -2286,6 +2690,8 @@ def run_voice1_readonly_admission(context: dict[str, Any]) -> dict[str, Any]:
     # -- 5. session preflight + authenticated GET (shared 10 s budget) -----
     session_deadline = min(time.monotonic() + SESSION_BUDGET_SECONDS, time.monotonic() + max(budget_remaining(), 0.001))
     try:
+        if not _custody_handles_revalidate(custody_handles):
+            raise ValueError("credential custody drifted before session observation")
         gw = gateway
         gw._preflight_existing_session(SELECTED_S, deadline_at=session_deadline)
         payload = gw._request(
@@ -2294,6 +2700,8 @@ def run_voice1_readonly_admission(context: dict[str, Any]) -> dict[str, Any]:
             extra_headers=gw._session_headers(SELECTED_S),
             deadline_at=session_deadline,
         )
+        if not _custody_handles_revalidate(custody_handles):
+            raise ValueError("credential custody drifted during session observation")
         predicates["generic_preflight"] = True
         predicates["session_get"] = isinstance(payload, dict)
         predicates["session_budget"] = bool(time.monotonic() <= session_deadline and within_budget())
@@ -2312,8 +2720,19 @@ def run_voice1_readonly_admission(context: dict[str, Any]) -> dict[str, Any]:
 
     # -- 6. read-only indexed persisted lookup ------------------------------
     lookup = _persisted_lookup(context, deadline_at=session_deadline)
+    if not _custody_handles_revalidate(custody_handles):
+        predicates["credential_custody"] = False
+        reason_codes.append("credential_custody")
+        return _admission_report(context, predicates, reason_codes, started_monotonic, started_utc, identity,
+                                 observations=observations, authorization=authorization)
     predicates["persisted_lookup_ro"] = bool(lookup.get("read_only"))
     predicates["persisted_lookup_indexed"] = bool(lookup.get("indexed"))
+    if predicates["persisted_lookup_ro"] and predicates["persisted_lookup_indexed"]:
+        # This is captured only after the real GET and the real indexed SELECT
+        # complete; it is never a caller-supplied freshness assertion.
+        observations["session_observed_utc"] = _utc_now_iso()
+        observations["session_observed_monotonic_ns"] = time.monotonic_ns()
+        observations["boot_id"] = _boot_id()
     if not (predicates["persisted_lookup_ro"] and predicates["persisted_lookup_indexed"]):
         reason_codes.append("persisted_lookup")
         return _admission_report(context, predicates, reason_codes, started_monotonic, started_utc, identity,
@@ -2338,15 +2757,18 @@ def run_voice1_readonly_admission(context: dict[str, Any]) -> dict[str, Any]:
     predicates["distinct_key_identity"] = bool(admission["distinct_key_identity"])
 
     # -- 8. closing vector ---------------------------------------------------
-    remaining_post = _dashboard_remaining_seconds(metadata_raw)
+    try:
+        metadata_post_raw = custody_handles[2].read_text()
+    except (OSError, UnicodeDecodeError):
+        metadata_post_raw = ""
+    custody_final = _custody_handles_revalidate(custody_handles) and within_budget()
+    remaining_post = _dashboard_remaining_seconds(metadata_post_raw)
     predicates["lifetime_post"] = bool(
-        remaining_post is not None and remaining_post >= DASHBOARD_LIFETIME_FLOOR_SECONDS
+        remaining_post is not None and remaining_post >= DASHBOARD_LIFETIME_FLOOR_SECONDS and custody_final
     )
     predicates["closing_identity_equal"] = bool(
         _closing_identity_equal(context, adapters_module)
-        and _credential_metadata_matches(dashboard_cred_path, dashboard_pin)
-        and _credential_metadata_matches(api_cred_path, api_pin)
-        and within_budget()
+        and custody_final
     )
     predicates["no_mutation"] = True  # this caller issued zero writes by construction
     predicates["secret_safe"] = bool(
@@ -2358,6 +2780,65 @@ def run_voice1_readonly_admission(context: dict[str, Any]) -> dict[str, Any]:
 
     return _admission_report(context, predicates, reason_codes, started_monotonic, started_utc, identity,
                              observations=observations, authorization=authorization)
+
+
+def _install_custody_reader_hooks(
+    context: dict[str, Any], module: Any, dashboard_path: Path, api_path: Path,
+    dashboard_value: str, api_value: str,
+) -> bool:
+    """Route candidate provider constructors back to retained descriptors."""
+    if module is None:
+        return False
+    hooks: list[tuple[Any, str, Any]] = []
+    dashboard_name = str(dashboard_path)
+    api_name = str(api_path)
+
+    def bound_reader(path: Any) -> str:
+        candidate = str(path)
+        if candidate == dashboard_name:
+            return dashboard_value
+        if candidate == api_name:
+            return api_value
+        raise ValueError("provider credential path is outside retained custody")
+
+    for attribute in ("_read_provider_credential", "_read_api_key_file"):
+        original = getattr(module, attribute, None)
+        if not callable(original):
+            continue
+        hooks.append((module, attribute, original))
+        setattr(module, attribute, bound_reader)
+    if not hooks:
+        return False
+    context["_candidate_reader_hooks"] = hooks
+    return True
+
+
+def _restore_custody_reader_hooks(context: dict[str, Any]) -> None:
+    hooks = context.pop("_candidate_reader_hooks", [])
+    if not isinstance(hooks, (list, tuple)):
+        return
+    for module, attribute, original in hooks:
+        try:
+            setattr(module, attribute, original)
+        except Exception:
+            pass
+
+
+def run_voice1_readonly_admission(context: dict[str, Any]) -> dict[str, Any]:
+    """Run admission and release all candidate/custody handles exactly once."""
+    try:
+        return _run_voice1_readonly_admission(context)
+    finally:
+        _restore_custody_reader_hooks(context)
+        bundle = context.pop("candidate_bundle", None) if isinstance(context, dict) else None
+        _release_candidate_module_bundle(bundle)
+        handles = context.pop("_custody_handles", []) if isinstance(context, dict) else []
+        if isinstance(handles, (list, tuple)):
+            for handle in handles:
+                try:
+                    handle.close()
+                except Exception:
+                    pass
 
 
 def _sqlite_uri_path(path: Path) -> str:
@@ -2373,45 +2854,136 @@ def quote_safe(value: str) -> str:
     return quote(value, safe="")
 
 
-def _read_credential_default(path: Path, pinned: Any = None) -> str:
-    """Identity-bound credential read (E5 F-3).
-    The value is read from the exact regular object the custody metadata was
-    verified against: one no-follow open, fstat identity compared to the pin,
-    bounded bytes read from that same descriptor, then parsed by the
-    candidate's own credential record parser.  A path that is a symlink, a
-    non-regular object, or whose fstat identity differs from the pin never
-    yields a value.
-    """
+class _CustodiedFile:
+    """A bounded no-follow descriptor plus its path/parent drift witness."""
+
+    def __init__(self, path: Path, pinned: Any, max_bytes: int) -> None:
+        if isinstance(max_bytes, bool) or not isinstance(max_bytes, int) or max_bytes < 0:
+            raise ValueError("invalid custody bound")
+        canonical = _bounded_absolute_path(str(path))
+        if canonical is None or not _path_has_no_symlink_components(canonical):
+            raise OSError("credential ancestry is not canonical")
+        if pinned is not None and (
+            not isinstance(pinned, dict)
+            or set(pinned) != {"device", "inode", "uid", "gid", "mode"}
+            or any(isinstance(value, bool) or not isinstance(value, int) or value < 0
+                   for value in pinned.values())
+        ):
+            raise ValueError("credential custody metadata is invalid")
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(canonical, flags)
+        self.path = canonical
+        self.fd = descriptor
+        self.pinned = dict(pinned) if isinstance(pinned, dict) else None
+        self.max_bytes = max_bytes
+        try:
+            info = os.fstat(descriptor)
+            path_info = os.lstat(canonical)
+            if not stat.S_ISREG(info.st_mode) or not stat.S_ISREG(path_info.st_mode):
+                raise OSError("custodied object is not regular")
+            identity = _stat_identity(info)
+            if identity != _stat_identity(path_info):
+                raise OSError("custodied path changed during open")
+            if self.pinned is not None and identity != self.pinned:
+                raise OSError("custodied object does not match authorization")
+            if info.st_size > max_bytes:
+                raise OSError("custodied object exceeds bound")
+            self.identity = identity
+            self.parent_signature = self._parent_signature()
+        except BaseException:
+            os.close(descriptor)
+            raise
+
+    def _parent_signature(self) -> tuple[int, ...]:
+        info = os.lstat(self.path.parent)
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+            raise OSError("custody parent is not a directory")
+        return (
+            info.st_dev, info.st_ino, info.st_uid, info.st_gid,
+            stat.S_IMODE(info.st_mode), info.st_ctime_ns, info.st_mtime_ns,
+        )
+
+    def revalidate(self) -> bool:
+        if getattr(self, "fd", -1) < 0:
+            return False
+        try:
+            fd_info = os.fstat(self.fd)
+            path_info = os.lstat(self.path)
+            if not stat.S_ISREG(fd_info.st_mode) or not stat.S_ISREG(path_info.st_mode):
+                return False
+            if _stat_identity(fd_info) != self.identity or _stat_identity(path_info) != self.identity:
+                return False
+            if self.pinned is not None and _stat_identity(fd_info) != self.pinned:
+                return False
+            return self._parent_signature() == self.parent_signature
+        except OSError:
+            return False
+
+    def read_bytes(self) -> bytes:
+        if not self.revalidate():
+            raise OSError("custody drifted before read")
+        try:
+            os.lseek(self.fd, 0, os.SEEK_SET)
+            chunks: list[bytes] = []
+            total = 0
+            while total <= self.max_bytes:
+                chunk = os.read(self.fd, min(65536, self.max_bytes - total + 1))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                total += len(chunk)
+                if total > self.max_bytes:
+                    raise OSError("custodied object exceeds bound")
+            result = b"".join(chunks)
+            if not self.revalidate():
+                raise OSError("custody drifted during read")
+            if len(result) != os.fstat(self.fd).st_size:
+                raise OSError("custodied object size changed")
+            return result
+        except OSError:
+            raise
+
+    def read_text(self) -> str:
+        return self.read_bytes().decode("utf-8")
+
+    def close(self) -> None:
+        descriptor = getattr(self, "fd", -1)
+        self.fd = -1
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _open_custodied_file(path: Path, pinned: Any = None, *, max_bytes: int = 4096) -> _CustodiedFile:
+    return _CustodiedFile(path, pinned, max_bytes)
+
+
+def _custody_handles_revalidate(handles: Any) -> bool:
+    if not isinstance(handles, (list, tuple)) or not handles:
+        return False
+    return all(isinstance(handle, _CustodiedFile) and handle.revalidate() for handle in handles)
+
+
+def _read_credential_default(path: Path, pinned: Any = None, *, handle: _CustodiedFile | None = None) -> str:
+    """Parse bounded bytes from one already custody-checked descriptor."""
     from recorder_next.adapters import CredentialError, _parse_credential_record
 
-    if pinned is not None and not isinstance(pinned, dict):
-        raise CredentialError("credential custody metadata is invalid")
-    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    owned = handle is None
+    if handle is None:
+        try:
+            handle = _open_custodied_file(path, pinned, max_bytes=4113)
+        except (OSError, ValueError) as error:
+            raise CredentialError("credential file is unavailable") from error
     try:
-        descriptor = os.open(path, flags)
-    except OSError as error:
-        raise CredentialError("credential file is unavailable") from error
-    try:
-        info = os.fstat(descriptor)
-        if not stat.S_ISREG(info.st_mode):
-            raise CredentialError("credential file is not a regular object")
-        if pinned is not None:
-            actual = _stat_identity(info)
-            for key in ("device", "inode", "uid", "gid", "mode"):
-                expected = pinned.get(key)
-                if isinstance(expected, bool) or not isinstance(expected, int) or actual[key] != expected:
-                    raise CredentialError("credential custody identity drifted before read")
-        chunks: list[bytes] = []
-        remaining = 4113
-        while remaining > 0:
-            chunk = os.read(descriptor, remaining)
-            if not chunk:
-                break
-            chunks.append(chunk)
-            remaining -= len(chunk)
-        return _parse_credential_record(b"".join(chunks))
+        if handle.path != _bounded_absolute_path(str(path)):
+            raise CredentialError("credential path changed")
+        try:
+            raw = handle.read_bytes()
+        except OSError as error:
+            raise CredentialError("credential custody identity drifted") from error
+        return _parse_credential_record(raw)
     finally:
-        os.close(descriptor)
+        if owned:
+            handle.close()
 
 
 def _probe_dashboard_default(base_url: str, path: str, *, credential: str | None,
@@ -2596,6 +3168,88 @@ def _dashboard_remaining_seconds(metadata_raw: str) -> int | None:
     return expires - int(time.time())
 
 
+def _snapshot_proc_fd_numbers() -> set[int] | None:
+    """Snapshot Linux self FDs without opening a second database reference."""
+    try:
+        names = os.listdir("/proc/self/fd")
+    except OSError:
+        return None
+    numbers: set[int] = set()
+    for name in names:
+        if not name.isdigit():
+            continue
+        try:
+            fd = int(name)
+            info = os.fstat(fd)
+        except (OSError, ValueError):
+            continue
+        if stat.S_ISREG(info.st_mode):
+            numbers.add(fd)
+    return numbers
+
+
+def _fd_object_identity(fd: int) -> tuple[int, int, int] | None:
+    try:
+        info = os.fstat(fd)
+    except OSError:
+        return None
+    if not stat.S_ISREG(info.st_mode):
+        return None
+    return (info.st_dev, info.st_ino, stat.S_IFMT(info.st_mode))
+
+
+def _path_object_identity(path: Path) -> tuple[int, int, int] | None:
+    try:
+        info = os.lstat(path)
+    except OSError:
+        return None
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        return None
+    return (info.st_dev, info.st_ino, stat.S_IFMT(info.st_mode))
+
+
+def _directory_custody_signature(path: Path) -> tuple[int, ...] | None:
+    """Capture parent-directory metadata to detect replacement/restoration."""
+    try:
+        info = os.lstat(path.parent)
+    except OSError:
+        return None
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        return None
+    return (
+        info.st_dev, info.st_ino, info.st_uid, info.st_gid,
+        stat.S_IMODE(info.st_mode), info.st_ctime_ns, info.st_mtime_ns,
+    )
+
+
+def _connection_db_fd(
+    before: set[int], reference_identity: tuple[int, int, int]
+) -> int | None:
+    after = _snapshot_proc_fd_numbers()
+    if after is None:
+        return None
+    matches = [
+        fd for fd in sorted(after - before)
+        if _fd_object_identity(fd) == reference_identity
+    ]
+    if len(matches) != 1:
+        return None
+    return matches[0]
+
+
+def _connection_identity_ok(
+    db_path: Path, reference_fd: int, connection_fd: int
+) -> bool:
+    reference_identity = _fd_object_identity(reference_fd)
+    connection_identity = _fd_object_identity(connection_fd)
+    path_identity = _path_object_identity(db_path)
+    return (
+        reference_identity is not None
+        and connection_identity == reference_identity
+        and path_identity == reference_identity
+    )
+
+
 def _persisted_lookup(context: dict[str, Any], *, deadline_at: float | None = None) -> dict[str, Any]:
     """Read-only indexed SELECT of the target session row (URI mode=ro)."""
     authorization = context.get("authorization") or {}
@@ -2619,14 +3273,40 @@ def _persisted_lookup(context: dict[str, Any], *, deadline_at: float | None = No
         return result
     if not isinstance(db_raw, str) or not db_raw:
         return result
+    boundary = context.get("boundary") if isinstance(context, dict) else None
+    injected_connect = boundary.get("sqlite_connect") if isinstance(boundary, dict) else None
+    if injected_connect is None:
+        if sqlite3.connect is not _ORIGINAL_SQLITE_CONNECT:
+            return result
+        connect_callable = _ORIGINAL_SQLITE_CONNECT
+    elif callable(injected_connect):
+        # Tests may replace this I/O boundary explicitly; production calls
+        # always use the captured unmodified stdlib callable above.
+        connect_callable = injected_connect
+    else:
+        return result
     db_path = _bounded_absolute_path(db_raw)
     if db_path is None or not _path_has_no_symlink_components(db_path):
         return result
 
-    opening_identity = _regular_file_identity_no_follow(db_path)
-    if opening_identity is None:
+    reference_fd: int | None = None
+    connection_fd: int | None = None
+    try:
+        reference_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        reference_fd = os.open(db_path, reference_flags)
+        reference_identity = _fd_object_identity(reference_fd)
+    except OSError:
+        return result
+    if reference_identity is None:
+        os.close(reference_fd)
+        return result
+    opening_identity = reference_identity
+    opening_parent_signature = _directory_custody_signature(db_path)
+    if opening_parent_signature is None:
+        os.close(reference_fd)
         return result
     result["db_identity_opening"] = opening_identity
+    result["db_parent_signature_opening"] = opening_parent_signature
 
     def ensure_deadline() -> None:
         if time.monotonic() >= deadline:
@@ -2639,17 +3319,19 @@ def _persisted_lookup(context: dict[str, Any], *, deadline_at: float | None = No
         busy_timeout_ms = min(5000, int(remaining * 1000))
         if busy_timeout_ms <= 0:
             return result
-        connection = sqlite3.connect(
+        before_connect_fds = _snapshot_proc_fd_numbers()
+        if before_connect_fds is None:
+            return result
+        connection = connect_callable(
             f"file:{_sqlite_uri_path(db_path)}?mode=ro",
             uri=True,
             timeout=min(5.0, max(remaining, 0.001)),
             isolation_level=None,
         )
-        # E5 F-4: the connection itself must name the approved canonical path
-        # as its main database.  A redirected factory/connection (or any URI
-        # reinterpretation) opens a different file; PRAGMA database_list
-        # reports the actually opened main-db filename through the connection,
-        # so rows from any other object can never participate.
+        connection_fd = _connection_db_fd(before_connect_fds, reference_identity)
+        result["connection_fd"] = connection_fd
+        if connection_fd is None or not _connection_identity_ok(db_path, reference_fd, connection_fd):
+            return result
         try:
             db_rows = connection.execute("PRAGMA database_list").fetchall()
         except sqlite3.Error:
@@ -2658,11 +3340,8 @@ def _persisted_lookup(context: dict[str, Any], *, deadline_at: float | None = No
         result["db_connected_file_equal"] = bool(
             connected_file is not None and os.path.normpath(connected_file) == str(db_path)
         )
+        result["db_identity_connected"] = _fd_object_identity(connection_fd)
         if not result["db_connected_file_equal"]:
-            return result
-        connected_identity = _regular_file_identity_no_follow(db_path)
-        result["db_identity_connected"] = connected_identity
-        if connected_identity != opening_identity:
             return result
 
         def interrupt_if_expired() -> int:
@@ -2701,27 +3380,65 @@ def _persisted_lookup(context: dict[str, Any], *, deadline_at: float | None = No
             (SELECTED_S,),
         ).fetchall()
         result["rows"] = [tuple(row) for row in rows]
+        if connection_fd is None or not _connection_identity_ok(db_path, reference_fd, connection_fd):
+            raise OSError("SQLite connection object drifted after query")
     except (sqlite3.Error, OSError, TimeoutError, TypeError, ValueError):
         result["read_only"] = False
         result["indexed"] = False
         result["rows"] = []
     finally:
         if connection is not None:
-            closing_identity = _regular_file_identity_no_follow(db_path)
-            result["db_identity_closing"] = closing_identity
-            result["db_identity_equal"] = closing_identity == opening_identity
+            closing_connection_identity = (
+                _fd_object_identity(connection_fd) if connection_fd is not None else None
+            )
+            result["db_connection_identity_closing"] = closing_connection_identity
+            result["db_identity_closing"] = _path_object_identity(db_path)
+            result["db_identity_equal"] = bool(
+                connection_fd is not None
+                and _connection_identity_ok(db_path, reference_fd, connection_fd)
+                and closing_connection_identity == opening_identity
+            )
             if not result["db_identity_equal"] or not result.get("db_connected_file_equal"):
                 result["read_only"] = False
                 result["indexed"] = False
                 result["rows"] = []
             try:
                 connection.set_progress_handler(None, 0)
-            except sqlite3.Error:
+            except Exception:
                 pass
+            close_failed = False
             try:
                 connection.close()
-            except sqlite3.Error:
-                pass
+            except Exception:
+                close_failed = True
+            # The pathname is a separate authority boundary from the held
+            # SQLite descriptor.  Re-check it after close as well: a
+            # same-path replacement can occur during a wrapped close and be
+            # restored before the next caller-visible read.
+            post_close_path_identity = _path_object_identity(db_path)
+            post_close_parent_signature = _directory_custody_signature(db_path)
+            result["db_identity_post_close"] = post_close_path_identity
+            result["db_parent_signature_post_close"] = post_close_parent_signature
+            if (
+                close_failed
+                or post_close_path_identity != opening_identity
+                or post_close_parent_signature != opening_parent_signature
+                or not result["db_identity_equal"]
+                or not result.get("db_connected_file_equal")
+            ):
+                result["db_identity_equal"] = False
+                result["read_only"] = False
+                result["indexed"] = False
+                result["rows"] = []
+        if reference_fd is not None:
+            try:
+                if _fd_object_identity(reference_fd) != opening_identity:
+                    result["db_identity_equal"] = False
+                    result["read_only"] = False
+                    result["indexed"] = False
+                    result["rows"] = []
+            finally:
+                os.close(reference_fd)
     return result
 
 
@@ -3264,6 +3981,7 @@ def execute_attempt_phase(context: dict[str, Any], phase: str,
     root, db_path = _validate_fixture_context(context)
     if phase not in {"A1", "A2", "A3"}:
         raise AttemptContextError("unsupported creation phase")
+    report_context = context
     context = dict(context)
     context["db_path"] = db_path
     try:
@@ -3292,6 +4010,16 @@ def execute_attempt_phase(context: dict[str, Any], phase: str,
             return {"status": "HOLD", "state": "HOLD", "creation_outcome": "HOLD", "phase": phase, "reason_codes": ["prefix_mismatch"]}
     tip = prefix[-1] if prefix else None
     tip_receipt_sha = _receipt_digest_of_stored(tip)
+    admission: dict[str, Any] | None = None
+    admission_sha256: str | None = None
+    if phase == "A3":
+        admission = _read_admission_report_once(report_context)
+        if admission is None:
+            return {
+                "status": "HOLD", "state": "HOLD", "creation_outcome": "HOLD",
+                "phase": phase, "reason_codes": ["admission_report_invalid"],
+            }
+        admission_sha256 = context.get("admission_sha256")
     blocks = _load_blocks()
     identity = context["trial_identity"]
     receipt_phase = {"A1": "A1_CREATED", "A2": "A2_CREATED", "A3": "A3_BOUND"}[phase]
@@ -3361,17 +4089,19 @@ def execute_attempt_phase(context: dict[str, Any], phase: str,
                     raise AttemptContextError("a2 session postimage mismatch")
                 current_rows = {"devices": opening["devices"], "projects": expected_project, "sessions": expected_session}
             else:
-                # A3 consumes the exact admission report; a bare True is refused.
-                admission = context.get("admission_report")
-                if not isinstance(admission, dict) or admission.get("schema") != REPORT_SCHEMA:
+                # A3 consumes the exact, externally pinned admission bytes;
+                # _read_admission_report_once ran before BEGIN IMMEDIATE.
+                if admission is None:
                     raise AttemptContextError("A3 requires the exact admission report")
-                predicates = admission.get("predicates") or {}
-                if any(predicates.get(name) is not True for name in REQUIRED_PREDICATES):
+                predicates = admission["predicates"]
+                if any(predicates[name] is not True for name in REQUIRED_PREDICATES):
                     raise AttemptContextError("A3 admission report has non-true required predicates")
                 if admission.get("candidate_id") != context.get("candidate_id"):
                     raise AttemptContextError("A3 admission report candidate mismatch")
                 if opening["devices"] is None or opening["projects"] is None or opening["sessions"] is None:
                     raise AttemptContextError("A3 requires the exact A2 rows")
+                if not _a3_admission_is_fresh(report_context, admission):
+                    raise AttemptContextError("A3 admission report expired before mutation")
                 params = context["phase_params"]["A3"]
                 cur = conn.execute(blocks["a3.bind_session"], params)
                 if cur.rowcount != 1:
@@ -3405,6 +4135,8 @@ def execute_attempt_phase(context: dict[str, Any], phase: str,
         receipt = _base_receipt(context, receipt_phase, tip_receipt_sha)
         receipt["current_rows"] = {table: list(values) if values is not None else None for table, values in current_rows.items()}
         receipt["explicit_absent"] = []
+        if phase == "A3":
+            receipt["admission_sha256"] = admission_sha256
         receipt_sha = _receipt_sha256(receipt)
         if (root / "receipts" / leaf).exists():
             return {
@@ -3641,13 +4373,18 @@ class AttemptExecutorTests(unittest.TestCase):
             "candidate_id": "fixture-candidate",
             "archive_sha256": "0" * 64,
             "source_commit": "f" * 40,
-            "source_tree": "e" * 64,
+            "source_tree": "e" * 40,
+            "control_sha256": "b" * 64,
             "control_packet_sha256": self.control_packet_sha256,
             "spec_sha256": "d" * 64,
             "owner_authorization_sha256": "c" * 64,
+            "manifest_sha256": "a" * 64,
+            "authorization_sha256": "c" * 64,
+            "execution_scope": "fixture_readonly",
             "trial_identity": self._trial_identity(),
             "phase_params": {},
             "admission_report": None,
+            "admission_report_bytes": None,
         }
         self.context["protected_logical_digest"] = self._protected_digest()
 
@@ -3743,14 +4480,51 @@ class AttemptExecutorTests(unittest.TestCase):
         return execute_attempt_phase(self.context, "A3", a2["resulting_head_sha256"])
 
     def _admission_report_fixture(self) -> dict[str, Any]:
-        predicates = {name: True for name in REQUIRED_PREDICATES}
-        return {
-            "schema": REPORT_SCHEMA,
-            "candidate_id": self.context.get("candidate_id"),
-            "predicates": predicates,
-            "status": "PASS",
-            "status_code": 0,
+        now_epoch = int(time.time())
+        authorization = {
+            "execution_scope": "fixture_readonly",
+            "persisted_key_sha256": FIXTURE_KEY_SHA256,
+            "candidate_id": self.context["candidate_id"],
+            "candidate_sha256": self.context["archive_sha256"],
+            "source_commit": self.context["source_commit"],
+            "source_tree": self.context["source_tree"],
+            "control_sha256": self.context["control_sha256"],
+            "specification_sha256": self.context["spec_sha256"],
+            "manifest_sha256": self.context["manifest_sha256"],
+            "control_packet_sha256": self.context["control_packet_sha256"],
+            "not_before_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now_epoch - 60)),
+            "expires_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now_epoch + 60)),
         }
+        identity = {
+            "candidate_id": self.context["candidate_id"],
+            "archive_sha256": self.context["archive_sha256"],
+            "source_commit": self.context["source_commit"],
+            "source_tree": self.context["source_tree"],
+            "control_sha256": self.context["control_sha256"],
+            "spec_sha256": self.context["spec_sha256"],
+        }
+        observations = {
+            "session_observed_utc": _utc_now_iso(),
+            "session_observed_monotonic_ns": time.monotonic_ns(),
+            "boot_id": _boot_id(),
+        }
+        report = _admission_report(
+            self.context,
+            {name: True for name in REQUIRED_PREDICATES},
+            [],
+            time.monotonic(),
+            _utc_now_iso(),
+            identity,
+            observations=observations,
+            authorization=authorization,
+        )
+        raw = (json.dumps(report, sort_keys=True) + "\n").encode("utf-8")
+        self.context.update({
+            "authorization": authorization,
+            "admission_sha256": hashlib.sha256(raw).hexdigest(),
+            "admission_report_bytes": raw,
+        })
+        return report
 
     # -- INTENT custody ---------------------------------------------------
 
@@ -3865,8 +4639,39 @@ class AttemptExecutorTests(unittest.TestCase):
             )
         }
         self.context["admission_report"] = {"ok": True}
-        with self.assertRaises(AttemptContextError):
-            execute_attempt_phase(self.context, "A3", a2["resulting_head_sha256"])
+        result = execute_attempt_phase(self.context, "A3", a2["resulting_head_sha256"])
+        self.assertEqual(result["status"], "HOLD")
+        self.assertEqual(result["reason_codes"], ["admission_report_invalid"])
+
+    def test_a3_rechecks_admission_freshness_before_first_mutation(self):
+        a2 = self._run_a2()
+        self.assertEqual(a2["status"], "PASS")
+        a2_params = self._a2_params()
+        self.context["phase_params"] = {
+            "A3": dict(
+                a2_params,
+                S=self.context["trial_identity"]["S"],
+                prior_gateway_session_key=a2_params["gateway_session_key"],
+                prior_record_version=1,
+                operation_time="2026-09-12T13:05:00.000+00:00",
+            )
+        }
+        self._admission_report_fixture()
+        report = json.loads(self.context["admission_report_bytes"].decode("utf-8"))
+        observed_ns = report["session_observed_monotonic_ns"]
+        before_conn = _connect_fixture(self.context)
+        try:
+            before = _read_trial_rows(before_conn, self.context)
+        finally:
+            before_conn.close()
+        with patch.object(time, "monotonic_ns", side_effect=[observed_ns, observed_ns + 10_000_000_001]):
+            with self.assertRaises(AttemptContextError):
+                execute_attempt_phase(self.context, "A3", a2["resulting_head_sha256"])
+        conn = _connect_fixture(self.context)
+        try:
+            self.assertEqual(_read_trial_rows(conn, self.context), before)
+        finally:
+            conn.close()
 
     def test_a3_commit_produces_bound_state(self):
         result = self._run_a3()

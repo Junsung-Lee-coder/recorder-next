@@ -1055,8 +1055,18 @@ class Voice1B6ExecutableClosureTests(unittest.TestCase):
         self.assertTrue(callable(control.execute_attempt_phase))
         self.assertTrue(callable(control.cleanup_attempt))
         self.assertIsInstance(control.REQUIRED_PREDICATES, tuple)
-        self.assertEqual(len(control.REQUIRED_PREDICATES), 33)
-        self.assertEqual(len(set(control.REQUIRED_PREDICATES)), 33)
+        self.assertEqual(control.REQUIRED_PREDICATES, (
+            "authorization_bound", "candidate_bound", "imports_bound",
+            "credential_custody", "dashboard_credential_parse", "api_credential_parse",
+            "lifetime_pre", "unauthenticated_gate", "api_capability", "asr_ready", "tts_ready",
+            "omitted_profile_equal", "omitted_profile_ready", "generic_preflight", "session_get",
+            "persisted_lookup_ro", "persisted_lookup_indexed", "session_budget",
+            "payload_object_match", "source_match", "id_match", "lifecycle_match",
+            "persisted_row_count_match", "persisted_id_match", "persisted_source_match",
+            "persisted_ended_at_null", "conversation_key_match", "distinct_key_identity",
+            "lifetime_post", "closing_identity_equal", "no_mutation", "secret_safe",
+        ))
+        self.assertEqual(len(set(control.REQUIRED_PREDICATES)), 32)
 
     def test_main_without_flags_is_structured_hold_exit_2(self):
         # B6 REV-008: any noncanonical invocation prints one JSON HOLD/2.
@@ -1277,19 +1287,24 @@ class Voice1B6ExecutableClosureTests(unittest.TestCase):
         # canonical vector, and every candidate-root member digest before
         # any import, so this fixture binds the REAL worktree digests and
         # a REAL harmless archive whose bytes hash to candidate_sha256.
-        real_adapters_sha = hashlib.sha256(
-            (candidate_root / "recorder_next" / "adapters.py").read_bytes()
-        ).hexdigest()
         import io as _io
         import tarfile as _tarfile
 
-        per_file = {"recorder_next/adapters.py": real_adapters_sha}
+        bundle_members = tuple(
+            sorted(
+                path.relative_to(candidate_root).as_posix()
+                for path in (candidate_root / "recorder_next").glob("*.py")
+            )
+        )
+        per_file: dict[str, str] = {}
         archive_buf = _io.BytesIO()
         with _tarfile.open(fileobj=archive_buf, mode="w") as tar:
-            member_bytes = (candidate_root / "recorder_next" / "adapters.py").read_bytes()
-            info = _tarfile.TarInfo(name="./recorder_next/adapters.py")
-            info.size = len(member_bytes)
-            tar.addfile(info, _io.BytesIO(member_bytes))
+            for member in bundle_members:
+                member_bytes = (candidate_root / member).read_bytes()
+                per_file[member] = hashlib.sha256(member_bytes).hexdigest()
+                info = _tarfile.TarInfo(name=member)
+                info.size = len(member_bytes)
+                tar.addfile(info, _io.BytesIO(member_bytes))
         archive_bytes = archive_buf.getvalue()
         archive_path = tmp / "fixture-candidate.tar"
         archive_path.write_bytes(archive_bytes)
@@ -1309,7 +1324,7 @@ class Voice1B6ExecutableClosureTests(unittest.TestCase):
                             "specification_sha256": self.control.RATIFIED_ADDENDUM_SHA256,
                             "inherited_specification_sha256": self.control.RATIFIED_INHERITED_SPEC_SHA256},
             "per_file_sha256": per_file,
-            "tracked_file_count": 1,
+            "tracked_file_count": len(per_file),
             "tracked_file_vector_sha256": hashlib.sha256(
                 json.dumps(per_file, sort_keys=True,
                            separators=(",", ":"), ensure_ascii=True).encode("utf-8")
@@ -1751,7 +1766,8 @@ class Voice1B6E4FindingRegressionTests(unittest.TestCase):
                 kwargs["factory"] = AuditedConnection
                 return real_connect(*args, **kwargs)
 
-            context = {"authorization": {"paths": {"persisted_db": str(db_path)}}}
+            context = {"authorization": {"paths": {"persisted_db": str(db_path)}},
+                       "boundary": {"sqlite_connect": connect}}
             with patch.object(self.control.sqlite3, "connect", side_effect=connect):
                 result = self.control._persisted_lookup(
                     context, deadline_at=time.monotonic() + 5.0
@@ -1796,7 +1812,8 @@ class Voice1B6E4FindingRegressionTests(unittest.TestCase):
                 return real_connect(*args, **kwargs)
 
             deadline_at = time.monotonic() + 2.0
-            context = {"authorization": {"paths": {"persisted_db": str(db_path)}}}
+            context = {"authorization": {"paths": {"persisted_db": str(db_path)},
+                         }, "boundary": {"sqlite_connect": connect}}
             with patch.object(self.control.sqlite3, "connect", side_effect=connect):
                 result = self.control._persisted_lookup(context, deadline_at=deadline_at)
 
@@ -1809,15 +1826,18 @@ class Voice1B6E4FindingRegressionTests(unittest.TestCase):
             self.assertTrue(callable(handler))
             self.assertGreater(interval, 0)
 
-            identity = self.control._regular_file_identity_no_follow(db_path)
+            identity = self.control._path_object_identity(db_path)
             self.assertIsNotNone(identity)
+            assert identity is not None
             with patch.object(
                 self.control,
-                "_regular_file_identity_no_follow",
+                "_path_object_identity",
                 side_effect=[
                     identity,
-                    {**identity, "inode": identity["inode"] + 1},
-                    {**identity, "inode": identity["inode"] + 1},
+                    (identity[0], identity[1] + 1, identity[2]),
+                    (identity[0], identity[1] + 1, identity[2]),
+                    (identity[0], identity[1] + 1, identity[2]),
+                    (identity[0], identity[1] + 1, identity[2]),
                 ],
             ):
                 drifted = self.control._persisted_lookup(
@@ -3440,5 +3460,363 @@ class R25IntegratedRegressionTests(unittest.TestCase):
                 self.assertIsNone(conn.execute("SELECT 1 FROM update_manifests WHERE channel=?", ("mutation",)).fetchone())
 
 
-if __name__ == "__main__":
-    unittest.main()
+class Voice1B6E6SuccessorRegressionTests(unittest.TestCase):
+    """RED/GREEN coverage for the E6 closure and report-consumer seams."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        control_dir = Path(__file__).resolve().parents[1] / "run"
+        if str(control_dir) not in sys.path:
+            sys.path.insert(0, str(control_dir))
+        import qa_probe_runner as control
+
+        cls.control = control
+
+    def test_e6_predicate_abi_is_exact_ordered_32(self):
+        expected = (
+            "authorization_bound", "candidate_bound", "imports_bound",
+            "credential_custody", "dashboard_credential_parse", "api_credential_parse",
+            "lifetime_pre", "unauthenticated_gate", "api_capability", "asr_ready", "tts_ready",
+            "omitted_profile_equal", "omitted_profile_ready", "generic_preflight", "session_get",
+            "persisted_lookup_ro", "persisted_lookup_indexed", "session_budget",
+            "payload_object_match", "source_match", "id_match", "lifecycle_match",
+            "persisted_row_count_match", "persisted_id_match", "persisted_source_match",
+            "persisted_ended_at_null", "conversation_key_match", "distinct_key_identity",
+            "lifetime_post", "closing_identity_equal", "no_mutation", "secret_safe",
+        )
+        self.assertEqual(self.control.REQUIRED_PREDICATES, expected)
+
+    def test_e6_candidate_registry_rejects_namespace_and_identity_drift(self):
+        helper = Voice1B6E5FindingRegressionTests()
+        helper.control = self.control
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            per_file, archive = helper._bundle_fixture(root)
+            snapshot = helper._snapshot_candidate_modules()
+            try:
+                helper._restore_candidate_modules({})
+                with patch.object(self.control, "_verify_candidate_source", return_value=True):
+                    bundle = self.control._load_candidate_module_bundle(
+                        {"per_file_sha256": per_file}, {"archive_path": str(archive)},
+                        retain_finder=True,
+                    )
+                self.assertIsInstance(bundle, dict)
+                assert isinstance(bundle, dict)
+                self.assertTrue(self.control._candidate_modules_still_bound(bundle, {}, {}))
+                extra = importlib.util.module_from_spec(
+                    importlib.util.spec_from_loader("recorder_next.e6_extra", loader=None)
+                )
+                sys.modules["recorder_next.e6_extra"] = extra
+                self.assertFalse(self.control._candidate_modules_still_bound(bundle, {}, {}))
+                del sys.modules["recorder_next.e6_extra"]
+                removed_name = next(iter(bundle["registry"]))
+                removed = sys.modules.pop(removed_name)
+                try:
+                    self.assertFalse(self.control._candidate_modules_still_bound(bundle, {}, {}))
+                finally:
+                    sys.modules[removed_name] = removed
+                module = sys.modules[removed_name]
+                original_spec = module.__spec__
+                module.__spec__ = importlib.machinery.ModuleSpec(removed_name, loader=None)
+                try:
+                    self.assertFalse(self.control._candidate_modules_still_bound(bundle, {}, {}))
+                finally:
+                    module.__spec__ = original_spec
+                loader = original_spec.loader
+                original_data = loader._data
+                loader._data = original_data + b"\\n# drift\\n"
+                try:
+                    self.assertFalse(self.control._candidate_modules_still_bound(bundle, {}, {}))
+                finally:
+                    loader._data = original_data
+            finally:
+                self.control._release_candidate_module_bundle(locals().get("bundle"))
+                helper._restore_candidate_modules(snapshot)
+
+    def test_e6_custody_handle_detects_leaf_swap_restore_without_reopen(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            credential = root / "credential"
+            credential.write_bytes(b"fixture-secret")
+            pin = self.control._regular_file_identity_no_follow(credential)
+            handle = self.control._open_custodied_file(credential, pin, max_bytes=128)
+            try:
+                self.assertTrue(handle.revalidate())
+                replacement = root / "replacement"
+                replacement.write_bytes(b"fixture-secret")
+                original = root / "original"
+                credential.rename(original)
+                replacement.rename(credential)
+                credential.rename(replacement)
+                original.rename(credential)
+                self.assertFalse(handle.revalidate(), "swap/restore must invalidate the held custody")
+            finally:
+                handle.close()
+
+    def test_e6_sqlite_requires_original_connect_and_connection_fd_identity(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            db_path = root / "sessions.sqlite3"
+            with sqlite3.connect(db_path) as connection:
+                connection.executescript(
+                    "CREATE TABLE sessions (id TEXT, source TEXT, session_key TEXT, ended_at TEXT);"
+                    "CREATE INDEX sessions_id_idx ON sessions(id);"
+                    "INSERT INTO sessions VALUES ('20260703_210417_8f66b434','discord','fixture-key',NULL);"
+                )
+            context = {"authorization": {"paths": {"persisted_db": str(db_path)}}}
+            healthy = self.control._persisted_lookup(context, deadline_at=time.monotonic() + 5.0)
+            self.assertTrue(healthy["read_only"])
+            self.assertTrue(healthy["db_connected_file_equal"])
+            original_connect = self.control.sqlite3.connect
+            with patch.object(self.control.sqlite3, "connect", side_effect=original_connect):
+                drifted = self.control._persisted_lookup(context, deadline_at=time.monotonic() + 5.0)
+            self.assertFalse(drifted["read_only"], "a replaced connect callable is not authorized")
+
+    def test_e6_admission_report_requires_fresh_observation_and_scope_key(self):
+        now = time.monotonic_ns()
+        now_epoch = int(time.time())
+        authorization = {
+            "execution_scope": "fixture_readonly",
+            "persisted_key_sha256": self.control.FIXTURE_KEY_SHA256,
+            "candidate_id": "candidate",
+            "candidate_sha256": "d" * 64,
+            "source_commit": "e" * 40,
+            "source_tree": "f" * 40,
+            "control_sha256": "1" * 64,
+            "specification_sha256": "2" * 64,
+            "manifest_sha256": "b" * 64,
+            "control_packet_sha256": "a" * 64,
+            "not_before_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now_epoch - 60)),
+            "expires_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now_epoch + 60)),
+        }
+        context = {
+            "manifest_sha256": "b" * 64,
+            "authorization_sha256": "c" * 64,
+        }
+        identity = {
+            "candidate_id": "candidate",
+            "archive_sha256": "d" * 64,
+            "source_commit": "e" * 40,
+            "source_tree": "f" * 40,
+            "control_sha256": "1" * 64,
+            "spec_sha256": "2" * 64,
+        }
+        observations = {
+            "session_observed_utc": self.control._utc_now_iso(),
+            "session_observed_monotonic_ns": now,
+            "boot_id": self.control._boot_id(),
+        }
+        report = self.control._admission_report(
+            context, {name: True for name in self.control.REQUIRED_PREDICATES}, [],
+            time.monotonic(), self.control._utc_now_iso(), identity,
+            observations=observations, authorization=authorization,
+        )
+        self.assertEqual(report["status_code"], 0)
+        self.assertEqual(report["expected_key_sha256"], self.control.FIXTURE_KEY_SHA256)
+        self.assertEqual(len(report["predicates"]), 32)
+        raw = (json.dumps(report, sort_keys=True) + "\n").encode("utf-8")
+        admission_context = {
+            **context,
+            **identity,
+            "authorization": authorization,
+            "candidate_id": identity["candidate_id"],
+            "archive_sha256": identity["archive_sha256"],
+            "source_commit": identity["source_commit"],
+            "source_tree": identity["source_tree"],
+            "control_sha256": identity["control_sha256"],
+            "control_packet_sha256": authorization["control_packet_sha256"],
+            "spec_sha256": identity["spec_sha256"],
+            "admission_sha256": hashlib.sha256(raw).hexdigest(),
+        }
+        self.assertIsNotNone(self.control._validate_a3_admission_report(admission_context, raw))
+        trailing_space = raw[:-1] + b" \n"
+        self.assertIsNone(
+            self.control._validate_a3_admission_report(
+                dict(admission_context, admission_sha256=hashlib.sha256(trailing_space).hexdigest()),
+                trailing_space,
+            ),
+            "A3 input is the exact stdout record, not JSON with trailing whitespace",
+        )
+        missing_window = dict(
+            admission_context,
+            authorization={key: value for key, value in authorization.items() if key not in {"not_before_utc", "expires_at_utc"}},
+        )
+        self.assertIsNone(
+            self.control._validate_a3_admission_report(missing_window, raw),
+            "A3 must not accept a report without authorization UTC bounds",
+        )
+        parsed_only = dict(admission_context, admission_report=report)
+        self.assertIsNone(self.control._read_admission_report_once(parsed_only))
+
+    def test_e6_candidate_registry_checks_dunder_and_finder_identity(self):
+        helper = Voice1B6E5FindingRegressionTests()
+        helper.control = self.control
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            per_file, archive = helper._bundle_fixture(root)
+            snapshot = helper._snapshot_candidate_modules()
+            try:
+                helper._restore_candidate_modules({})
+                with patch.object(self.control, "_verify_candidate_source", return_value=True):
+                    bundle = self.control._load_candidate_module_bundle(
+                        {"per_file_sha256": per_file}, {"archive_path": str(archive)},
+                        retain_finder=True,
+                    )
+                self.assertIsInstance(bundle, dict)
+                assert isinstance(bundle, dict)
+                self.assertTrue(self.control._candidate_modules_still_bound(bundle, {}, {}))
+                entry = bundle["registry"]["recorder_next.adapters"]
+                module = entry["module"]
+                old_name = module.__name__
+                module.__name__ = "recorder_next.e6_rebound"
+                try:
+                    self.assertFalse(self.control._candidate_modules_still_bound(bundle, {}, {}))
+                finally:
+                    module.__name__ = old_name
+                finder = bundle["finder"]
+                old_map = finder._module_map
+                finder._module_map = dict(old_map)
+                try:
+                    self.assertFalse(self.control._candidate_modules_still_bound(bundle, {}, {}))
+                finally:
+                    finder._module_map = old_map
+            finally:
+                self.control._release_candidate_module_bundle(locals().get("bundle"))
+                helper._restore_candidate_modules(snapshot)
+
+    def test_e6_sqlite_rechecks_path_after_close_swap_restore(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            db_path = root / "sessions.sqlite3"
+            with sqlite3.connect(db_path) as connection:
+                connection.executescript(
+                    "CREATE TABLE sessions (id TEXT, source TEXT, session_key TEXT, ended_at TEXT);"
+                    "CREATE INDEX sessions_id_idx ON sessions(id);"
+                    "INSERT INTO sessions VALUES ('20260703_210417_8f66b434','discord','fixture-key',NULL);"
+                )
+            replacement = root / "replacement.sqlite3"
+            replacement.write_bytes(db_path.read_bytes())
+
+            class SwapOnClose:
+                def __init__(self, real):
+                    self.real = real
+
+                def __getattr__(self, name):
+                    return getattr(self.real, name)
+
+                def close(self):
+                    original = root / "original.sqlite3"
+                    db_path.rename(original)
+                    replacement.rename(db_path)
+                    db_path.rename(replacement)
+                    original.rename(db_path)
+                    return self.real.close()
+
+            context = {
+                "authorization": {"paths": {"persisted_db": str(db_path)}},
+                "boundary": {
+                    "sqlite_connect": lambda *args, **kwargs: SwapOnClose(
+                        sqlite3.connect(*args, **kwargs)
+                    ),
+                },
+            }
+            result = self.control._persisted_lookup(context, deadline_at=time.monotonic() + 5.0)
+            self.assertFalse(result["read_only"], "post-close pathname substitution must be HOLD")
+            self.assertFalse(result["db_identity_equal"])
+
+    def test_e6_report_rejects_authorization_target_mismatch(self):
+        now_epoch = int(time.time())
+        authorization = {
+            "execution_scope": "fixture_readonly",
+            "persisted_key_sha256": self.control.FIXTURE_KEY_SHA256,
+            "candidate_id": "wrong-target",
+            "candidate_sha256": "d" * 64,
+            "source_commit": "e" * 40,
+            "source_tree": "f" * 40,
+            "control_sha256": "1" * 64,
+            "specification_sha256": "2" * 64,
+            "manifest_sha256": "b" * 64,
+            "control_packet_sha256": "a" * 64,
+            "not_before_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now_epoch - 60)),
+            "expires_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now_epoch + 60)),
+        }
+        identity = {
+            "candidate_id": "right-target",
+            "archive_sha256": "d" * 64,
+            "source_commit": "e" * 40,
+            "source_tree": "f" * 40,
+            "control_sha256": "1" * 64,
+            "spec_sha256": "2" * 64,
+        }
+        observations = {
+            "session_observed_utc": self.control._utc_now_iso(),
+            "session_observed_monotonic_ns": time.monotonic_ns(),
+            "boot_id": self.control._boot_id(),
+        }
+        context = {"manifest_sha256": "b" * 64, "authorization_sha256": "c" * 64}
+        report = self.control._admission_report(
+            context, {name: True for name in self.control.REQUIRED_PREDICATES}, [],
+            time.monotonic(), self.control._utc_now_iso(), identity,
+            observations=observations, authorization=authorization,
+        )
+        raw = (json.dumps(report, sort_keys=True) + "\n").encode("utf-8")
+        admission_context = {
+            **context,
+            **identity,
+            "authorization": authorization,
+            "execution_scope": "fixture_readonly",
+            "persisted_key_sha256": self.control.FIXTURE_KEY_SHA256,
+            "control_packet_sha256": authorization["control_packet_sha256"],
+            "admission_sha256": hashlib.sha256(raw).hexdigest(),
+        }
+        self.assertIsNone(
+            self.control._validate_a3_admission_report(admission_context, raw),
+            "A3 must bind target identity through authorization as well as report context",
+        )
+        unsafe_report = dict(report, candidate_id="../untrusted")
+        unsafe_raw = (json.dumps(unsafe_report, sort_keys=True) + "\n").encode("utf-8")
+        unsafe_auth = dict(authorization, candidate_id="../untrusted")
+        self.assertIsNone(
+            self.control._validate_a3_admission_report(
+                dict(admission_context, candidate_id="../untrusted", authorization=unsafe_auth,
+                     admission_sha256=hashlib.sha256(unsafe_raw).hexdigest()),
+                unsafe_raw,
+            ),
+            "A3 candidate identity must retain the canonical identifier grammar",
+        )
+
+    def test_e6_a3_rejects_observation_before_attempt_start(self):
+        now = time.monotonic_ns()
+        now_epoch = int(time.time())
+        authorization = {
+            "execution_scope": "fixture_readonly",
+            "persisted_key_sha256": self.control.FIXTURE_KEY_SHA256,
+            "not_before_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now_epoch - 60)),
+            "expires_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now_epoch + 60)),
+        }
+        context = {
+            "authorization": authorization,
+            "execution_scope": "fixture_readonly",
+            "persisted_key_sha256": self.control.FIXTURE_KEY_SHA256,
+        }
+        observed = self.control._utc_now_iso()
+        parsed = {
+            "started_utc": observed,
+            "finished_utc": observed,
+            "session_observed_utc": "2000-01-01T00:00:00Z",
+            "session_observed_monotonic_ns": now,
+            "boot_id": self.control._boot_id(),
+        }
+        self.assertFalse(self.control._a3_admission_is_fresh(context, parsed))
+
+    def test_e6_report_reason_codes_are_fixed_not_input_text(self):
+        report = self.control._admission_report(
+            {}, {}, ["credential-leak-secret", "internal_error"], time.monotonic(),
+            self.control._utc_now_iso(), {},
+        )
+        self.assertNotIn("credential-leak-secret", report["reason_codes"])
+        self.assertEqual(report["reason_codes"], ["internal_error"])
+
+    def test_e6_a3_rejects_tampered_or_stale_report_before_mutation(self):
+        self.assertTrue(hasattr(self.control, "_validate_a3_admission_report"))
+        self.assertTrue(hasattr(self.control, "_read_admission_report_once"))
