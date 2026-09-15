@@ -2198,7 +2198,7 @@ def _freeze_candidate_module_registry(
             or getattr(module, "__loader__", None) is not loader
         ):
             return None
-        exports = _candidate_exports(module)
+        exports = _static_module_exports(module)
         if name == "recorder_next.adapters" and any(
             required not in exports for required in _REQUIRED_ADAPTER_EXPORTS
         ):
@@ -2290,8 +2290,10 @@ def _load_candidate_module_bundle(
         }
         # E7: freeze the export surface of every registry module so the
         # closing check can reject replaced or added executable exports.
+        # E8: the snapshot is non-dispatching and binds the exact static
+        # mapping key set (see _static_module_exports).
         cleanup_bundle["exports_frozen"] = {
-            name: dict(_candidate_exports(entry["module"])) for name, entry in registry.items()
+            name: _static_module_exports(entry["module"]) for name, entry in registry.items()
         }
         cleanup_bundle["load_failed"] = False
         # E7: the global bundle activation is what authorizes the credential
@@ -2391,6 +2393,14 @@ def _candidate_modules_still_bound(
     # E7 executable_exports_not_bound: the registry binds the export surface
     # as well as the executed bytes.  A replaced dereferenced export or an
     # added foreign executable export breaks the closure (value identity).
+    # E8 CODE-001: the closing comparison is non-dispatching and
+    # identity-exact.  The current snapshot is re-derived through the static
+    # module mapping (never dir()/getattr(), so mutable __dir__/__getattr__
+    # cannot hide or inject anything and no candidate __eq__ runs); the exact
+    # frozen key set must be present; and every export must be bound by
+    # object identity (``is``), so an equal-comparing replacement is rejected
+    # even when its __eq__ claims equality.  Container equality over
+    # attacker-controlled objects is never used.
     exports_frozen = bundle.get("exports_frozen")
     if not isinstance(exports_frozen, dict):
         return False
@@ -2399,8 +2409,22 @@ def _candidate_modules_still_bound(
         bound = expected.get("exports")
         if not isinstance(frozen, dict) or not isinstance(bound, dict):
             return False
-        if bound != frozen or _candidate_exports(expected.get("module")) != frozen:
+        module = expected.get("module")
+        if not isinstance(module, types.ModuleType) or type(module) is not type(
+            expected.get("module")
+        ):
             return False
+        try:
+            current = _static_module_exports(module)
+        except CandidateBundleError:
+            return False
+        if bound.keys() != frozen.keys() or current.keys() != frozen.keys():
+            return False
+        for export_name, frozen_value in frozen.items():
+            if current[export_name] is not frozen_value:
+                return False
+            if bound.get(export_name) is not frozen_value:
+                return False
     return True
 
 def _profile_observations_ready(omitted_response: Any, explicit_response: Any) -> bool:
@@ -3144,8 +3168,82 @@ class CredentialGateError(ValueError):
     """
 
 
+def _static_module_mapping(module: Any) -> dict[str, Any] | None:
+    """Read one module's static global mapping without candidate dispatch (E8).
+
+    The mapping is taken through the module object's *type* mapping protocol,
+    never through instance-level attribute access, so candidate-defined
+    ``__getattr__``, ``__dir__``, ``__eq__``, or ``__ne__`` hooks cannot
+    influence either the key set or the values observed.  A module whose type
+    does not expose exactly the standard module mapping behaviour is rejected.
+    """
+    if not isinstance(module, types.ModuleType):
+        return None
+    module_type = type(module)
+    if module_type is not types.ModuleType and not issubclass(
+        module_type, types.ModuleType
+    ):
+        return None
+    try:
+        mapping = object.__getattribute__(module, "__dict__")
+    except AttributeError:
+        return None
+    if not isinstance(mapping, dict):
+        return None
+    if module_type is types.ModuleType:
+        return dict(mapping)
+    # A ModuleType subclass (for example a candidate-set module class with a
+    # custom __getattr__) must still expose the standard static mapping: the
+    # mapping protocol must resolve to the plain dict implementations across
+    # the type's MRO without invoking any candidate-defined override.
+    if module_type is not types.ModuleType:
+        protocol = {}
+        for name, expected in (
+            ("get", dict.get),
+            ("__setitem__", dict.__setitem__),
+            ("__delitem__", dict.__delitem__),
+            ("__contains__", dict.__contains__),
+            ("keys", dict.keys),
+        ):
+            resolved = expected
+            for klass in module_type.__mro__:
+                if klass is dict:
+                    break
+                if name in vars(klass):
+                    resolved = vars(klass)[name]
+                    break
+            if resolved is not expected:
+                protocol[name] = False
+        if protocol:
+            return None
+    return dict(mapping)
+
+
+def _static_module_exports(module: Any) -> dict[str, Any]:
+    """Executable/module export snapshot bound without dispatch (E8).
+
+    Replaces the E7 ``dir()``/``getattr()`` walk: the key set comes from the
+    module's static mapping, and values are the mapping's own stored objects.
+    A candidate-set ``__dir__`` cannot hide an added export, and no candidate
+    ``__getattr__`` can inject a value that is not stored in the mapping.
+    """
+    mapping = _static_module_mapping(module)
+    if mapping is None:
+        raise CandidateBundleError("candidate module mapping is not statically bound")
+    return {
+        name: value
+        for name, value in mapping.items()
+        if not name.startswith("__")
+        and (callable(value) or isinstance(value, types.ModuleType))
+    }
+
+
 def _candidate_exports(module: Any) -> dict[str, Any]:
     """Public + underscore callable/module export values of one module (E7).
+
+    Retained for historical caller compatibility; the freeze and closing
+    paths use :func:`_static_module_exports` (E8), which cannot dispatch into
+    candidate-controlled hooks.
 
     The mapping binds values by identity: a replaced export keeps its name,
     so only a value comparison can detect the substitution.

@@ -4249,6 +4249,121 @@ class Voice1B6E7SuccessorRegressionTests(unittest.TestCase):
                 self.control._release_candidate_module_bundle(locals().get("bundle"))
                 self._restore_candidate_modules(snapshot)
 
+    # -- E8 CODE-001: closing export validation must be non-dispatching -------
+    # (reviewer finding t_c6436186:1084:product-fail:1; equal-comparing
+    # replacements and __dir__ concealment stayed accepted on E7 while the
+    # validator executed the candidate hooks)
+
+    class _EqualCallable:
+        """A replacement export whose __eq__ always claims equality."""
+
+        def __init__(self) -> None:
+            self.equal_calls = 0
+
+        def __call__(self, raw: str) -> str:
+            return "E8-SPOOF"
+
+        def __eq__(self, other: object) -> bool:
+            self.equal_calls += 1
+            return True
+
+        def __ne__(self, other: object) -> bool:
+            return False
+
+    def test_e8_closing_binding_rejects_equal_comparing_export_replacement(self):
+        """A replaced export whose __eq__ returns True must force HOLD, and the
+        closing check must never execute the replacement's comparison hooks."""
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            per_file, archive = self._bundle_fixture(root)
+            snapshot = self._snapshot_candidate_modules()
+            bundle = None
+            try:
+                self._restore_candidate_modules({})
+                with patch.object(self.control, "_verify_candidate_source", return_value=True):
+                    bundle = self.control._load_candidate_module_bundle(
+                        {"per_file_sha256": per_file}, {"archive_path": str(archive)},
+                        retain_finder=True,
+                    )
+                self.assertIsInstance(bundle, dict)
+                assert isinstance(bundle, dict)
+                auth = {"per_file_sha256": per_file}
+                man = {"archive_path": str(archive)}
+                self.assertTrue(self.control._candidate_modules_still_bound(bundle, auth, man))
+                module = bundle["registry"]["recorder_next.adapters"]["module"]
+                original = module._parse_credential_record
+
+                replacement = self._EqualCallable()
+                self.assertIsNot(replacement, original)
+                module._parse_credential_record = replacement
+                try:
+                    self.assertFalse(
+                        self.control._candidate_modules_still_bound(bundle, auth, man),
+                        "equal-comparing replacement must fail the closing check",
+                    )
+                    self.assertEqual(
+                        replacement.equal_calls, 0,
+                        "closing check must not dispatch into the replacement __eq__",
+                    )
+                finally:
+                    module._parse_credential_record = original
+
+                self.assertTrue(self.control._candidate_modules_still_bound(bundle, auth, man))
+                self.assertEqual(replacement.equal_calls, 0)
+            finally:
+                self.control._release_candidate_module_bundle(locals().get("bundle"))
+                self._restore_candidate_modules(snapshot)
+
+    def test_e8_closing_binding_rejects_dir_concealed_added_export(self):
+        """A foreign callable hidden by a mutable module.__dir__ must force
+        HOLD, and the closing check must never execute the __dir__ hook."""
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            per_file, archive = self._bundle_fixture(root)
+            snapshot = self._snapshot_candidate_modules()
+            bundle = None
+            try:
+                self._restore_candidate_modules({})
+                with patch.object(self.control, "_verify_candidate_source", return_value=True):
+                    bundle = self.control._load_candidate_module_bundle(
+                        {"per_file_sha256": per_file}, {"archive_path": str(archive)},
+                        retain_finder=True,
+                    )
+                self.assertIsInstance(bundle, dict)
+                assert isinstance(bundle, dict)
+                auth = {"per_file_sha256": per_file}
+                man = {"archive_path": str(archive)}
+                self.assertTrue(self.control._candidate_modules_still_bound(bundle, auth, man))
+                module = bundle["registry"]["recorder_next.adapters"]["module"]
+                frozen_names = sorted(bundle["exports_frozen"]["recorder_next.adapters"])
+
+                hook_state = {"calls": 0}
+
+                def tampered_dir() -> list[str]:
+                    hook_state["calls"] += 1
+                    return list(frozen_names)
+
+                module._e8_hidden_foreign_export = lambda: "foreign"
+                module.__dir__ = tampered_dir
+                try:
+                    self.assertFalse(
+                        self.control._candidate_modules_still_bound(bundle, auth, man),
+                        "dir-concealed added export must fail the closing check",
+                    )
+                    self.assertEqual(
+                        hook_state["calls"], 0,
+                        "closing check must not dispatch into module.__dir__",
+                    )
+                finally:
+                    del module.__dir__
+                    del module._e8_hidden_foreign_export
+
+                self.assertTrue(self.control._candidate_modules_still_bound(bundle, auth, man))
+                self.assertEqual(hook_state["calls"], 0)
+            finally:
+                self.control._release_candidate_module_bundle(locals().get("bundle"))
+                self._restore_candidate_modules(snapshot)
+
     # -- F-3: metadata_ancestor_check_open_race ---------------------------------
 
     def test_e7_custody_open_rejects_realdir_ancestor_swap(self):
