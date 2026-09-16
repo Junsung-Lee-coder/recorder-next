@@ -2177,6 +2177,12 @@ def _freeze_candidate_module_registry(
 ) -> dict[str, dict[str, Any]] | None:
     registry: dict[str, dict[str, Any]] = {}
     for name, module in loaded.items():
+        # E10 CODE-002: bind the exact trusted module type first, before any
+        # candidate-dispatching access (getattr/hasattr/module.__dict__/...).
+        # A substituted object or a ModuleType subclass is rejected here so
+        # its type-level hooks can never run during freeze.
+        if type(module) is not _TRUSTED_MODULE_TYPE:
+            return None
         entry = module_map.get(name)
         spec = getattr(module, "__spec__", None)
         loader = getattr(spec, "loader", None) if spec is not None else None
@@ -2322,6 +2328,11 @@ def _candidate_modules_still_bound(
     """Verify the frozen module object/loader/spec closure without re-opening source."""
     if not isinstance(bundle, dict) or bundle.get("load_failed"):
         return False
+    # E10 CODE-002: the expected module type is bound once, separately from
+    # any mutable module object, to the trusted exact ``types.ModuleType``
+    # constant; both closing loops gate on it before any candidate-dispatching
+    # read.
+    frozen_expected_module_type = _TRUSTED_MODULE_TYPE
     registry = bundle.get("registry")
     module_map = bundle.get("module_map")
     frozen_module_map = bundle.get("module_map_frozen")
@@ -2356,6 +2367,12 @@ def _candidate_modules_still_bound(
     for name, expected in registry.items():
         module = current.get(name)
         if module is not expected.get("module"):
+            return False
+        # E10 CODE-002: the exact trusted module-type gate stands immediately
+        # after obtaining the current module and before every getattr,
+        # hasattr, attribute, or other candidate-dispatching read below.  A
+        # subclass must HOLD here with zero candidate hook executions.
+        if type(module) is not frozen_expected_module_type:
             return False
         spec = getattr(module, "__spec__", None)
         loader = getattr(spec, "loader", None) if spec is not None else None
@@ -2401,6 +2418,16 @@ def _candidate_modules_still_bound(
     # object identity (``is``), so an equal-comparing replacement is rejected
     # even when its __eq__ claims equality.  Container equality over
     # attacker-controlled objects is never used.
+    # E10 CODE-002: the frozen expected module type is bound once, separately
+    # from the mutable module object, to the trusted exact
+    # ``types.ModuleType`` constant.  Immediately after obtaining each current
+    # module — before every getattr/hasattr/attribute/namespace or any other
+    # candidate-dispatching read — the current module must still be an exact
+    # instance of that trusted type (identity, not isinstance: no subclass and
+    # no class-rebind survives).  Only after this gate passes may closing
+    # validation obtain the namespace through the non-dispatching base
+    # ``__dict__`` descriptor path in :func:`_static_module_mapping` and then
+    # enforce the exact frozen key set and per-object ``is`` identity.
     exports_frozen = bundle.get("exports_frozen")
     if not isinstance(exports_frozen, dict):
         return False
@@ -2410,9 +2437,7 @@ def _candidate_modules_still_bound(
         if not isinstance(frozen, dict) or not isinstance(bound, dict):
             return False
         module = expected.get("module")
-        if not isinstance(module, types.ModuleType) or type(module) is not type(
-            expected.get("module")
-        ):
+        if type(module) is not frozen_expected_module_type:
             return False
         try:
             current = _static_module_exports(module)
@@ -3168,6 +3193,14 @@ class CredentialGateError(ValueError):
     """
 
 
+# E10 CODE-002: the one trusted exact module-type constant, established before
+# any candidate import.  It is bound to the standard ``types.ModuleType``
+# class object itself — never to ``type(<a mutable module instance>)`` — so
+# the frozen expected type cannot drift with a mutable module object and
+# subclass drift cannot satisfy the identity check.
+_TRUSTED_MODULE_TYPE = types.ModuleType
+
+
 def _static_module_mapping(module: Any) -> dict[str, Any] | None:
     """Read one module's static global mapping without candidate dispatch (E8).
 
@@ -3175,14 +3208,13 @@ def _static_module_mapping(module: Any) -> dict[str, Any] | None:
     never through instance-level attribute access, so candidate-defined
     ``__getattr__``, ``__dir__``, ``__eq__``, or ``__ne__`` hooks cannot
     influence either the key set or the values observed.  A module whose type
-    does not expose exactly the standard module mapping behaviour is rejected.
+    is not the trusted exact :class:`types.ModuleType` is rejected (E10
+    CODE-002): subclasses are never accepted, so subclass-defined
+    ``__getattribute__``/``__getattr__``/``__dir__``/``__eq__`` hooks can
+    never run here and the returned mapping is read through the base type's
+    non-dispatching ``__dict__`` descriptor only.
     """
-    if not isinstance(module, types.ModuleType):
-        return None
-    module_type = type(module)
-    if module_type is not types.ModuleType and not issubclass(
-        module_type, types.ModuleType
-    ):
+    if type(module) is not _TRUSTED_MODULE_TYPE:
         return None
     try:
         mapping = object.__getattribute__(module, "__dict__")
@@ -3190,32 +3222,6 @@ def _static_module_mapping(module: Any) -> dict[str, Any] | None:
         return None
     if not isinstance(mapping, dict):
         return None
-    if module_type is types.ModuleType:
-        return dict(mapping)
-    # A ModuleType subclass (for example a candidate-set module class with a
-    # custom __getattr__) must still expose the standard static mapping: the
-    # mapping protocol must resolve to the plain dict implementations across
-    # the type's MRO without invoking any candidate-defined override.
-    if module_type is not types.ModuleType:
-        protocol = {}
-        for name, expected in (
-            ("get", dict.get),
-            ("__setitem__", dict.__setitem__),
-            ("__delitem__", dict.__delitem__),
-            ("__contains__", dict.__contains__),
-            ("keys", dict.keys),
-        ):
-            resolved = expected
-            for klass in module_type.__mro__:
-                if klass is dict:
-                    break
-                if name in vars(klass):
-                    resolved = vars(klass)[name]
-                    break
-            if resolved is not expected:
-                protocol[name] = False
-        if protocol:
-            return None
     return dict(mapping)
 
 

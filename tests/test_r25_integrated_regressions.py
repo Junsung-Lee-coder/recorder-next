@@ -4249,6 +4249,109 @@ class Voice1B6E7SuccessorRegressionTests(unittest.TestCase):
                 self.control._release_candidate_module_bundle(locals().get("bundle"))
                 self._restore_candidate_modules(snapshot)
 
+    # -- E10 CODE-002: benign and hook-bearing ModuleType subclass drift must HOLD --
+    # (reviewer run 1095 CODE-002-UNCLOSED: the E8/E9 closing gate ran
+    # candidate-dispatching getattr reads before its exact-type check, so a
+    # subclass with a recording __getattribute__ passed while its hooks ran)
+
+    def test_e10_closing_binding_rejects_benign_module_subclass_drift(self):
+        """A frozen candidate module whose type drifted to a benign distinct
+        ModuleType subclass must force HOLD (false), and the unchanged exact
+        types.ModuleType module must still pass the closing bound check."""
+        import types
+
+        with tempfile.TemporaryDirectory() as raw:
+            per_file, archive = self._bundle_fixture(Path(raw))
+            snapshot = self._snapshot_candidate_modules()
+            bundle = None
+            try:
+                self._restore_candidate_modules({})
+                with patch.object(self.control, "_verify_candidate_source", return_value=True):
+                    bundle = self.control._load_candidate_module_bundle(
+                        {"per_file_sha256": per_file}, {"archive_path": str(archive)},
+                        retain_finder=True,
+                    )
+                self.assertIsInstance(bundle, dict)
+                assert isinstance(bundle, dict)
+                auth = {"per_file_sha256": per_file}
+                man = {"archive_path": str(archive)}
+                self.assertTrue(self.control._candidate_modules_still_bound(bundle, auth, man))
+                module = bundle["registry"]["recorder_next.adapters"]["module"]
+                self.assertIs(type(module), types.ModuleType)
+
+                class _E10BenignSubclass(types.ModuleType):
+                    """A distinct benign ModuleType subclass (no overrides)."""
+
+                original_class = type(module)
+                module.__class__ = _E10BenignSubclass
+                try:
+                    self.assertIs(type(module), _E10BenignSubclass)
+                    self.assertFalse(
+                        self.control._candidate_modules_still_bound(bundle, auth, man),
+                        "benign ModuleType subclass drift must force HOLD",
+                    )
+                finally:
+                    module.__class__ = original_class
+                self.assertIs(type(module), types.ModuleType)
+                self.assertTrue(self.control._candidate_modules_still_bound(bundle, auth, man))
+            finally:
+                self.control._release_candidate_module_bundle(locals().get("bundle"))
+                self._restore_candidate_modules(snapshot)
+
+    def test_e10_closing_binding_rejects_hook_bearing_subclass_with_zero_hook_calls(self):
+        """A frozen candidate module whose type drifted to a ModuleType subclass
+        with a recording __getattribute__ must force HOLD with exactly zero
+        candidate hook executions during the closing bound check."""
+        import types
+
+        with tempfile.TemporaryDirectory() as raw:
+            per_file, archive = self._bundle_fixture(Path(raw))
+            snapshot = self._snapshot_candidate_modules()
+            bundle = None
+            try:
+                self._restore_candidate_modules({})
+                with patch.object(self.control, "_verify_candidate_source", return_value=True):
+                    bundle = self.control._load_candidate_module_bundle(
+                        {"per_file_sha256": per_file}, {"archive_path": str(archive)},
+                        retain_finder=True,
+                    )
+                self.assertIsInstance(bundle, dict)
+                assert isinstance(bundle, dict)
+                auth = {"per_file_sha256": per_file}
+                man = {"archive_path": str(archive)}
+                self.assertTrue(self.control._candidate_modules_still_bound(bundle, auth, man))
+                module = bundle["registry"]["recorder_next.adapters"]["module"]
+
+                hook_state = {"calls": 0}
+
+                class _E10HookSubclass(types.ModuleType):
+                    """A ModuleType subclass whose __getattribute__ records calls."""
+
+                    def __getattribute__(self, name: str):  # noqa: D102
+                        hook_state["calls"] = hook_state["calls"] + 1
+                        return types.ModuleType.__getattribute__(self, name)
+
+                original_class = type(module)
+                module.__class__ = _E10HookSubclass
+                try:
+                    hook_state["calls"] = 0
+                    result = self.control._candidate_modules_still_bound(bundle, auth, man)
+                    self.assertFalse(
+                        result,
+                        "hook-bearing ModuleType subclass drift must force HOLD",
+                    )
+                    self.assertEqual(
+                        hook_state["calls"], 0,
+                        "closing check must not execute candidate __getattribute__ hooks",
+                    )
+                finally:
+                    module.__class__ = original_class
+                self.assertIs(type(module), types.ModuleType)
+                self.assertTrue(self.control._candidate_modules_still_bound(bundle, auth, man))
+            finally:
+                self.control._release_candidate_module_bundle(locals().get("bundle"))
+                self._restore_candidate_modules(snapshot)
+
     # -- E8 CODE-001: closing export validation must be non-dispatching -------
     # (reviewer finding t_c6436186:1084:product-fail:1; equal-comparing
     # replacements and __dir__ concealment stayed accepted on E7 while the
