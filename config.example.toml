@@ -53,6 +53,12 @@ tts_source = "hermes"
 asr_chain = []
 tts_chain = []
 # hermes_base_url is intentionally omitted; set it only in deployment configuration.
+# It must be the Hermes Gateway/API listener that supports /v1/runs and
+# /v1/runs/{run_id}; do not substitute a `hermes chat --resume` wrapper.
+# For transport-backed sessions, set the distinct owning conversation key used
+# in X-Hermes-Session-Key. Recorder still sends the approved Hermes session ID
+# separately in the /v1/runs session_id field.
+# hermes_conversation_key = "agent:main:discord:thread:..."
 # It is the Hermes Gateway/API listener. The installed Hermes dashboard exposes
 # the audio route on its separate loopback listener (default port 9120), so the
 # reviewed TTS endpoint is http://127.0.0.1:9120, not the Gateway port.

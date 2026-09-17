@@ -697,7 +697,11 @@ class HttpHermesGateway:
         )
 
     def _session_headers(self, session_key: str) -> dict[str, str]:
-        headers = {"X-Hermes-Session-Key": session_key}
+        # ``session_key`` is Recorder's exact target Hermes session ID.  The
+        # Gateway conversation key is a separate transport identity (for
+        # example a Discord thread key) and must not overwrite that target.
+        conversation_key = self.gateway_session_key or session_key
+        headers = {"X-Hermes-Session-Key": conversation_key}
         if self._api_key is not None:
             headers["Authorization"] = f"Bearer {self._api_key}"
         return headers
@@ -1129,7 +1133,7 @@ class HttpHermesGateway:
             raise ValueError("Hermes submission id is not a valid Idempotency-Key")
         json_session = request.get("session_id")
         if json_session is not None and json_session != session_key:
-            raise ValueError("JSON session_id conflicts with X-Hermes-Session-Key")
+            raise ValueError("JSON session_id conflicts with the approved target session")
         projected = projected_value
         text = projected.get("input") or projected.get("text") or ""
         attachments = self._resolve_inline_attachments(projected, submission_id=submission_id)

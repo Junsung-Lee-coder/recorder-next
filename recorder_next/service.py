@@ -950,6 +950,11 @@ class RecorderService:
         *,
         deadline_at: float | None = None,
     ) -> str | None:
+        # A durable /v1/runs terminal result is the authoritative recovery
+        # source.  Session-message history is a legacy, non-idempotent
+        # observation surface and can belong to a different transport turn.
+        if bool(getattr(self.hermes, "durable_correlation", False)):
+            return None
         turn = self.store.get_turn(ingress["turn_id"])
         if not turn.get("final_event_version") or turn.get("final_content"):
             return None
@@ -2693,6 +2698,7 @@ def create_configured_service(
             raise CredentialError("Hermes API credential path and endpoint are required")
         hermes = HttpHermesGateway(
             config.hermes_base_url,
+            gateway_session_key=config.hermes_conversation_key,
             api_key_file=config.hermes_api_key_file,
             max_request_bytes=config.gateway_max_request_bytes,
             require_existing_session=require_production,

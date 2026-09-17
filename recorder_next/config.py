@@ -383,6 +383,7 @@ class RecorderConfig:
     tts_retry_seconds: int = 10
     hermes_base_url: str | None = None
     hermes_audio_base_url: str | None = None
+    hermes_conversation_key: str | None = None
     hermes_api_key_file: str | None = None
     hermes_profile: str = "default"
     asr_source: str = "hermes"
@@ -691,6 +692,7 @@ class RecorderConfig:
             {
                 "hermes_base_url",
                 "hermes_audio_base_url",
+                "hermes_conversation_key",
                 "hermes_api_key_file",
                 "hermes_profile",
                 "asr_source",
@@ -787,6 +789,9 @@ class RecorderConfig:
 
             hermes_base_url=providers.get("hermes_base_url"),
             hermes_audio_base_url=providers.get("hermes_audio_base_url"),
+            hermes_conversation_key=providers.get(
+                "hermes_conversation_key", os.environ.get("RECORDER_NEXT_HERMES_CONVERSATION_KEY")
+            ),
             hermes_api_key_file=providers.get(
                 "hermes_api_key_file", os.environ.get("RECORDER_NEXT_HERMES_API_KEY_FILE")
             ),
@@ -852,6 +857,12 @@ class RecorderConfig:
                 raise ValueError(f"{field_name} is invalid")
         if not isinstance(self.hermes_profile, str) or not re.fullmatch(r"^[A-Za-z0-9_.-]{1,64}$", self.hermes_profile):
             raise ValueError("Hermes profile is invalid")
+        if self.hermes_conversation_key is not None and (
+            not isinstance(self.hermes_conversation_key, str)
+            or not 1 <= len(self.hermes_conversation_key) <= 512
+            or any(ord(char) < 33 or ord(char) > 126 for char in self.hermes_conversation_key)
+        ):
+            raise ValueError("Hermes conversation key is invalid")
         for endpoint_name, endpoint in (("Hermes endpoint", self.hermes_base_url), ("Hermes audio endpoint", self.hermes_audio_base_url)):
             if endpoint is None:
                 continue
